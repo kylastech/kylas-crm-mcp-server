@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.kylastech/kylas-crm",
+  "title": "Kylas CRM",
+  "description": "MCP server for Kylas CRM: create, search, and manage leads. Requires KYLAS_API_KEY.",
+  "repository": {
+    "url": "https://github.com/kylastech/kylas-crm-mcp-server",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "kylas-crm-mcp",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "KYLAS_API_KEY",
+          "description": "Your Kylas API key (required)",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "KYLAS_BASE_URL",
+          "description": "Kylas API base URL (optional, default: https://api.kylas.io/v1)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
