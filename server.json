@@ -11,7 +11,7 @@
   "packages": [
     {
       "registryType": "pypi",
-      "identifier": "kylas-crm-mcp",
+      "identifier": "kylas-crm-mcp-server",
       "version": "1.0.0",
       "transport": {
         "type": "stdio"

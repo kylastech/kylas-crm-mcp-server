@@ -23,7 +23,7 @@ Model Context Protocol server for **Kylas CRM** lead operations. Use it from Cur
 
 ```bash
 pip install -e .
-# or from PyPI (after publish): pip install kylas-crm-mcp
+# or from PyPI (after publish): pip install kylas-crm-mcp-server
 ```
 
 ## Configuration

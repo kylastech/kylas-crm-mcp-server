@@ -30,7 +30,7 @@ This guide covers publishing to the **official MCP Registry** ([registry.modelco
   ```html
   <!-- mcp-name: io.github.kylastech/kylas-crm -->
   ```
-- **pyproject.toml** – Package name `kylas-crm-mcp`, version, entry point.
+- **pyproject.toml** – Package name `kylas-crm-mcp-server`, version, entry point.
 
 ## Step 1: Publish the package to PyPI
 
@@ -52,7 +52,7 @@ uv run twine upload dist/*
 
 First time: create an API token at [PyPI → Account settings → API tokens](https://pypi.org/manage/account/token/), then use it when `twine` asks for username/password (username: `__token__`, password: the token).
 
-Confirm the package at [https://pypi.org/project/kylas-crm-mcp/](https://pypi.org/project/kylas-crm-mcp/) and that the project description (from README) contains the `mcp-name` line.
+Confirm the package at [https://pypi.org/project/kylas-crm-mcp-server/](https://pypi.org/project/kylas-crm-mcp-server/) and that the project description (from README) contains the `mcp-name` line.
 
 ## Step 2: Install the MCP Publisher CLI
 
