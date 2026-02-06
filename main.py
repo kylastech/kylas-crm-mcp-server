@@ -3,12 +3,13 @@ Kylas CRM MCP Server - Lead Only
 
 Model Context Protocol server for Kylas CRM lead operations.
 - Tool 1: get_lead_field_instructions (call FIRST to get schema)
-- Tool 2: create_lead (single tool with dynamic field_values from user context)
-- Tool 3: search_leads (filter leads by multiple criteria; only filterable fields)
-- Tool 4: lookup_users (resolve user name to ID for createdBy, updatedBy, ownerId, etc.)
-- Tool 5: lookup_products (resolve product name to ID for filtering leads by product)
-- Tool 6: lookup_pipelines / get_pipeline_stages (resolve pipeline and stages for open/closed/won lead filters)
-- Tool 7: search_idle_leads (leads with no activity for N days; uses updatedAt and latestActivityCreatedAt)
+- Tool 1b: get_current_user (GET /users/me — timezone, recordActions; use for date/datetime handling)
+- Tool 2: lookup_users (resolve user name to ID for createdBy, updatedBy, ownerId, etc.)
+- Tool 3: lookup_products, lookup_pipelines, get_pipeline_stages
+- Tool 3a: parse_datetime_to_utc_iso_tool (user's local datetime + timezone → UTC ISO for create_lead)
+- Tool 4: create_lead (dynamic field_values; for datetime fields convert user time to UTC via parse_datetime_to_utc_iso_tool)
+- Tool 5: search_leads (filter by criteria; date/datetime filters use current user timezone, do not convert to UTC)
+- Tool 6: search_idle_leads (no activity for N days; uses current user timezone when not provided)
 """
 
 import os
@@ -18,7 +19,9 @@ from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
+from dateutil import parser as dateutil_parser
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_context, get_http_request
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -123,6 +126,11 @@ Before creating a lead, you MUST call `get_lead_field_instructions` to get:
 - "Idle" or "stagnant" means no activity on the lead for at least N days. Use **last activity** = the **later** of `updatedAt` and `latestActivityCreatedAt`; the lead is idle if that date is before (today − N days).
 - Since the API cannot filter on "max of two fields", use **both** conditions: `updatedAt` ≤ threshold **and** `latestActivityCreatedAt` ≤ threshold (threshold = now − N days in ISO). That way the lead is returned only when both dates are old, i.e. the effective last activity is before the threshold.
 - Prefer the **search_idle_leads** tool when the user asks for idle/stagnant/inactive leads (e.g. "no activity since 10 days"). Otherwise build search_leads filters as above with operator "less_or_equal" and value = ISO date string for (now − N days).
+
+### Date and datetime fields — timezone from current user (GET /users/me)
+- Whenever a **date or datetime** is involved (create lead with a date/datetime field, or filter by date/datetime), call **get_current_user** first to get the user's **timezone** (e.g. Asia/Calcutta).
+- **Creating a lead with a datetime field:** The user gives the datetime in their own timezone (e.g. "11th Feb 2026 at 7:30 AM"). You MUST convert it to UTC before sending: call **get_current_user** → get timezone → call **parse_datetime_to_utc_iso_tool**(user's datetime string, user's timezone) → put the returned UTC ISO string in field_values for that date/datetime field. Do not send the user's local time as-is.
+- **Filtering by date/datetime (search_leads, search_idle_leads):** Use the user's timezone from get_current_user as the **timeZone** in the filter (or rely on the server using it when timeZone is omitted). Keep the date/datetime value as the user said it (in their timezone); do **not** convert filter values to UTC — the API interprets them using the timeZone field.
 """
 
 # ---------------------------------------------------------------------------
@@ -165,15 +173,46 @@ class KylasAPIError(Exception):
         super().__init__(self.message)
 
 
+def _get_mcp_client_name() -> str:
+    """
+    Resolve the MCP client name (e.g. cursor, claude) from request context or HTTP User-Agent.
+    Used for the outbound User-Agent to Kylas: kylas_mcp_server/{clientName}.
+    """
+    try:
+        ctx = get_context()
+        if ctx and getattr(ctx, "client_id", None):
+            cid = (ctx.client_id or "").lower()
+            if "cursor" in cid:
+                return "cursor"
+            if "claude" in cid:
+                return "claude"
+    except Exception:
+        pass
+    try:
+        req = get_http_request()
+        if req and getattr(req, "headers", None):
+            ua = (req.headers.get("user-agent") or req.headers.get("User-Agent") or "").lower()
+            if "cursor" in ua:
+                return "cursor"
+            if "claude" in ua:
+                return "claude"
+    except Exception:
+        pass
+    return "unknown"
+
+
 def get_client() -> httpx.AsyncClient:
     if not API_KEY:
         raise KylasAPIError("KYLAS_API_KEY environment variable is not set")
+    client_name = _get_mcp_client_name()
+    user_agent = f"kylas_mcp_server/{client_name}"
     return httpx.AsyncClient(
         base_url=BASE_URL,
         headers={
             "api-key": API_KEY,
             "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "User-Agent": user_agent,
         },
         timeout=30.0
     )
@@ -290,11 +329,14 @@ def _rule_type_for_value(field_type: str, field_name: str, value: Any) -> str:
 def _build_search_json_rule(
     filters: List[Dict[str, Any]],
     filterable_map: Dict[str, Dict[str, Any]],
+    default_timezone: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """
     Build jsonRule for POST /search/lead. Returns (jsonRule, error_message).
     Each filter: { "field": "<name>", "operator": "<op>", "value": <val>, "type": "<FIELD_TYPE>" }.
+    default_timezone: used for date/datetime rules when filter has no timeZone (e.g. from get_current_user).
     """
+    tz_for_date = default_timezone or DEFAULT_TIMEZONE
     rules = []
     for i, f in enumerate(filters):
         field_name = f.get("field")
@@ -318,7 +360,7 @@ def _build_search_json_rule(
                 value = int(value)
             except (TypeError, ValueError):
                 value = value
-        # Date rules: value left as-is — single ISO string (greater/less), [start,end] (between), or null (today/is_null)
+        # Date rules: value left as-is (user's timezone); API uses timeZone for interpretation — do not convert to UTC
 
         # Custom fields: API expects field path "customFieldValues.cfFruits" or "customFieldValues.cfDateField"; standard fields use field name only
         is_custom = not meta.get("standard", True)
@@ -337,9 +379,9 @@ def _build_search_json_rule(
             rule["dependentFieldIds"] = ["pipelineStage", "pipelineStageReason"]
         elif field_name == "pipelineStage":
             rule["relatedFieldIds"] = ["pipeline"]
-        # Date/datetime fields: API requires timeZone (e.g. today, between, is_not_null)
+        # Date/datetime fields: API requires timeZone; use filter's timeZone or current user's (default_timezone) or fallback
         if rule_type == "date":
-            rule["timeZone"] = f.get("timeZone") or DEFAULT_TIMEZONE
+            rule["timeZone"] = f.get("timeZone") or tz_for_date
         rules.append(rule)
 
     return {"rules": rules, "condition": "AND", "valid": True}, None
@@ -382,6 +424,58 @@ async def get_lead_field_instructions() -> str:
         return f"Error: {e.message}"
     except Exception as e:
         logger.exception("get_lead_field_instructions")
+        return f"Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Tool 1b: Get current user (timezone, recordActions, etc.) – for date/datetime handling
+# ---------------------------------------------------------------------------
+
+async def _fetch_current_user() -> Dict[str, Any]:
+    """Fetch current user from GET /users/me. Returns full user object (timezone, recordActions, name, etc.)."""
+    async with get_client() as client:
+        response = await client.get("/users/me")
+        return await handle_api_response(response, "Fetch current user")
+
+
+@mcp.tool()
+async def get_current_user() -> str:
+    """
+    Get the current authenticated user's profile from Kylas (GET /users/me).
+    Call this whenever a date or datetime-related query is involved.
+    Returns timezone (IANA, e.g. Asia/Calcutta), recordActions (call, email, sms, etc.), name, and other profile fields.
+    - For filtering (search_leads, search_idle_leads): use the returned timezone as the timeZone in date/datetime filters; keep the user's date/datetime as-is (do not convert to UTC).
+    - For create_lead: when the user provides a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone, convert to UTC using parse_datetime_to_utc_iso, and send the UTC ISO string in field_values.
+    """
+    try:
+        logger.info("Fetching current user (users/me)")
+        user = await _fetch_current_user()
+        tz = user.get("timezone") or "UTC"
+        name = user.get("name") or f"{user.get('firstName', '')} {user.get('lastName', '')}".strip() or "—"
+        lines = [
+            "=" * 50,
+            "CURRENT USER (GET /users/me)",
+            "=" * 50,
+            f"Name: {name}",
+            f"Timezone: {tz}",
+            "",
+            "recordActions (permissions):",
+        ]
+        ra = user.get("recordActions") or {}
+        for k, v in sorted(ra.items()):
+            lines.append(f"  • {k}: {v}")
+        lines.extend([
+            "",
+            "Use this timezone for:",
+            "  - Date/datetime filters in search_leads: pass timeZone in each date filter; do not convert filter values to UTC.",
+            "  - create_lead with datetime fields: convert user's local datetime to UTC with parse_datetime_to_utc_iso, then send UTC ISO in field_values.",
+            "=" * 50,
+        ])
+        return "\n".join(lines)
+    except KylasAPIError as e:
+        return f"Error: {e.message}"
+    except Exception as e:
+        logger.exception("get_current_user")
         return f"Unexpected error: {str(e)}"
 
 
@@ -660,6 +754,42 @@ async def get_pipeline_stages(pipeline_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool 3a: Parse datetime in user timezone to UTC ISO (for create_lead datetime fields)
+# ---------------------------------------------------------------------------
+
+def parse_datetime_to_utc_iso(local_datetime: str, timezone: str) -> str:
+    """
+    Parse a datetime string as given in the user's local timezone and return UTC ISO string for the Kylas API.
+    Use when creating a lead with a date/datetime field: the user says e.g. "11th Feb 2026 at 7:30 AM" in their timezone;
+    call get_current_user to get timezone, then call this with (user's datetime string, user's timezone) and put the result in field_values.
+    """
+    try:
+        tz = ZoneInfo(timezone)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    dt = dateutil_parser.parse(local_datetime)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    utc_dt = dt.astimezone(ZoneInfo("UTC"))
+    return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+@mcp.tool()
+def parse_datetime_to_utc_iso_tool(local_datetime: str, timezone: str) -> str:
+    """
+    Parse a datetime string in the user's timezone and return UTC ISO string for the Kylas API.
+    Call get_current_user first to get the user's timezone. Use the returned string in create_lead field_values for date/datetime fields.
+    Example: user says "create lead with follow-up 11th Feb 2026 at 7:30 AM" → get_current_user → timezone Asia/Calcutta → parse_datetime_to_utc_iso_tool("11 Feb 2026 7:30 AM", "Asia/Calcutta") → use result in field_values.
+    local_datetime: Datetime as the user said it (e.g. "11 Feb 2026 7:30 AM", "11th Feb 2026 at 7:30 am").
+    timezone: IANA timezone from get_current_user (e.g. Asia/Calcutta).
+    """
+    try:
+        return parse_datetime_to_utc_iso(local_datetime, timezone)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
 # Tool 4: Create Lead (single tool, dynamic field_values)
 # ---------------------------------------------------------------------------
 
@@ -836,6 +966,7 @@ async def create_lead(field_values: Dict[str, Any]) -> str:
     - Custom fields: MUST be under "customFieldValues" with **internal name** as key (e.g. "customFieldValues": {"cfLeadCheck": "Checked"}). Do not use field ID as key—Kylas expects internal names. If you pass a field ID (e.g. "1210985"), the server will resolve it to the internal name (e.g. cfLeadCheck) automatically.
     - For a single email use "email": "user@example.com". For phones use "phone": "5551234567" (or "phoneNumbers" array) and you MUST include "phone_country_code": "IN" or "+91" at top level. If the user provided phone(s) but did not specify country or dial code, do NOT call create_lead—ask the user (e.g. which country/dial code for these numbers?) and only call after they respond. Do not infer from currency or other context. Email types: OFFICE, PERSONAL. Phone types: MOBILE, WORK, HOME, PERSONAL. Exactly one email and at most one phone should be primary; first entry is primary by default.
     - For picklists use the Option ID (number) from the cheat sheet.
+    - For date/datetime fields: the user gives a time in their timezone (e.g. "11th Feb 2026 at 7:30 AM"). Call get_current_user, then parse_datetime_to_utc_iso_tool(local_datetime, timezone) and put the returned UTC ISO string in field_values.
     """
     try:
         result = await create_lead_logic(field_values)
@@ -881,12 +1012,23 @@ async def search_leads_logic(
     size: int = 20,
     sort: Optional[str] = "createdAt,desc",
 ) -> str:
-    """Search leads with jsonRule; only filterable fields allowed."""
+    """Search leads with jsonRule; only filterable fields allowed. Uses current user timezone for date/datetime filters when timeZone is not provided."""
     fields_list = await _fetch_lead_fields()
     filterable_map = _get_filterable_fields_map(fields_list)
     if not filterable_map:
         return "No filterable lead fields found for this tenant."
-    json_rule, err = _build_search_json_rule(filters, filterable_map)
+    default_tz = None
+    date_field_types = {"DATETIME_PICKER", "DATE", "DATE_PICKER"}
+    for f in filters:
+        fn = f.get("field")
+        if fn and fn in filterable_map and filterable_map[fn].get("type") in date_field_types and not f.get("timeZone"):
+            try:
+                user = await _fetch_current_user()
+                default_tz = user.get("timezone") or DEFAULT_TIMEZONE
+            except Exception:
+                default_tz = DEFAULT_TIMEZONE
+            break
+    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
     if err:
         return f"Invalid filters: {err}"
     payload = {
@@ -973,9 +1115,16 @@ async def search_idle_leads_logic(
     Find leads with no activity for at least `days` days.
     Uses last-activity = max(updatedAt, latestActivityCreatedAt); a lead is idle when both
     updatedAt and latestActivityCreatedAt are on or before (now - days).
-    If only one of the two fields is filterable, uses that one (and notes it in the result).
+    If time_zone is not provided, uses current user's timezone from GET /users/me.
     """
-    tz = time_zone or DEFAULT_TIMEZONE
+    if time_zone:
+        tz = time_zone
+    else:
+        try:
+            user = await _fetch_current_user()
+            tz = user.get("timezone") or DEFAULT_TIMEZONE
+        except Exception:
+            tz = DEFAULT_TIMEZONE
     threshold_iso = _threshold_iso_days_ago(days, tz)
     base = {"operator": "less_or_equal", "value": threshold_iso, "timeZone": tz}
     fields_list = await _fetch_lead_fields()
