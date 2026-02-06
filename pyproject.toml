@@ -38,6 +38,7 @@ dev = [
 
 [project.scripts]
 kylas-crm-mcp = "main:run"
+kylas-crm-mcp-server = "main:run"
 
 [tool.setuptools]
 py-modules = ["main"]

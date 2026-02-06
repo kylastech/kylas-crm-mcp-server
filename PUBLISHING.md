@@ -17,6 +17,14 @@ This guide covers publishing to the **official MCP Registry** ([registry.modelco
 
 ---
 
+## Which branch should my code be on?
+
+- **What gets published**: The package you build and upload is what PyPI and the MCP Registry use. They **do not** read or check your Git branch. So you can publish from **any branch** — including your working/feature branch. Whatever is in your project directory when you run `python -m build` and `twine upload dist/*` is what gets published.
+- **Publishing from a working branch**: If your code is on a branch like `SD-28296-mcp-for-lead` (or any other branch), you can stay on that branch, run the build and upload steps, and publish. It will work.
+- **Optional (for consistency)**: If you want the repo’s **default branch** (e.g. `main`) to match the published package, merge your working branch into `main` and optionally tag (e.g. `v1.0.0`). That way anyone opening the `repository.url` sees the same code as the release. This is not required for publishing.
+
+---
+
 ## Prerequisites
 
 - **PyPI account** – [Create one](https://pypi.org/account/register/) if needed. The registry only stores metadata; the actual package is published to PyPI.
@@ -119,7 +127,24 @@ Or open [https://modelcontextprotocol.io](https://modelcontextprotocol.io) and u
 |-------|------------|
 | **Package validation failed** | Ensure the PyPI project’s long description (from README) contains exactly `mcp-name: io.github.kylastech/kylas-crm` (can be in an HTML comment). Re-upload the package if you fixed the README. |
 | **Invalid or expired Registry JWT** | Run `mcp-publisher login github` again. |
-| **You do not have permission to publish this server** | The server `name` must start with `io.github.kylastech/`. Log in with a GitHub account that has permission to publish for the **kylastech** organisation (e.g. org owner or member with publish rights). |
+| **You do not have permission to publish this server** | See **"Getting permission to publish as the organisation"** below. |
+
+## Getting permission to publish as the organisation (403)
+
+If you see **"You have permission to publish: io.github.akshaykylas94/*. Attempting to publish: io.github.kylastech/kylas-crm"**, the registry cannot see your **kylastech** membership. Do this:
+
+1. **Make your organisation membership public**  
+   [GitHub: Publicizing or hiding organization membership](https://docs.github.com/en/account-and-profile/how-tos/organization-membership/publicizing-or-hiding-organization-membership)  
+   In short: Profile → Organizations → **kylastech** → make your membership **Public** (or ask an org owner if the setting is per-member).
+2. **Log out and log in again** (so the registry sees the updated membership):
+   ```bash
+   mcp-publisher logout
+   mcp-publisher login github
+   ```
+   Use the GitHub account that is a member of **kylastech**.
+3. **Publish again:** `mcp-publisher publish`
+
+If it still returns 403, try another GitHub account that is in **kylastech** (with public membership), or ask the [MCP Registry](https://github.com/modelcontextprotocol/registry/issues) how org namespace permission is granted.
 
 ## Optional: Automate with GitHub Actions
 

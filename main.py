@@ -86,8 +86,8 @@ Before creating a lead, you MUST call `get_lead_field_instructions` to get:
 
 ### Field value formats (from Kylas API)
 - **Standard fields** (firstName, lastName, companyName, isNew, etc.): use API name as key at top level.
-- **emails**: array of objects, or pass "email": "user@example.com" to normalize.
-- **phoneNumbers**: array of objects, or pass "phone": "5551234567" and optionally "phone_country_code": "+1".
+- **emails**: array of objects (types OFFICE, PERSONAL only; exactly one must be primary). Or pass "email": "user@example.com" to normalize (OFFICE, primary). First entry is primary by default.
+- **phoneNumbers**: array of objects (types MOBILE, WORK, HOME, PERSONAL only; exactly one must be primary; "code" = 2-letter country e.g. IN, US). Or pass "phone": "5551234567". You MUST also pass "phone_country_code": "IN" or "+91" at the top level whenever any phone is included. **If the user gave phone number(s) but did NOT specify country or dial code: do NOT call create_lead.** Reply asking for country/dial code (e.g. "Which country or dial code should I use for these phone numbers? (e.g. India: IN or +91, US: +1)"). Only after the user provides it, call create_lead with that phone_country_code. Do not infer country from currency (e.g. INR), locale, or number format—always ask. First entry is primary by default.
 - **Picklist fields** (e.g. leadSource, salutation): use the **Option ID** (number) from the cheat sheet.
 - **Custom fields**: MUST go in "customFieldValues" with **internal name** as key (e.g. "customFieldValues": {"cfLeadCheck": "Checked"}). Never use field ID as the key in the request—the API expects internal names (e.g. cfLeadCheck). If you pass a field ID by mistake, the server will resolve it to the internal name automatically. From the cheat sheet, use the "Field ID" only to identify the field; for the payload use the field's **name** (internal/API name) in customFieldValues.
 
@@ -663,6 +663,48 @@ async def get_pipeline_stages(pipeline_id: int) -> str:
 # Tool 4: Create Lead (single tool, dynamic field_values)
 # ---------------------------------------------------------------------------
 
+# Kylas API uses 2-letter country codes (e.g. IN, US). No default—caller must provide when phone is used.
+COUNTRY_CODE_MAP = {
+    "+91": "IN", "IN": "IN", "in": "IN", "india": "IN",
+    "+1": "US", "US": "US", "us": "US", "usa": "US",
+    "GB": "GB", "+44": "GB", "UK": "GB",
+}
+
+
+def _normalize_country_code(code: Optional[str]) -> str:
+    """Normalize user-provided country code to Kylas 2-letter code. Returns empty string if not provided (caller must require it when phone is present)."""
+    if not code or not str(code).strip():
+        return ""
+    raw = str(code).strip().upper() if len(str(code).strip()) <= 3 else str(code).strip()
+    return COUNTRY_CODE_MAP.get(raw) or COUNTRY_CODE_MAP.get(code) or (raw if len(raw) == 2 else "")
+
+
+def _ensure_single_primary(entries: List[Dict[str, Any]], allowed_types: List[str], default_type: str) -> List[Dict[str, Any]]:
+    """Ensure exactly one entry has primary=True. Use first entry marked primary by user, else first entry. Types restricted to allowed_types."""
+    if not entries or not isinstance(entries, list):
+        return entries
+    result = []
+    for e in entries:
+        if not e or not isinstance(e, dict):
+            continue
+        entry = dict(e)
+        t = (entry.get("type") or default_type).upper()
+        entry["type"] = t if t in allowed_types else default_type
+        result.append(entry)
+    primary_idx = 0
+    for i, entry in enumerate(result):
+        if entry.get("primary"):
+            primary_idx = i
+            break
+    for i, entry in enumerate(result):
+        entry["primary"] = i == primary_idx
+    return result
+
+
+EMAIL_TYPES = ["OFFICE", "PERSONAL"]
+PHONE_TYPES = ["MOBILE", "WORK", "HOME", "PERSONAL"]
+
+
 def _normalize_field_values(
     field_values: Dict[str, Any],
     custom_field_id_to_name: Optional[Dict[str, str]] = None,
@@ -671,8 +713,9 @@ def _normalize_field_values(
     Build Kylas create-lead payload from dynamic field_values.
     - Custom fields (numeric keys or in customFieldValues) → customFieldValues with INTERNAL NAME as key (never ID).
     - Explicit "customFieldValues" dict → merged; keys must be internal names (e.g. cfLeadCheck).
-    - "email" string → emails array
-    - "phone" / "phoneNumber" + optional "phone_country_code" → phoneNumbers array
+    - "email" string → emails array (type OFFICE, primary true). One email must be primary.
+    - "phone" / "phoneNumber" + "phone_country_code" (required when phone given) → phoneNumbers array (type MOBILE, code as 2-letter e.g. IN). Caller must ask user for country/dial code when phone is given without it; do not assume or infer. One phone must be primary.
+    - emails/phoneNumbers arrays: allowed types email OFFICE|PERSONAL, phone MOBILE|WORK|HOME|PERSONAL; exactly one primary (first if unspecified).
     - Rest → top-level payload (standard fields)
     """
     payload: Dict[str, Any] = {}
@@ -680,7 +723,20 @@ def _normalize_field_values(
     fv = dict(field_values)
     id_to_name = custom_field_id_to_name or {}
 
-    phone_code = fv.pop("phone_country_code", None) or "+1"
+    phone_country_raw = fv.pop("phone_country_code", None)
+    phone_country = _normalize_country_code(phone_country_raw)
+    has_phone_data = (
+        fv.get("phone") or fv.get("phoneNumber")
+        or (isinstance(fv.get("phoneNumbers"), list) and len(fv["phoneNumbers"]) > 0)
+    )
+    # Require explicit phone_country_code whenever any phone number is present (do not assume India).
+    # This applies even if phoneNumbers array already has "code" on each entry—caller must pass
+    # phone_country_code at top level so we know the user was asked, not assumed.
+    if has_phone_data and not phone_country:
+        raise ValueError(
+            "Phone number(s) were provided but country/dial code was not. "
+            "Ask the user which country and dial code to use (e.g. India: IN or +91, US: US or +1) and include 'phone_country_code' in field_values."
+        )
 
     # Explicit customFieldValues: merge into custom (keys must be internal names, e.g. cfLeadCheck)
     if "customFieldValues" in fv:
@@ -700,15 +756,47 @@ def _normalize_field_values(
             continue
         # Normalize single email string to Kylas emails array
         if key == "email" and isinstance(value, str):
-            payload["emails"] = [{"type": "OFFICE", "value": value.strip(), "primary": True}]
+            payload["emails"] = _ensure_single_primary(
+                [{"type": "OFFICE", "value": value.strip(), "primary": True}],
+                EMAIL_TYPES,
+                "OFFICE",
+            )
             continue
-        # Normalize single phone string to Kylas phoneNumbers array
+        # Normalize single phone string to Kylas phoneNumbers array (code = 2-letter; required when phone given)
         if key in ("phone", "phoneNumber") and isinstance(value, str):
-            payload["phoneNumbers"] = [{"type": "MOBILE", "code": phone_code, "value": value.strip(), "primary": True}]
+            if not phone_country:
+                raise ValueError(
+                    "Phone number was provided but country/dial code was not. "
+                    "Ask the user which country and dial code to use and include 'phone_country_code' in field_values."
+                )
+            payload["phoneNumbers"] = _ensure_single_primary(
+                [{"type": "MOBILE", "code": phone_country, "value": value.strip(), "primary": True}],
+                PHONE_TYPES,
+                "MOBILE",
+            )
             continue
-        # Already in API shape
-        if key in ("emails", "phoneNumbers"):
-            payload[key] = value
+        # Already in API shape: ensure single primary and allowed types
+        if key == "emails":
+            payload["emails"] = _ensure_single_primary(
+                value if isinstance(value, list) else [],
+                EMAIL_TYPES,
+                "OFFICE",
+            )
+            continue
+        if key == "phoneNumbers":
+            # Normalize code to 2-letter for each entry; use phone_country when entry missing code (already validated above)
+            raw_phones = value if isinstance(value, list) else []
+            phones = []
+            for p in raw_phones:
+                if not isinstance(p, dict):
+                    continue
+                entry = dict(p)
+                if "code" not in entry or not entry.get("code"):
+                    entry["code"] = phone_country
+                elif len(str(entry["code"])) > 2:
+                    entry["code"] = _normalize_country_code(entry["code"]) or entry["code"]
+                phones.append(entry)
+            payload["phoneNumbers"] = _ensure_single_primary(phones, PHONE_TYPES, "MOBILE")
             continue
         # All other standard fields at top level
         payload[key] = value
@@ -746,7 +834,7 @@ async def create_lead(field_values: Dict[str, Any]) -> str:
     field_values: Map of field identifier to value.
     - Standard fields: use API name as key at top level (e.g. firstName, lastName, companyName, emails, phoneNumbers, leadSource, isNew).
     - Custom fields: MUST be under "customFieldValues" with **internal name** as key (e.g. "customFieldValues": {"cfLeadCheck": "Checked"}). Do not use field ID as key—Kylas expects internal names. If you pass a field ID (e.g. "1210985"), the server will resolve it to the internal name (e.g. cfLeadCheck) automatically.
-    - For a single email use "email": "user@example.com"; for phones "phone": "5551234567" and optionally "phone_country_code": "+1".
+    - For a single email use "email": "user@example.com". For phones use "phone": "5551234567" (or "phoneNumbers" array) and you MUST include "phone_country_code": "IN" or "+91" at top level. If the user provided phone(s) but did not specify country or dial code, do NOT call create_lead—ask the user (e.g. which country/dial code for these numbers?) and only call after they respond. Do not infer from currency or other context. Email types: OFFICE, PERSONAL. Phone types: MOBILE, WORK, HOME, PERSONAL. Exactly one email and at most one phone should be primary; first entry is primary by default.
     - For picklists use the Option ID (number) from the cheat sheet.
     """
     try:
@@ -754,6 +842,8 @@ async def create_lead(field_values: Dict[str, Any]) -> str:
         lead_id = result.get("id", "?")
         name = f"{result.get('firstName', '')} {result.get('lastName', '')}".strip() or "Lead"
         return f"✓ Lead created successfully.\n  ID: {lead_id}\n  Name: {name}"
+    except ValueError as e:
+        return f"✗ {e}"
     except KylasAPIError as e:
         return f"✗ Failed to create lead: {e.message}\n  Details: {e.response_body}"
     except Exception as e:

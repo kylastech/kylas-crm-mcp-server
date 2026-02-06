@@ -152,7 +152,48 @@ def test_normalize_field_values_phone_string():
     fv = {"firstName": "Jane", "phone": "5551234567", "phone_country_code": "+1"}
     payload = _normalize_field_values(fv)
     assert payload["firstName"] == "Jane"
-    assert payload["phoneNumbers"] == [{"type": "MOBILE", "code": "+1", "value": "5551234567", "primary": True}]
+    # +1 normalized to 2-letter code US
+    assert payload["phoneNumbers"] == [{"type": "MOBILE", "code": "US", "value": "5551234567", "primary": True}]
+
+
+def test_normalize_field_values_phone_string_requires_country_code():
+    """Phone without country/dial code must not default to India; should raise so caller asks user."""
+    fv = {"firstName": "Jane", "phone": "8830311640"}
+    with pytest.raises(ValueError, match="country.*dial code"):
+        _normalize_field_values(fv)
+
+
+def test_normalize_field_values_phone_string_with_country_code():
+    """Phone with phone_country_code IN or +91 normalizes to code IN."""
+    fv = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "IN"}
+    payload = _normalize_field_values(fv)
+    assert payload["phoneNumbers"] == [{"type": "MOBILE", "code": "IN", "value": "8830311640", "primary": True}]
+    fv2 = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "+91"}
+    payload2 = _normalize_field_values(fv2)
+    assert payload2["phoneNumbers"] == [{"type": "MOBILE", "code": "IN", "value": "8830311640", "primary": True}]
+
+
+def test_normalize_field_values_emails_single_primary():
+    fv = {"emails": [{"type": "OFFICE", "value": "a@k.io", "primary": True}, {"type": "PERSONAL", "value": "b@gmail.com", "primary": False}]}
+    payload = _normalize_field_values(fv)
+    assert payload["emails"][0]["primary"] is True
+    assert payload["emails"][1]["primary"] is False
+
+
+def test_normalize_field_values_phone_numbers_single_primary():
+    # Top-level phone_country_code required whenever any phone data is present (even if entries have "code").
+    fv = {"phone_country_code": "IN", "phoneNumbers": [{"type": "MOBILE", "code": "IN", "value": "9090909090", "primary": True}, {"type": "WORK", "code": "US", "value": "4155550132", "primary": False}]}
+    payload = _normalize_field_values(fv)
+    assert len(payload["phoneNumbers"]) == 2
+    assert payload["phoneNumbers"][0]["primary"] is True
+    assert payload["phoneNumbers"][1]["primary"] is False
+
+
+def test_normalize_field_values_phone_numbers_array_requires_country_code():
+    """phoneNumbers array without top-level phone_country_code must raise (do not assume India)."""
+    fv = {"phoneNumbers": [{"type": "MOBILE", "code": "IN", "value": "7447631718", "primary": True}]}
+    with pytest.raises(ValueError, match="country.*dial code"):
+        _normalize_field_values(fv)
 
 
 def test_normalize_field_values_custom_fields():
