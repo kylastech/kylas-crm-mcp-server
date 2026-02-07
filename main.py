@@ -5,10 +5,12 @@ Model Context Protocol server for Kylas CRM lead operations.
 - Tool 1: get_lead_field_instructions (call FIRST to get schema)
 - Tool 1b: get_current_user (GET /users/me — timezone, recordActions; use for date/datetime handling)
 - Tool 2: lookup_users (resolve user name to ID for createdBy, updatedBy, ownerId, etc.)
-- Tool 3: lookup_products, lookup_pipelines, get_pipeline_stages
+- Tool 3: lookup_products, lookup_pipelines, get_pipeline_stages, get_pipeline_details (for Closed Lost/Unqualified reasons)
 - Tool 3a: parse_datetime_to_utc_iso_tool (user's local datetime + timezone → UTC ISO for create_lead)
 - Tool 4: create_lead (dynamic field_values; for datetime fields convert user time to UTC via parse_datetime_to_utc_iso_tool)
+- Tool 4b: update_lead (PUT /leads/{id}; same field_values format as create_lead)
 - Tool 5: search_leads (filter by criteria; date/datetime filters use current user timezone, do not convert to UTC)
+- Tool 5b: search_leads_by_term (search across multiple fields by a single term, e.g. "leads with akshay")
 - Tool 6: search_idle_leads (no activity for N days; uses current user timezone when not provided)
 """
 
@@ -81,9 +83,10 @@ Before creating a lead, you MUST call `get_lead_field_instructions` to get:
 - Field IDs for custom fields (e.g. "57256")
 - Picklist option IDs for dropdowns (e.g. leadSource: 12345)
 
-### Step 2: Create lead from user context only
-- Do NOT use a fixed list of fields. Infer from the user's message what they want to create.
+### Step 2: Create/Update lead from user context only
+- Do NOT use a fixed list of fields. Infer from the user's message what they want to create or update.
 - Build `field_values` with ONLY the fields the user provided or implied.
+- For **update_lead**: pass the lead ID (e.g. from search results) and the fields to update; same field_values format as create_lead. For owner/ownerId use user ID from lookup_users.
 - Keys: use API Name for standard fields (from cheat sheet), or Field ID string for custom fields.
 - Values: use the exact format expected by Kylas (see below).
 
@@ -99,8 +102,10 @@ Before creating a lead, you MUST call `get_lead_field_instructions` to get:
 - Omit any field the user did not mention; do not add static/default fields.
 
 ### Search/Filter leads
-- Call `get_lead_field_instructions` first to see which fields are **filterable** (marked in cheat sheet).
-- Only fields with filterable=true can be used in search filters.
+- **By term across multiple fields:** When the user asks for "leads with X", "leads containing Y", or "leads named Z" without specifying a field (e.g. "leads with akshay"), use **search_leads_by_term** with that term. The API will search across firstName, lastName, companyName, phoneNumbers, emails, etc.
+- **By specific field:** When the user specifies a field (e.g. "leads where phone number is X", "leads where first name is John"), use **search_leads** with the appropriate filter(s).
+- Call `get_lead_field_instructions` first to see which fields are **filterable** (marked in cheat sheet) when using search_leads.
+- Only fields with filterable=true can be used in search_leads filters.
 - For PICK_LIST/MULTI_PICKLIST: use **Option ID** (number) in filter value, except for: requirementCurrency, companyBusinessType, country, timezone, companyIndustry — for these use **internal name** (string).
 - Use the correct operator for the field type (see operator list in search_leads docstring).
 
@@ -114,13 +119,27 @@ Before creating a lead, you MUST call `get_lead_field_instructions` to get:
 - When the user asks e.g. "leads with product X" or "leads that have product Y": (1) Call **lookup_products** with query e.g. "name:X" or "name:Y". (2) If **more than one** product is returned, ask the user which product they mean and list the matches (id and name). (3) Once exactly one product is identified, call **search_leads** with filter {"field": "products", "operator": "equal", "value": <product_id>}.
 - Do not guess product IDs; always use lookup_products first when filtering by product name.
 
-### Pipeline and pipeline stage (open leads, closed leads, Won, etc.)
-- When the user asks for leads by **stage** (e.g. "open leads", "closed leads", "leads in Won", "Won stage") and the **pipeline is not clear**:
-  1. **Ask for pipeline first:** Call **lookup_pipelines** only (entityType=LEAD, query by name or empty for all). Do **not** call get_pipeline_stages yet.
-  2. **Get confirmation:** Present the pipeline(s) (id and name) and ask the user which pipeline they mean. If only one pipeline is found, still ask the user to confirm (e.g. "I found one pipeline: [name]. Should I use this one?").
-  3. **After confirmation only:** Once the user confirms the pipeline, call **get_pipeline_stages** with that pipeline ID to get stages for that pipeline only.
-  4. Map the user's intent to stage(s): e.g. "open" → stages with forecastingType OPEN; "closed" → CLOSED_*; "won" → CLOSED_WON; "lost" → CLOSED_LOST. If more than one stage matches (e.g. two OPEN stages), ask which stage they mean. Then call **search_leads** with filters: {"field": "pipeline", "operator": "equal", "value": pipeline_id} and {"field": "pipelineStage", "operator": "equal", "value": stage_id} (or "in" with a list of stage IDs if the user wants multiple stages).
-- Do not guess pipeline or pipeline stage IDs. Do not call get_pipeline_stages until the user has confirmed which pipeline to use.
+### Pipeline and pipeline stage (create, update, search)
+
+**Always resolve pipeline first when stage is involved.** Call **lookup_pipelines** (entityType=LEAD); do **not** call get_pipeline_stages until the user has confirmed which pipeline.
+
+- **If there are multiple pipelines:** Always list them (id and name) and ask which pipeline the user means. Even if the user says "default lead pipeline", there may be more than one—ask explicitly (e.g. "Do you mean 'Default Lead Pipeline' (id 996) or 'new PIpeline' (id 1232)?").
+- **If there is only one pipeline:** Still ask for confirmation (e.g. "I found one pipeline: [name]. Should I use this one?") before calling get_pipeline_stages or updating the lead.
+- **After confirmation only:** Call **get_pipeline_stages** with that pipeline ID, then map stage intent (e.g. "open" → OPEN, "won" → CLOSED_WON) and use that pipeline + stage in create_lead, update_lead, or search_leads as below.
+
+**Create lead with stage** (e.g. "create lead with open stage"):
+- User must confirm which pipeline before creating. Follow the rules above (list pipelines, get confirmation; if only one pipeline, still confirm). Then get_pipeline_stages for that pipeline, pick the matching stage (e.g. Open), and include pipeline + pipelineStage (or pipeline object with stage) in create_lead field_values.
+
+**Update lead pipeline/stage** (e.g. "move this lead to Open", "set stage to Won"):
+- If the user did **not** specify which pipeline: call lookup_pipelines, list pipelines, and ask which pipeline to use. Then get_pipeline_stages for that pipeline and proceed with update_lead.
+- If the lead **already has a pipeline** and the user is moving the lead to a **different pipeline** (e.g. lead is in "Default Lead Pipeline" and user says "move to new PIpeline"): ask for confirmation: "This lead is already in [current pipeline name]. Are you sure you want to move it to [new pipeline name]?" Only after the user confirms, call update_lead with the new pipeline and stage.
+- If only one pipeline exists and user didn’t name it: still ask for confirmation before updating.
+
+- **When moving to Closed Lost or Closed Unqualified:** A closing reason is required. Call **get_pipeline_details**(pipeline_id) to get the pipeline's **lostReasons** (for Closed Lost) or **unqualifiedReasons** (for Closed Unqualified). Present the list to the user and ask them to pick one. Then call update_lead with pipeline, stage, and **pipelineStageReason** set to the **exact string** the user chose (e.g. "No followup", "Booked with competitor", "False enquiry").
+
+**Search/filter by stage** (e.g. "open leads", "closed leads", "leads in Won"):
+- Same as above: ask for pipeline first (list and get confirmation), then get_pipeline_stages, then search_leads with pipeline + pipelineStage filters.
+- Do not guess pipeline or pipeline stage IDs.
 
 ### Idle / Stagnant leads (no activity for N days)
 - "Idle" or "stagnant" means no activity on the lead for at least N days. Use **last activity** = the **later** of `updatedAt` and `latestActivityCreatedAt`; the lead is idle if that date is before (today − N days).
@@ -754,6 +773,79 @@ async def get_pipeline_stages(pipeline_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool 3d: Get pipeline details (GET /pipelines/{id}) – stages + lost/unqualified reasons
+# ---------------------------------------------------------------------------
+
+async def get_pipeline_details_logic(pipeline_id: int) -> str:
+    """
+    Call GET /pipelines/{id}. Returns pipeline name, stages (id, name, forecastingType),
+    unqualifiedReasons (for Closed Unqualified), and lostReasons (for Closed Lost).
+    Use when moving a lead to Closed Lost or Closed Unqualified: get reasons, ask the user to pick one,
+    then update_lead with pipelineStageReason set to that exact string.
+    """
+    pipeline_id = int(pipeline_id)
+    async with get_client() as client:
+        response = await client.get(f"/pipelines/{pipeline_id}")
+        data = await handle_api_response(response, "Get pipeline details")
+    name = data.get("name", "—")
+    lines = [
+        f"Pipeline: {name} (ID: {pipeline_id})",
+        "",
+        "Stages:",
+    ]
+    for s in data.get("stages", []):
+        sid = s.get("id", "?")
+        sname = s.get("name", "—")
+        ftype = s.get("forecastingType", "")
+        lines.append(f"  • Stage ID: {sid}  |  Name: {sname}  |  forecastingType: {ftype}")
+    unq = data.get("unqualifiedReasons") or []
+    lost = data.get("lostReasons") or []
+    lines.extend([
+        "",
+        "Closed Unqualified reasons (use exact string as pipelineStageReason when moving to Closed Unqualified):",
+    ])
+    if unq:
+        for r in unq:
+            lines.append(f"  • \"{r}\"")
+    else:
+        lines.append("  (none configured)")
+    lines.extend([
+        "",
+        "Closed Lost reasons (use exact string as pipelineStageReason when moving to Closed Lost):",
+    ])
+    if lost:
+        for r in lost:
+            lines.append(f"  • \"{r}\"")
+    else:
+        lines.append("  (none configured)")
+    lines.append("")
+    lines.append("When updating lead to Closed Lost or Closed Unqualified, ask the user to pick one reason from the list above, then call update_lead with pipelineStageReason set to that exact string.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_pipeline_details(pipeline_id: int) -> str:
+    """
+    Get full pipeline details by ID (GET /pipelines/{id}): stages plus unqualifiedReasons and lostReasons.
+    Call this when moving a lead to Closed Lost or Closed Unqualified. Present the relevant reasons list to the user,
+    ask them to pick one, then call update_lead with pipelineStageReason set to that exact string (e.g. "No followup", "Booked with competitor").
+    pipeline_id: The pipeline ID (from the lead's current pipeline or from lookup_pipelines).
+    """
+    try:
+        pipeline_id = int(pipeline_id)
+    except (TypeError, ValueError):
+        return "Error: pipeline_id must be a number."
+    try:
+        logger.info("Pipeline details: pipeline_id=%s", pipeline_id)
+        return await get_pipeline_details_logic(pipeline_id)
+    except KylasAPIError as e:
+        return f"Error: {e.message}"
+    except Exception as e:
+        logger.exception("get_pipeline_details")
+        return f"Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
 # Tool 3a: Parse datetime in user timezone to UTC ISO (for create_lead datetime fields)
 # ---------------------------------------------------------------------------
 
@@ -983,7 +1075,148 @@ async def create_lead(field_values: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 4: Search / Filter Leads
+# Tool 4b: Update Lead (PUT /leads/{id})
+# ---------------------------------------------------------------------------
+
+async def update_lead_logic(lead_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """GET the lead first, merge field_values into it, then PUT the full body. No partial update."""
+    lead_id = int(lead_id)
+    fv = dict(field_values)
+    if not fv:
+        raise KylasAPIError("field_values cannot be empty for update.")
+    has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
+    id_to_name = await _get_custom_field_id_to_name() if has_custom_by_id else {}
+    payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    if not payload:
+        raise KylasAPIError("field_values produced an empty payload.")
+    logger.info("Updating lead %s with fields: %s", lead_id, list(payload.keys()))
+    async with get_client() as client:
+        get_response = await client.get(f"/leads/{lead_id}")
+        existing = await handle_api_response(get_response, "Get lead")
+        merged = dict(existing)
+        for key, value in payload.items():
+            if key == "customFieldValues" and isinstance(value, dict):
+                merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
+            else:
+                merged[key] = value
+        response = await client.put(f"/leads/{lead_id}", json=merged)
+        result = await handle_api_response(response, "Update lead")
+        logger.info("Lead %s updated", lead_id)
+        return result
+
+
+@mcp.tool()
+async def update_lead(lead_id: int, field_values: Dict[str, Any]) -> str:
+    """
+    Update a lead in Kylas CRM. Fetches the lead first, merges your field_values into it, then PUTs the full body.
+    Same field_values format as create_lead. Call get_lead_field_instructions first for API names and custom field internal names.
+    For owner: use lookup_users to get the user ID, then pass ownerId: <id> in field_values.
+
+    lead_id: The lead ID to update (e.g. from search_leads or search_leads_by_term results).
+    field_values: Map of field identifier to value (same as create_lead: firstName, lastName, email, phone with phone_country_code, customFieldValues, picklist Option IDs, date/datetime in UTC ISO, etc.). These are merged over the existing lead; other fields are left unchanged.
+    """
+    try:
+        result = await update_lead_logic(lead_id, field_values)
+        lid = result.get("id", lead_id)
+        name = f"{result.get('firstName', '')} {result.get('lastName', '')}".strip() or "Lead"
+        return f"✓ Lead updated successfully.\n  ID: {lid}\n  Name: {name}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to update lead: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("update_lead")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Tool 4c: Get lead by ID (full details)
+# ---------------------------------------------------------------------------
+
+async def get_lead_logic(lead_id: int) -> Dict[str, Any]:
+    """Fetch a single lead by ID (GET /leads/{id}). Returns full lead object."""
+    lead_id = int(lead_id)
+    async with get_client() as client:
+        response = await client.get(f"/leads/{lead_id}")
+        return await handle_api_response(response, "Get lead")
+
+
+def _format_lead_for_display(lead: Dict[str, Any]) -> str:
+    """Format a lead object into a readable multi-line string."""
+    lines = ["=" * 60, "LEAD DETAILS", "=" * 60]
+    lines.append(f"ID: {lead.get('id', '—')}")
+    lines.append(f"First Name: {lead.get('firstName', '—')}")
+    lines.append(f"Last Name: {lead.get('lastName', '—')}")
+    lines.append(f"Company Name: {lead.get('companyName') or '—'}")
+    # Emails
+    emails = lead.get("emails") or []
+    if emails:
+        for e in emails:
+            val = e.get("value", "")
+            typ = e.get("type", "")
+            prim = " (primary)" if e.get("primary") else ""
+            lines.append(f"Email ({typ}): {val}{prim}")
+    else:
+        lines.append("Email: —")
+    # Phones
+    phones = lead.get("phoneNumbers") or []
+    if phones:
+        for p in phones:
+            code = p.get("code", "")
+            val = p.get("value", "")
+            typ = p.get("type", "")
+            prim = " (primary)" if p.get("primary") else ""
+            lines.append(f"Phone ({typ}): +{code} {val}{prim}")
+    else:
+        lines.append("Phone: —")
+    # Pipeline / Stage
+    pipeline = lead.get("pipeline") or {}
+    if isinstance(pipeline, dict):
+        pl_name = pipeline.get("name", "—")
+        stage = pipeline.get("stage") or {}
+        stage_name = stage.get("name", "—") if isinstance(stage, dict) else "—"
+        lines.append(f"Pipeline: {pl_name}")
+        lines.append(f"Stage: {stage_name}")
+    else:
+        lines.append(f"Pipeline: {pipeline}")
+    lines.append(f"Pipeline Stage Reason: {lead.get('pipelineStageReason') or '—'}")
+    lines.append(f"Owner ID: {lead.get('ownerId', '—')}")
+    lines.append(f"Created At: {lead.get('createdAt', '—')}")
+    lines.append(f"Updated At: {lead.get('updatedAt', '—')}")
+    # Custom fields
+    custom = lead.get("customFieldValues") or {}
+    if custom:
+        lines.append("")
+        lines.append("Custom fields:")
+        for k, v in custom.items():
+            lines.append(f"  {k}: {v}")
+    # Other common fields
+    for key in ("address", "city", "state", "zipcode", "country", "salutation", "leadSource", "companyWebsite", "facebook", "twitter", "linkedIn"):
+        val = lead.get(key)
+        if val is not None and val != "":
+            lines.append(f"{key}: {val}")
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_lead(lead_id: int) -> str:
+    """
+    Get full details of a lead by ID (GET /leads/{id}). Use when the user asks for complete lead info, lead details, or to view a specific lead.
+    lead_id: The lead ID (e.g. from search_leads or search_leads_by_term results).
+    """
+    try:
+        lead = await get_lead_logic(lead_id)
+        return _format_lead_for_display(lead)
+    except KylasAPIError as e:
+        return f"✗ Failed to get lead: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("get_lead")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Tool 5: Search / Filter Leads
 # ---------------------------------------------------------------------------
 
 def _extract_primary_email(emails: Any) -> str:
@@ -1101,7 +1334,95 @@ async def search_leads(
 
 
 # ---------------------------------------------------------------------------
-# Tool 5: Search idle / stagnant leads (no activity for N days)
+# Tool 5b: Search leads by term (multi-field search)
+# ---------------------------------------------------------------------------
+
+def _multi_field_json_rule(search_term: str) -> Dict[str, Any]:
+    """Build jsonRule for POST /search/lead multi-field search (search across firstName, lastName, companyName, etc.)."""
+    return {
+        "rules": [
+            {
+                "id": "multi_field",
+                "field": "multi_field",
+                "type": "multi_field",
+                "input": "multi_field",
+                "operator": "multi_field",
+                "value": search_term.strip(),
+            }
+        ],
+        "condition": "AND",
+        "valid": True,
+    }
+
+
+async def search_leads_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """Search leads by a single term across multiple fields (firstName, lastName, companyName, phoneNumbers, emails, etc.) via POST /search/lead with multi_field jsonRule."""
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    json_rule = _multi_field_json_rule(term)
+    payload = {
+        "fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "companyName", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching leads by term: %r", term)
+    async with get_client() as client:
+        response = await client.post("/search/lead", params=params, json=payload)
+        data = await handle_api_response(response, "Search leads by term")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No leads found matching '{term}'. (Total in DB: {total})"
+    lines = [f"Found {len(results)} lead(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for lead in results:
+        lid = lead.get("id", "?")
+        fn = lead.get("firstName") or ""
+        ln = lead.get("lastName") or ""
+        name = f"{fn} {ln}".strip() or "—"
+        email = _extract_primary_email(lead.get("emails"))
+        phone = _extract_primary_phone(lead.get("phoneNumbers"))
+        lines.append(f"• ID: {lid} | Name: {name} | Email: {email} | Phone: {phone}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_leads_by_term(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """
+    Search leads by a single term across multiple fields (firstName, lastName, companyName, phoneNumbers, emails, etc.).
+    Use this when the user asks for "leads with X", "leads containing Y", or "leads named Z" without specifying which field to filter on.
+    For filtering by a specific field (e.g. "leads where phone number is X"), use search_leads instead.
+
+    search_term: The term to search for (e.g. "akshay", "acme").
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "updatedAt,desc" (default).
+    """
+    try:
+        return await search_leads_by_term_logic(search_term, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_leads_by_term")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Tool 6: Search idle / stagnant leads (no activity for N days)
 # ---------------------------------------------------------------------------
 
 async def search_idle_leads_logic(
