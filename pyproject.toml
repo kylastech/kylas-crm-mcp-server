@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kylas-crm-mcp-server"
+version = "1.0.3"
+description = "MCP server for Kylas CRM lead operations: create leads, search leads, lookup users/products/pipelines."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "akshaykylas94", email = "akshay.gunshetti@kylas.io" }
+]
+keywords = ["mcp", "kylas", "crm", "model-context-protocol", "leads"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "fastmcp>=2.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "python-dateutil>=2.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[project.scripts]
+kylas-crm-mcp = "main:run"
+kylas-crm-mcp-server = "main:run"
+
+[tool.setuptools]
+py-modules = ["main"]
