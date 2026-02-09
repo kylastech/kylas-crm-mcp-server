@@ -14,7 +14,9 @@ Model Context Protocol server for Kylas CRM lead operations.
 - Tool 6: search_idle_leads (no activity for N days; uses current user timezone when not provided)
 """
 
+import asyncio
 import os
+import random
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
@@ -181,6 +183,63 @@ OPERATOR_MAPPING = {
 PICKLIST_FIELDS_USE_INTERNAL_NAME = {"requirementCurrency", "companyBusinessType", "country", "timezone", "companyIndustry"}
 
 # ---------------------------------------------------------------------------
+# API call throttle: 100–500 ms random delay between subsequent calls per tool
+# ---------------------------------------------------------------------------
+
+import contextvars
+
+_api_call_count: contextvars.ContextVar[int] = contextvars.ContextVar("api_call_count", default=0)
+
+async def _before_api_call() -> None:
+    """If this is not the first API call in this tool run, sleep 100–500 ms at random."""
+    n = _api_call_count.get()
+    if n > 0:
+        delay = random.uniform(0.1, 0.5)
+        await asyncio.sleep(delay)
+
+
+def _after_api_call() -> None:
+    """Mark that one API call has completed (for throttle counting)."""
+    _api_call_count.set(_api_call_count.get() + 1)
+
+
+def _reset_api_call_count() -> None:
+    """Reset at the start of each tool so only subsequent calls within the same tool are delayed."""
+    _api_call_count.set(0)
+
+
+class _ThrottledClient:
+    """Wraps httpx.AsyncClient to add 100–500 ms random delay before 2nd, 3rd, … request in the same tool."""
+
+    def __init__(self, client: httpx.AsyncClient):
+        self._client = client
+
+    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        await _before_api_call()
+        try:
+            return await self._client.get(url, **kwargs)
+        finally:
+            _after_api_call()
+
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        await _before_api_call()
+        try:
+            return await self._client.post(url, **kwargs)
+        finally:
+            _after_api_call()
+
+    async def put(self, url: str, **kwargs: Any) -> httpx.Response:
+        await _before_api_call()
+        try:
+            return await self._client.put(url, **kwargs)
+        finally:
+            _after_api_call()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
+# ---------------------------------------------------------------------------
 # HTTP Client & Errors
 # ---------------------------------------------------------------------------
 
@@ -220,21 +279,36 @@ def _get_mcp_client_name() -> str:
     return "unknown"
 
 
-def get_client() -> httpx.AsyncClient:
-    if not API_KEY:
-        raise KylasAPIError("KYLAS_API_KEY environment variable is not set")
-    client_name = _get_mcp_client_name()
-    user_agent = f"kylas_mcp_server/{client_name}"
-    return httpx.AsyncClient(
-        base_url=BASE_URL,
-        headers={
-            "api-key": API_KEY,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": user_agent,
-        },
-        timeout=30.0
-    )
+class _ThrottledClientContext:
+    """Async context manager: wraps httpx.AsyncClient and yields _ThrottledClient for 100–500 ms delay between calls."""
+
+    def __init__(self) -> None:
+        if not API_KEY:
+            raise KylasAPIError("KYLAS_API_KEY environment variable is not set")
+        client_name = _get_mcp_client_name()
+        user_agent = f"kylas_mcp_server/{client_name}"
+        self._raw = httpx.AsyncClient(
+            base_url=BASE_URL,
+            headers={
+                "api-key": API_KEY,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": user_agent,
+            },
+            timeout=30.0,
+        )
+
+    async def __aenter__(self) -> "_ThrottledClient":
+        entered = await self._raw.__aenter__()
+        return _ThrottledClient(entered)
+
+    async def __aexit__(self, *args: Any) -> Any:
+        return await self._raw.__aexit__(*args)
+
+
+def get_client() -> _ThrottledClientContext:
+    """Return a context manager that yields a throttled HTTP client (100–500 ms delay between subsequent API calls)."""
+    return _ThrottledClientContext()
 
 
 async def handle_api_response(response: httpx.Response, operation: str) -> Dict[str, Any]:
@@ -436,6 +510,7 @@ async def get_lead_field_instructions() -> str:
     Use this to build field_values for create_lead based on what the user wants—do not use static fields.
     """
     try:
+        _reset_api_call_count()
         logger.info("Fetching lead field instructions")
         result = await get_lead_field_instructions_logic()
         return result
@@ -467,6 +542,7 @@ async def get_current_user() -> str:
     - For create_lead: when the user provides a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone, convert to UTC using parse_datetime_to_utc_iso, and send the UTC ISO string in field_values.
     """
     try:
+        _reset_api_call_count()
         logger.info("Fetching current user (users/me)")
         user = await _fetch_current_user()
         tz = user.get("timezone") or "UTC"
@@ -571,6 +647,7 @@ async def lookup_users(
     return_all: If True, fetch all pages and return every user in one response (cap 500).
     """
     try:
+        _reset_api_call_count()
         q = (query or "name:").strip() or "name:"
         logger.info("User lookup: q=%s return_all=%s", q, return_all)
         return await lookup_users_logic(q, page, size, fetch_all_pages=return_all)
@@ -631,6 +708,7 @@ async def lookup_products(query: str, page: int = 0, size: int = 50) -> str:
     size: Max 50 (default 50).
     """
     try:
+        _reset_api_call_count()
         logger.info("Product lookup: q=%s", query)
         return await lookup_products_logic(query, page, size)
     except KylasAPIError as e:
@@ -702,6 +780,7 @@ async def lookup_pipelines(
     size: Max 50 (default 50).
     """
     try:
+        _reset_api_call_count()
         logger.info("Pipeline lookup: entityType=%s q=%s", entity_type, query)
         return await lookup_pipelines_logic(query, entity_type, page, size)
     except KylasAPIError as e:
@@ -763,6 +842,7 @@ async def get_pipeline_stages(pipeline_id: int) -> str:
     except (TypeError, ValueError):
         return "Error: pipeline_id must be a number."
     try:
+        _reset_api_call_count()
         logger.info("Pipeline stages: pipeline_id=%s", pipeline_id)
         return await get_pipeline_stages_logic(pipeline_id)
     except KylasAPIError as e:
@@ -836,6 +916,7 @@ async def get_pipeline_details(pipeline_id: int) -> str:
     except (TypeError, ValueError):
         return "Error: pipeline_id must be a number."
     try:
+        _reset_api_call_count()
         logger.info("Pipeline details: pipeline_id=%s", pipeline_id)
         return await get_pipeline_details_logic(pipeline_id)
     except KylasAPIError as e:
@@ -1061,6 +1142,7 @@ async def create_lead(field_values: Dict[str, Any]) -> str:
     - For date/datetime fields: the user gives a time in their timezone (e.g. "11th Feb 2026 at 7:30 AM"). Call get_current_user, then parse_datetime_to_utc_iso_tool(local_datetime, timezone) and put the returned UTC ISO string in field_values.
     """
     try:
+        _reset_api_call_count()
         result = await create_lead_logic(field_values)
         lead_id = result.get("id", "?")
         name = f"{result.get('firstName', '')} {result.get('lastName', '')}".strip() or "Lead"
@@ -1116,6 +1198,7 @@ async def update_lead(lead_id: int, field_values: Dict[str, Any]) -> str:
     field_values: Map of field identifier to value (same as create_lead: firstName, lastName, email, phone with phone_country_code, customFieldValues, picklist Option IDs, date/datetime in UTC ISO, etc.). These are merged over the existing lead; other fields are left unchanged.
     """
     try:
+        _reset_api_call_count()
         result = await update_lead_logic(lead_id, field_values)
         lid = result.get("id", lead_id)
         name = f"{result.get('firstName', '')} {result.get('lastName', '')}".strip() or "Lead"
@@ -1206,6 +1289,7 @@ async def get_lead(lead_id: int) -> str:
     lead_id: The lead ID (e.g. from search_leads or search_leads_by_term results).
     """
     try:
+        _reset_api_call_count()
         lead = await get_lead_logic(lead_id)
         return _format_lead_for_display(lead)
     except KylasAPIError as e:
@@ -1323,6 +1407,7 @@ async def search_leads(
     Operators by type (examples): TEXT_FIELD: equal, contains, is_empty. NUMBER: equal, greater, between, is_null. PICK_LIST: equal, in, is_null. DATETIME_PICKER: today, yesterday, between, is_not_null, greater, less, current_week, etc.
     """
     try:
+        _reset_api_call_count()
         if not filters:
             return "Error: filters list cannot be empty. Provide at least one filter with field, operator, and value."
         return await search_leads_logic(filters, page, size, sort)
@@ -1413,6 +1498,7 @@ async def search_leads_by_term(
     sort: Sort e.g. "updatedAt,desc" (default).
     """
     try:
+        _reset_api_call_count()
         return await search_leads_by_term_logic(search_term, page, size, sort)
     except KylasAPIError as e:
         return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
@@ -1479,6 +1565,7 @@ async def search_idle_leads(
     sort: Sort e.g. "createdAt,desc" (default).
     """
     try:
+        _reset_api_call_count()
         if days < 0:
             return "Error: days must be non-negative."
         return await search_idle_leads_logic(days, time_zone, page, size, sort)
