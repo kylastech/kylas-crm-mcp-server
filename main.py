@@ -1,17 +1,33 @@
 """
-Kylas CRM MCP Server - Lead Only
+Kylas CRM MCP Server - Lead, Contact & Task Support
 
-Model Context Protocol server for Kylas CRM lead operations.
-- Tool 1: get_lead_field_instructions (call FIRST to get schema)
-- Tool 1b: get_current_user (GET /users/me — timezone, recordActions; use for date/datetime handling)
-- Tool 2: lookup_users (resolve user name to ID for createdBy, updatedBy, ownerId, etc.)
-- Tool 3: lookup_products, lookup_pipelines, get_pipeline_stages, get_pipeline_details (for Closed Lost/Unqualified reasons)
-- Tool 3a: parse_datetime_to_utc_iso_tool (user's local datetime + timezone → UTC ISO for create_lead)
-- Tool 4: create_lead (dynamic field_values; for datetime fields convert user time to UTC via parse_datetime_to_utc_iso_tool)
-- Tool 4b: update_lead (PUT /leads/{id}; same field_values format as create_lead)
-- Tool 5: search_leads (filter by criteria; date/datetime filters use current user timezone, do not convert to UTC)
-- Tool 5b: search_leads_by_term (search across multiple fields by a single term, e.g. "leads with akshay")
-- Tool 6: search_idle_leads (no activity for N days; uses current user timezone when not provided)
+Model Context Protocol server for Kylas CRM operations:
+
+LEAD OPERATIONS:
+- get_lead_field_instructions (call FIRST to get schema)
+- create_lead, update_lead, get_lead
+- search_leads (filter by criteria)
+- search_leads_by_term (multi-field search)
+- search_idle_leads (no activity for N days)
+- lookup_pipelines, get_pipeline_stages, get_pipeline_details
+
+CONTACT OPERATIONS:
+- get_contact_field_instructions (call FIRST to get schema)
+- create_contact, update_contact, get_contact
+- search_contacts (filter by criteria - NO PIPELINE)
+- search_contacts_by_term (multi-field search)
+
+TASK OPERATIONS:
+- get_task_field_instructions (call FIRST to get schema)
+- create_task, update_task, get_task
+- search_tasks (filter by criteria - NO PIPELINE)
+- search_tasks_by_term (multi-field search)
+
+SHARED TOOLS (for all Lead, Contact, Task):
+- get_current_user (timezone, ID; use for date/datetime handling)
+- lookup_users (resolve user names to IDs for ownerId, createdBy, updatedBy)
+- lookup_products (find products for field_values)
+- parse_datetime_to_utc_iso_tool (convert user timezone to UTC ISO)
 """
 
 import asyncio
@@ -74,21 +90,30 @@ if not API_KEY:
 # ---------------------------------------------------------------------------
 
 SYSTEM_INSTRUCTIONS = """
-# Kylas CRM MCP Server - Lead Only
+# Kylas CRM MCP Server - Lead, Contact & Task Support
 
-## CRITICAL: Workflow
+## CRITICAL: Workflow (applies to Lead, Contact, and Task)
 
-### Step 1: ALWAYS call `get_lead_field_instructions` FIRST
-Before creating a lead, you MUST call `get_lead_field_instructions` to get:
+### Step 1: ALWAYS call `get_<entity>_field_instructions` FIRST
+Before creating a lead, contact, or task, you MUST call the appropriate field instructions tool:
+- **For Leads:** `get_lead_field_instructions`
+- **For Contacts:** `get_contact_field_instructions`
+- **For Tasks:** `get_task_field_instructions`
+
+This provides:
 - All available lead fields (standard and custom)
 - API names for standard fields (e.g. firstName, lastName, emails, companyName)
 - Field IDs for custom fields (e.g. "57256")
 - Picklist option IDs for dropdowns (e.g. leadSource: 12345)
 
-### Step 2: Create/Update lead from user context only
+### Step 2: Create/Update Lead, Contact, or Task from user context only
 - Do NOT use a fixed list of fields. Infer from the user's message what they want to create or update.
 - Build `field_values` with ONLY the fields the user provided or implied.
-- For **update_lead**: pass the lead ID (e.g. from search results) and the fields to update; same field_values format as create_lead. For owner/ownerId use user ID from lookup_users.
+- For **update_lead**, **update_contact**, or **update_task**: pass the entity ID (e.g. from search results) and the fields to update; same field_values format as create. For owner/ownerId use user ID from lookup_users.
+- **Important differences:**
+  - **Contacts do NOT have:** pipeline, pipelineStage fields (Lead-specific)
+  - **Tasks do NOT have:** pipeline, pipelineStage fields (Lead-specific)
+  - Use only entity-specific fields from field instructions
 - Keys: use API Name for standard fields (from cheat sheet), or Field ID string for custom fields.
 - Values: use the exact format expected by Kylas (see below).
 
@@ -148,10 +173,24 @@ Before creating a lead, you MUST call `get_lead_field_instructions` to get:
 - Since the API cannot filter on "max of two fields", use **both** conditions: `updatedAt` ≤ threshold **and** `latestActivityCreatedAt` ≤ threshold (threshold = now − N days in ISO). That way the lead is returned only when both dates are old, i.e. the effective last activity is before the threshold.
 - Prefer the **search_idle_leads** tool when the user asks for idle/stagnant/inactive leads (e.g. "no activity since 10 days"). Otherwise build search_leads filters as above with operator "less_or_equal" and value = ISO date string for (now − N days).
 
+### Contact-Specific Operations (NO PIPELINE/STAGE)
+- **Search Contacts:** Use `search_contacts` with filters or `search_contacts_by_term` for multi-field search. **IMPORTANT:** Contacts do NOT support pipeline or pipelineStage filters.
+- **Update Contact:** Use `update_contact` with contact ID and field_values. Same field format as create_contact.
+- **Fields available:** firstName, lastName, emails, phoneNumbers, department, designation, company, ownerId, custom fields, etc.
+- **Fields NOT available:** pipeline, pipelineStage (these are Lead-specific).
+- All other instructions (email/phone normalization, timezone handling, lookup_users, lookup_products, custom fields) apply the same to contacts as leads.
+
+### Task-Specific Operations (NO PIPELINE/STAGE)
+- **Search Tasks:** Use `search_tasks` with filters or `search_tasks_by_term` for multi-field search. **IMPORTANT:** Tasks do NOT support pipeline or pipelineStage filters.
+- **Update Task:** Use `update_task` with task ID and field_values. Same field format as create_task.
+- **Fields available:** title, description, status, priority, dueDate, relatedTo, ownerId, custom fields, etc.
+- **Fields NOT available:** pipeline, pipelineStage (these are Lead-specific), emails, phoneNumbers (Contact-specific).
+- All other instructions (timezone handling, lookup_users, lookup_products, custom fields) apply the same to tasks.
+
 ### Date and datetime fields — timezone from current user (GET /users/me)
-- Whenever a **date or datetime** is involved (create lead with a date/datetime field, or filter by date/datetime), call **get_current_user** first to get the user's **timezone** (e.g. Asia/Calcutta).
-- **Creating a lead with a datetime field:** The user gives the datetime in their own timezone (e.g. "11th Feb 2026 at 7:30 AM"). You MUST convert it to UTC before sending: call **get_current_user** → get timezone → call **parse_datetime_to_utc_iso_tool**(user's datetime string, user's timezone) → put the returned UTC ISO string in field_values for that date/datetime field. Do not send the user's local time as-is.
-- **Filtering by date/datetime (search_leads, search_idle_leads):** Use the user's timezone from get_current_user as the **timeZone** in the filter (or rely on the server using it when timeZone is omitted). Keep the date/datetime value as the user said it (in their timezone); do **not** convert filter values to UTC — the API interprets them using the timeZone field.
+- Whenever a **date or datetime** is involved (create lead/contact with a date/datetime field, or filter by date/datetime), call **get_current_user** first to get the user's **timezone** (e.g. Asia/Calcutta).
+- **Creating a lead/contact with a datetime field:** The user gives the datetime in their own timezone (e.g. "11th Feb 2026 at 7:30 AM"). You MUST convert it to UTC before sending: call **get_current_user** → get timezone → call **parse_datetime_to_utc_iso_tool**(user's datetime string, user's timezone) → put the returned UTC ISO string in field_values for that date/datetime field. Do not send the user's local time as-is.
+- **Filtering by date/datetime (search_leads, search_contacts, search_idle_leads):** Use the user's timezone from get_current_user as the **timeZone** in the filter (or rely on the server using it when timeZone is omitted). Keep the date/datetime value as the user said it (in their timezone); do **not** convert filter values to UTC — the API interprets them using the timeZone field.
 """
 
 # ---------------------------------------------------------------------------
@@ -1577,12 +1616,653 @@ async def search_idle_leads(
 
 
 # ---------------------------------------------------------------------------
+# Contact Entity Support (similar to Lead but no pipeline/stage)
+# ---------------------------------------------------------------------------
+
+async def _fetch_contact_fields() -> List[Dict[str, Any]]:
+    """Fetch contact field metadata from Kylas API."""
+    async with get_client() as client:
+        response = await client.get(
+            "/entities/contact/fields",
+            params={"entityType": "contact", "custom-only": "false", "page": 0, "size": 100}
+        )
+        data = await handle_api_response(response, "Fetch contact fields")
+        if isinstance(data, list):
+            fields = data
+        else:
+            fields = data.get("data", data.get("content", []))
+        return [f for f in fields if f.get("active", True)]
+
+
+async def _get_custom_contact_field_id_to_name() -> Dict[str, str]:
+    """Return mapping of custom contact field ID -> internal name."""
+    fields = await _fetch_contact_fields()
+    custom = [f for f in fields if not f.get("standard", False)]
+    return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
+
+
+async def create_contact_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a contact with the given dynamic field_values."""
+    fv = dict(field_values)
+    has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
+    id_to_name = await _get_custom_contact_field_id_to_name() if has_custom_by_id else {}
+    payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    if not payload:
+        raise KylasAPIError("field_values cannot be empty")
+    logger.info("Creating contact with fields: %s", list(payload.keys()))
+    async with get_client() as client:
+        response = await client.post("/contacts", json=payload)
+        result = await handle_api_response(response, "Create contact")
+        logger.info("Contact created with ID: %s", result.get("id"))
+        return result
+
+
+async def update_contact_logic(contact_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """GET the contact first, merge field_values into it, then PUT the full body."""
+    contact_id = int(contact_id)
+    fv = dict(field_values)
+    if not fv:
+        raise KylasAPIError("field_values cannot be empty for update.")
+    has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
+    id_to_name = await _get_custom_contact_field_id_to_name() if has_custom_by_id else {}
+    payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    if not payload:
+        raise KylasAPIError("field_values produced an empty payload.")
+    logger.info("Updating contact %s with fields: %s", contact_id, list(payload.keys()))
+    async with get_client() as client:
+        get_response = await client.get(f"/contacts/{contact_id}")
+        existing = await handle_api_response(get_response, "Get contact")
+        merged = dict(existing)
+        for key, value in payload.items():
+            if key == "customFieldValues" and isinstance(value, dict):
+                merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
+            else:
+                merged[key] = value
+        response = await client.put(f"/contacts/{contact_id}", json=merged)
+        result = await handle_api_response(response, "Update contact")
+        logger.info("Contact %s updated", contact_id)
+        return result
+
+
+def _format_contact_for_display(contact: Dict[str, Any]) -> str:
+    """Format a contact object into a readable multi-line string."""
+    lines = ["=" * 60, "CONTACT DETAILS", "=" * 60]
+    lines.append(f"ID: {contact.get('id', '—')}")
+    lines.append(f"First Name: {contact.get('firstName', '—')}")
+    lines.append(f"Last Name: {contact.get('lastName', '—')}")
+    lines.append(f"Department: {contact.get('department') or '—'}")
+    lines.append(f"Designation: {contact.get('designation') or '—'}")
+    lines.append(f"Company: {contact.get('company') or '—'}")
+    # Emails
+    emails = contact.get("emails") or []
+    if emails:
+        for e in emails:
+            val = e.get("value", "")
+            typ = e.get("type", "")
+            prim = " (primary)" if e.get("primary") else ""
+            lines.append(f"Email ({typ}): {val}{prim}")
+    else:
+        lines.append("Email: —")
+    # Phones
+    phones = contact.get("phoneNumbers") or []
+    if phones:
+        for p in phones:
+            code = p.get("code", "")
+            val = p.get("value", "")
+            typ = p.get("type", "")
+            prim = " (primary)" if p.get("primary") else ""
+            lines.append(f"Phone ({typ}): +{code} {val}{prim}")
+    else:
+        lines.append("Phone: —")
+    lines.append(f"Owner ID: {contact.get('ownerId', '—')}")
+    lines.append(f"Created At: {contact.get('createdAt', '—')}")
+    lines.append(f"Updated At: {contact.get('updatedAt', '—')}")
+    # Custom fields
+    custom = contact.get("customFieldValues") or {}
+    if custom:
+        lines.append("")
+        lines.append("Custom fields:")
+        for k, v in custom.items():
+            lines.append(f"  {k}: {v}")
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_contact_field_instructions() -> str:
+    """
+    Get contact field reference (API names, Field IDs, picklist options).
+    ALWAYS call this FIRST before creating or updating a contact.
+    """
+    try:
+        _reset_api_call_count()
+        fields = await _fetch_contact_fields()
+        lines = ["# Contact Field Reference", ""]
+        for field in fields:
+            lines.extend(_format_field(field, include_filterable=True))
+        return "\n".join(lines)
+    except KylasAPIError as e:
+        return f"✗ Failed to fetch fields: {e.message}"
+    except Exception as e:
+        logger.exception("get_contact_field_instructions")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def create_contact(field_values: Dict[str, Any]) -> str:
+    """
+    Create a contact with dynamic field values. Same format as create_lead but without pipeline fields.
+    ALWAYS call get_contact_field_instructions FIRST to get field names and IDs.
+    """
+    try:
+        _reset_api_call_count()
+        result = await create_contact_logic(field_values)
+        contact_id = result.get("id", "?")
+        first_name = result.get("firstName", "")
+        last_name = result.get("lastName", "")
+        name = f"{first_name} {last_name}".strip() or "Contact"
+        return f"✓ Contact created successfully.\n  ID: {contact_id}\n  Name: {name}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to create contact: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("create_contact")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def update_contact(contact_id: int, field_values: Dict[str, Any]) -> str:
+    """
+    Update a contact. Fetches current contact, merges your field_values into it, then updates.
+    Same field_values format as create_contact. Call get_contact_field_instructions first.
+    """
+    try:
+        _reset_api_call_count()
+        result = await update_contact_logic(contact_id, field_values)
+        cid = result.get("id", contact_id)
+        first_name = result.get("firstName", "")
+        last_name = result.get("lastName", "")
+        name = f"{first_name} {last_name}".strip() or "Contact"
+        return f"✓ Contact updated successfully.\n  ID: {cid}\n  Name: {name}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to update contact: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("update_contact")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def get_contact(contact_id: int) -> str:
+    """Get full details of a contact by ID."""
+    try:
+        _reset_api_call_count()
+        async with get_client() as client:
+            response = await client.get(f"/contacts/{contact_id}")
+            contact = await handle_api_response(response, "Get contact")
+        return _format_contact_for_display(contact)
+    except KylasAPIError as e:
+        return f"✗ Failed to get contact: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("get_contact")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def search_contacts_logic(
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """Search contacts with jsonRule; only filterable fields allowed."""
+    fields_list = await _fetch_contact_fields()
+    filterable_map = _get_filterable_fields_map(fields_list)
+    if not filterable_map:
+        return "No filterable contact fields found for this tenant."
+    default_tz = None
+    date_field_types = {"DATETIME_PICKER", "DATE", "DATE_PICKER"}
+    for f in filters:
+        fn = f.get("field")
+        if fn and fn in filterable_map and filterable_map[fn].get("type") in date_field_types and not f.get("timeZone"):
+            try:
+                user = await _fetch_current_user()
+                default_tz = user.get("timezone") or DEFAULT_TIMEZONE
+            except Exception:
+                default_tz = DEFAULT_TIMEZONE
+            break
+    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    if err:
+        return f"Invalid filters: {err}"
+    payload = {
+        "fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "department", "designation", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching contacts with %d filter(s)", len(filters))
+    async with get_client() as client:
+        response = await client.post("/search/contact", params=params, json=payload)
+        data = await handle_api_response(response, "Search contacts")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No contacts found matching the filters. (Total in DB: {total})"
+    lines = [f"Found {len(results)} contact(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for contact in results:
+        cid = contact.get("id", "?")
+        fn = contact.get("firstName") or ""
+        ln = contact.get("lastName") or ""
+        name = f"{fn} {ln}".strip() or "—"
+        email = _extract_primary_email(contact.get("emails"))
+        phone = _extract_primary_phone(contact.get("phoneNumbers"))
+        lines.append(f"• ID: {cid} | Name: {name} | Email: {email} | Phone: {phone}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_contacts(
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Search/filter contacts by criteria. Only fields marked [FILTERABLE] can be used.
+    Call get_contact_field_instructions first to see filterable fields and their types.
+    Same filter format as search_leads (no pipeline/stage filters for contacts).
+    """
+    try:
+        _reset_api_call_count()
+        if not filters:
+            return "Error: filters list cannot be empty. Provide at least one filter."
+        return await search_contacts_logic(filters, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_contacts")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def search_contacts_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """Search contacts by a single term across multiple fields."""
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    json_rule = _multi_field_json_rule(term)
+    payload = {
+        "fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "department", "designation", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching contacts by term: %r", term)
+    async with get_client() as client:
+        response = await client.post("/search/contact", params=params, json=payload)
+        data = await handle_api_response(response, "Search contacts by term")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No contacts found matching '{term}'. (Total in DB: {total})"
+    lines = [f"Found {len(results)} contact(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for contact in results:
+        cid = contact.get("id", "?")
+        fn = contact.get("firstName") or ""
+        ln = contact.get("lastName") or ""
+        name = f"{fn} {ln}".strip() or "—"
+        email = _extract_primary_email(contact.get("emails"))
+        phone = _extract_primary_phone(contact.get("phoneNumbers"))
+        lines.append(f"• ID: {cid} | Name: {name} | Email: {email} | Phone: {phone}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_contacts_by_term(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """
+    Search contacts by a single term across multiple fields (firstName, lastName, emails, phones, department, designation, etc.).
+    Use this when the user asks for "contacts with X", "contacts containing Y", or "contacts named Z" without specifying a field.
+    """
+    try:
+        _reset_api_call_count()
+        return await search_contacts_by_term_logic(search_term, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_contacts_by_term")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Task Entity Support (same as Contact/Lead but task-specific fields)
+# ---------------------------------------------------------------------------
+
+async def _fetch_task_fields() -> List[Dict[str, Any]]:
+    """Fetch task field metadata from Kylas API."""
+    async with get_client() as client:
+        response = await client.get(
+            "/entities/task/fields",
+            params={"entityType": "task", "custom-only": "false", "page": 0, "size": 100}
+        )
+        data = await handle_api_response(response, "Fetch task fields")
+        if isinstance(data, list):
+            fields = data
+        else:
+            fields = data.get("data", data.get("content", []))
+        return [f for f in fields if f.get("active", True)]
+
+
+async def _get_custom_task_field_id_to_name() -> Dict[str, str]:
+    """Return mapping of custom task field ID -> internal name."""
+    fields = await _fetch_task_fields()
+    custom = [f for f in fields if not f.get("standard", False)]
+    return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
+
+
+async def create_task_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a task with the given dynamic field_values."""
+    fv = dict(field_values)
+    has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
+    id_to_name = await _get_custom_task_field_id_to_name() if has_custom_by_id else {}
+    payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    if not payload:
+        raise KylasAPIError("field_values cannot be empty")
+    logger.info("Creating task with fields: %s", list(payload.keys()))
+    async with get_client() as client:
+        response = await client.post("/tasks", json=payload)
+        result = await handle_api_response(response, "Create task")
+        logger.info("Task created with ID: %s", result.get("id"))
+        return result
+
+
+async def update_task_logic(task_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """GET the task first, merge field_values into it, then PUT the full body."""
+    task_id = int(task_id)
+    fv = dict(field_values)
+    if not fv:
+        raise KylasAPIError("field_values cannot be empty for update.")
+    has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
+    id_to_name = await _get_custom_task_field_id_to_name() if has_custom_by_id else {}
+    payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    if not payload:
+        raise KylasAPIError("field_values produced an empty payload.")
+    logger.info("Updating task %s with fields: %s", task_id, list(payload.keys()))
+    async with get_client() as client:
+        get_response = await client.get(f"/tasks/{task_id}")
+        existing = await handle_api_response(get_response, "Get task")
+        merged = dict(existing)
+        for key, value in payload.items():
+            if key == "customFieldValues" and isinstance(value, dict):
+                merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
+            else:
+                merged[key] = value
+        response = await client.put(f"/tasks/{task_id}", json=merged)
+        result = await handle_api_response(response, "Update task")
+        logger.info("Task %s updated", task_id)
+        return result
+
+
+def _format_task_for_display(task: Dict[str, Any]) -> str:
+    """Format a task object into a readable multi-line string."""
+    lines = ["=" * 60, "TASK DETAILS", "=" * 60]
+    lines.append(f"ID: {task.get('id', '—')}")
+    lines.append(f"Title: {task.get('title', '—')}")
+    lines.append(f"Description: {task.get('description') or '—'}")
+    lines.append(f"Status: {task.get('status') or '—'}")
+    lines.append(f"Priority: {task.get('priority') or '—'}")
+    lines.append(f"Due Date: {task.get('dueDate') or '—'}")
+    lines.append(f"Related To: {task.get('relatedTo') or '—'}")
+    lines.append(f"Owner ID: {task.get('ownerId', '—')}")
+    lines.append(f"Created At: {task.get('createdAt', '—')}")
+    lines.append(f"Updated At: {task.get('updatedAt', '—')}")
+    # Custom fields
+    custom = task.get("customFieldValues") or {}
+    if custom:
+        lines.append("")
+        lines.append("Custom fields:")
+        for k, v in custom.items():
+            lines.append(f"  {k}: {v}")
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_task_field_instructions() -> str:
+    """
+    Get task field reference (API names, Field IDs, picklist options).
+    ALWAYS call this FIRST before creating or updating a task.
+    """
+    try:
+        _reset_api_call_count()
+        fields = await _fetch_task_fields()
+        lines = ["# Task Field Reference", ""]
+        for field in fields:
+            lines.extend(_format_field(field, include_filterable=True))
+        return "\n".join(lines)
+    except KylasAPIError as e:
+        return f"✗ Failed to fetch fields: {e.message}"
+    except Exception as e:
+        logger.exception("get_task_field_instructions")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def create_task(field_values: Dict[str, Any]) -> str:
+    """
+    Create a task with dynamic field values. Same format as create_contact/create_lead but task-specific.
+    ALWAYS call get_task_field_instructions FIRST to get field names and IDs.
+    """
+    try:
+        _reset_api_call_count()
+        result = await create_task_logic(field_values)
+        task_id = result.get("id", "?")
+        title = result.get("title", "Task")
+        return f"✓ Task created successfully.\n  ID: {task_id}\n  Title: {title}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to create task: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("create_task")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def update_task(task_id: int, field_values: Dict[str, Any]) -> str:
+    """
+    Update a task. Fetches current task, merges your field_values into it, then updates.
+    Same field_values format as create_task. Call get_task_field_instructions first.
+    """
+    try:
+        _reset_api_call_count()
+        result = await update_task_logic(task_id, field_values)
+        tid = result.get("id", task_id)
+        title = result.get("title", "Task")
+        return f"✓ Task updated successfully.\n  ID: {tid}\n  Title: {title}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to update task: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("update_task")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def get_task(task_id: int) -> str:
+    """Get full details of a task by ID."""
+    try:
+        _reset_api_call_count()
+        async with get_client() as client:
+            response = await client.get(f"/tasks/{task_id}")
+            task = await handle_api_response(response, "Get task")
+        return _format_task_for_display(task)
+    except KylasAPIError as e:
+        return f"✗ Failed to get task: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("get_task")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def search_tasks_logic(
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """Search tasks with jsonRule; only filterable fields allowed."""
+    fields_list = await _fetch_task_fields()
+    filterable_map = _get_filterable_fields_map(fields_list)
+    if not filterable_map:
+        return "No filterable task fields found for this tenant."
+    default_tz = None
+    date_field_types = {"DATETIME_PICKER", "DATE", "DATE_PICKER"}
+    for f in filters:
+        fn = f.get("field")
+        if fn and fn in filterable_map and filterable_map[fn].get("type") in date_field_types and not f.get("timeZone"):
+            try:
+                user = await _fetch_current_user()
+                default_tz = user.get("timezone") or DEFAULT_TIMEZONE
+            except Exception:
+                default_tz = DEFAULT_TIMEZONE
+            break
+    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    if err:
+        return f"Invalid filters: {err}"
+    payload = {
+        "fields": ["id", "title", "status", "priority", "dueDate", "ownerId", "relatedTo", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching tasks with %d filter(s)", len(filters))
+    async with get_client() as client:
+        response = await client.post("/search/task", params=params, json=payload)
+        data = await handle_api_response(response, "Search tasks")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No tasks found matching the filters. (Total in DB: {total})"
+    lines = [f"Found {len(results)} task(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for task in results:
+        tid = task.get("id", "?")
+        title = task.get("title", "—")
+        status = task.get("status", "—")
+        priority = task.get("priority", "—")
+        due_date = task.get("dueDate", "—")
+        lines.append(f"• ID: {tid} | Title: {title} | Status: {status} | Priority: {priority} | Due: {due_date}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_tasks(
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Search/filter tasks by criteria. Only fields marked [FILTERABLE] can be used.
+    Call get_task_field_instructions first to see filterable fields and their types.
+    Same filter format as search_leads/search_contacts (no pipeline filters for tasks).
+    """
+    try:
+        _reset_api_call_count()
+        if not filters:
+            return "Error: filters list cannot be empty. Provide at least one filter."
+        return await search_tasks_logic(filters, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_tasks")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def search_tasks_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """Search tasks by a single term across multiple fields."""
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    json_rule = _multi_field_json_rule(term)
+    payload = {
+        "fields": ["id", "title", "status", "priority", "dueDate", "ownerId", "relatedTo", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching tasks by term: %r", term)
+    async with get_client() as client:
+        response = await client.post("/search/task", params=params, json=payload)
+        data = await handle_api_response(response, "Search tasks by term")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No tasks found matching '{term}'. (Total in DB: {total})"
+    lines = [f"Found {len(results)} task(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for task in results:
+        tid = task.get("id", "?")
+        title = task.get("title", "—")
+        status = task.get("status", "—")
+        priority = task.get("priority", "—")
+        lines.append(f"• ID: {tid} | Title: {title} | Status: {status} | Priority: {priority}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_tasks_by_term(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """
+    Search tasks by a single term across multiple fields (title, description, status, etc.).
+    Use this when the user asks for "tasks with X", "tasks containing Y", or "tasks titled Z" without specifying a field.
+    """
+    try:
+        _reset_api_call_count()
+        return await search_tasks_by_term_logic(search_term, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_tasks_by_term")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
 
 def run() -> None:
     """Entry point for console script (e.g. kylas-crm-mcp)."""
-    logger.info("Starting Kylas CRM MCP Server (Lead only)...")
+    logger.info("Starting Kylas CRM MCP Server (Lead + Contact + Task support)...")
     mcp.run()
 
 
