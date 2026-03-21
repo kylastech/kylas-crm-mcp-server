@@ -22,6 +22,7 @@ TASK OPERATIONS:
 - create_task, update_task, get_task
 - search_tasks (filter by criteria - NO PIPELINE)
 - search_tasks_by_term (multi-field search)
+- search_tasks_for_lead, search_tasks_for_contact, search_tasks_for_deal, search_tasks_for_company (find tasks associated with entity)
 
 SHARED TOOLS (for all Lead, Contact, Task):
 - get_current_user (timezone, ID; use for date/datetime handling)
@@ -186,6 +187,13 @@ This provides:
 - **Fields available:** title, description, status, priority, dueDate, relatedTo, ownerId, custom fields, etc.
 - **Fields NOT available:** pipeline, pipelineStage (these are Lead-specific), emails, phoneNumbers (Contact-specific).
 - All other instructions (timezone handling, lookup_users, lookup_products, custom fields) apply the same to tasks.
+
+### Task Association Filters (finding tasks for a specific entity)
+- **Find tasks for a Lead:** Use `search_tasks_for_lead` with the lead ID. Internally filters by `associatedLeads` field.
+- **Find tasks for a Contact:** Use `search_tasks_for_contact` with the contact ID. Internally filters by `associatedContacts` field.
+- **Find tasks for a Deal:** Use `search_tasks_for_deal` with the deal ID. Internally filters by `associatedDeals` field.
+- **Find tasks for a Company:** Use `search_tasks_for_company` with the company ID. Internally filters by `associatedCompanies` field.
+- These are convenience tools; alternatively, use `search_tasks` with filters like `{"field": "associatedLeads", "operator": "equal", "value": <lead_id>}`.
 
 ### Date and datetime fields — timezone from current user (GET /users/me)
 - Whenever a **date or datetime** is involved (create lead/contact with a date/datetime field, or filter by date/datetime), call **get_current_user** first to get the user's **timezone** (e.g. Asia/Calcutta).
@@ -1953,6 +1961,57 @@ async def search_contacts_by_term(
 # Task Entity Support (same as Contact/Lead but task-specific fields)
 # ---------------------------------------------------------------------------
 
+# Task entity relationship lookup functions
+async def lookup_leads_for_task(search_term: str = "") -> Dict[str, Any]:
+    """Look up leads to associate with a task. Returns top 10 leads matching the search term."""
+    query = f"firstName:{search_term}" if search_term else "firstName:"
+    async with get_client() as client:
+        response = await client.get(
+            "/search/lead/lookup",
+            params={"converted": "false", "q": query}
+        )
+        return await handle_api_response(response, "Lookup leads for task")
+
+
+async def lookup_contacts_for_task(search_term: str = "") -> Dict[str, Any]:
+    """Look up contacts to associate with a task. Returns top 10 contacts matching the search term."""
+    query = f"name:{search_term}" if search_term else "name:"
+    payload = {"deal": [], "idToExclude": [], "company": []}
+    async with get_client() as client:
+        response = await client.post(
+            "/search/contact/associated-with-entity",
+            params={"view": "task", "q": query},
+            json=payload
+        )
+        return await handle_api_response(response, "Lookup contacts for task")
+
+
+async def lookup_deals_for_task(search_term: str = "") -> Dict[str, Any]:
+    """Look up deals to associate with a task. Returns top 10 deals matching the search term."""
+    query = f"name:{search_term}" if search_term else "name:"
+    payload = {"contact": [], "idToExclude": [], "company": []}
+    async with get_client() as client:
+        response = await client.post(
+            "/search/deal/associated-with-entity",
+            params={"view": "task", "q": query},
+            json=payload
+        )
+        return await handle_api_response(response, "Lookup deals for task")
+
+
+async def lookup_companies_for_task(search_term: str = "") -> Dict[str, Any]:
+    """Look up companies to associate with a task. Returns top 10 companies matching the search term."""
+    query = f"name:{search_term}" if search_term else "name:"
+    payload = {"deal": [], "idToExclude": [], "contact": []}
+    async with get_client() as client:
+        response = await client.post(
+            "/search/company/associated-with-entity",
+            params={"view": "task", "q": query},
+            json=payload
+        )
+        return await handle_api_response(response, "Lookup companies for task")
+
+
 async def _fetch_task_fields() -> List[Dict[str, Any]]:
     """Fetch task field metadata from Kylas API."""
     async with get_client() as client:
@@ -2022,13 +2081,13 @@ def _format_task_for_display(task: Dict[str, Any]) -> str:
     """Format a task object into a readable multi-line string."""
     lines = ["=" * 60, "TASK DETAILS", "=" * 60]
     lines.append(f"ID: {task.get('id', '—')}")
-    lines.append(f"Title: {task.get('title', '—')}")
+    lines.append(f"Name: {task.get('name', '—')}")
     lines.append(f"Description: {task.get('description') or '—'}")
     lines.append(f"Status: {task.get('status') or '—'}")
     lines.append(f"Priority: {task.get('priority') or '—'}")
     lines.append(f"Due Date: {task.get('dueDate') or '—'}")
-    lines.append(f"Related To: {task.get('relatedTo') or '—'}")
-    lines.append(f"Owner ID: {task.get('ownerId', '—')}")
+    lines.append(f"Assigned To: {task.get('assignedTo') or '—'}")
+    lines.append(f"Reminder: {task.get('reminder') or '—'}")
     lines.append(f"Created At: {task.get('createdAt', '—')}")
     lines.append(f"Updated At: {task.get('updatedAt', '—')}")
     # Custom fields
@@ -2072,8 +2131,8 @@ async def create_task(field_values: Dict[str, Any]) -> str:
         _reset_api_call_count()
         result = await create_task_logic(field_values)
         task_id = result.get("id", "?")
-        title = result.get("title", "Task")
-        return f"✓ Task created successfully.\n  ID: {task_id}\n  Title: {title}"
+        name = result.get("name", "Task")
+        return f"✓ Task created successfully.\n  ID: {task_id}\n  Name: {name}"
     except ValueError as e:
         return f"✗ {e}"
     except KylasAPIError as e:
@@ -2093,8 +2152,8 @@ async def update_task(task_id: int, field_values: Dict[str, Any]) -> str:
         _reset_api_call_count()
         result = await update_task_logic(task_id, field_values)
         tid = result.get("id", task_id)
-        title = result.get("title", "Task")
-        return f"✓ Task updated successfully.\n  ID: {tid}\n  Title: {title}"
+        name = result.get("name", "Task")
+        return f"✓ Task updated successfully.\n  ID: {tid}\n  Name: {name}"
     except ValueError as e:
         return f"✗ {e}"
     except KylasAPIError as e:
@@ -2146,7 +2205,7 @@ async def search_tasks_logic(
     if err:
         return f"Invalid filters: {err}"
     payload = {
-        "fields": ["id", "title", "status", "priority", "dueDate", "ownerId", "relatedTo", "createdAt"],
+        "fields": ["id", "name", "status", "priority", "dueDate", "assignedTo", "relation", "createdAt"],
         "jsonRule": json_rule,
     }
     params = {"page": page, "size": min(size, 100)}
@@ -2154,7 +2213,7 @@ async def search_tasks_logic(
         params["sort"] = sort
     logger.info("Searching tasks with %d filter(s)", len(filters))
     async with get_client() as client:
-        response = await client.post("/search/task", params=params, json=payload)
+        response = await client.post("/tasks/search", params=params, json=payload)
         data = await handle_api_response(response, "Search tasks")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -2164,11 +2223,11 @@ async def search_tasks_logic(
     lines = [f"Found {len(results)} task(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for task in results:
         tid = task.get("id", "?")
-        title = task.get("title", "—")
+        name = task.get("name", "—")
         status = task.get("status", "—")
         priority = task.get("priority", "—")
         due_date = task.get("dueDate", "—")
-        lines.append(f"• ID: {tid} | Title: {title} | Status: {status} | Priority: {priority} | Due: {due_date}")
+        lines.append(f"• ID: {tid} | Name: {name} | Status: {status} | Priority: {priority} | Due: {due_date}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -2209,7 +2268,7 @@ async def search_tasks_by_term_logic(
         return "Error: search_term cannot be empty."
     json_rule = _multi_field_json_rule(term)
     payload = {
-        "fields": ["id", "title", "status", "priority", "dueDate", "ownerId", "relatedTo", "createdAt"],
+        "fields": ["id", "name", "status", "priority", "dueDate", "assignedTo", "relation", "createdAt"],
         "jsonRule": json_rule,
     }
     params = {"page": page, "size": min(size, 100)}
@@ -2217,7 +2276,7 @@ async def search_tasks_by_term_logic(
         params["sort"] = sort
     logger.info("Searching tasks by term: %r", term)
     async with get_client() as client:
-        response = await client.post("/search/task", params=params, json=payload)
+        response = await client.post("/tasks/search", params=params, json=payload)
         data = await handle_api_response(response, "Search tasks by term")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -2227,10 +2286,10 @@ async def search_tasks_by_term_logic(
     lines = [f"Found {len(results)} task(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for task in results:
         tid = task.get("id", "?")
-        title = task.get("title", "—")
+        name = task.get("name", "—")
         status = task.get("status", "—")
         priority = task.get("priority", "—")
-        lines.append(f"• ID: {tid} | Title: {title} | Status: {status} | Priority: {priority}")
+        lines.append(f"• ID: {tid} | Name: {name} | Status: {status} | Priority: {priority}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -2253,6 +2312,219 @@ async def search_tasks_by_term(
         return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
     except Exception as e:
         logger.exception("search_tasks_by_term")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def lookup_leads_for_task_tool(search_term: str = "") -> str:
+    """
+    Look up leads to associate with a task.
+    Returns top 10 leads matching the search term (searches by firstName).
+    Use this when the user wants to create a task for a specific lead.
+    """
+    try:
+        _reset_api_call_count()
+        result = await lookup_leads_for_task(search_term)
+        leads = result if isinstance(result, list) else result.get("data", result.get("content", []))
+        if not leads:
+            return f"No leads found matching '{search_term}'."
+        lines = [f"Found {len(leads)} lead(s) matching '{search_term}':", "-" * 60]
+        for lead in leads[:10]:
+            lead_id = lead.get("id", "?")
+            first_name = lead.get("firstName", "—")
+            last_name = lead.get("lastName", "—")
+            company = lead.get("companyName", "—")
+            lines.append(f"• ID: {lead_id} | Name: {first_name} {last_name} | Company: {company}")
+        lines.append("-" * 60)
+        return "\n".join(lines)
+    except KylasAPIError as e:
+        return f"✗ Lookup failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("lookup_leads_for_task_tool")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def lookup_contacts_for_task_tool(search_term: str = "") -> str:
+    """
+    Look up contacts to associate with a task.
+    Returns top 10 contacts matching the search term (searches by name).
+    Use this when the user wants to create a task for a specific contact.
+    """
+    try:
+        _reset_api_call_count()
+        result = await lookup_contacts_for_task(search_term)
+        contacts = result if isinstance(result, list) else result.get("data", result.get("content", []))
+        if not contacts:
+            return f"No contacts found matching '{search_term}'."
+        lines = [f"Found {len(contacts)} contact(s) matching '{search_term}':", "-" * 60]
+        for contact in contacts[:10]:
+            contact_id = contact.get("id", "?")
+            name = contact.get("name", "—")
+            email = contact.get("emails", [{}])[0].get("value", "—") if contact.get("emails") else "—"
+            lines.append(f"• ID: {contact_id} | Name: {name} | Email: {email}")
+        lines.append("-" * 60)
+        return "\n".join(lines)
+    except KylasAPIError as e:
+        return f"✗ Lookup failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("lookup_contacts_for_task_tool")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def lookup_deals_for_task_tool(search_term: str = "") -> str:
+    """
+    Look up deals to associate with a task.
+    Returns top 10 deals matching the search term (searches by name).
+    Use this when the user wants to create a task for a specific deal.
+    """
+    try:
+        _reset_api_call_count()
+        result = await lookup_deals_for_task(search_term)
+        deals = result if isinstance(result, list) else result.get("data", result.get("content", []))
+        if not deals:
+            return f"No deals found matching '{search_term}'."
+        lines = [f"Found {len(deals)} deal(s) matching '{search_term}':", "-" * 60]
+        for deal in deals[:10]:
+            deal_id = deal.get("id", "?")
+            name = deal.get("name", "—")
+            value = deal.get("value", "—")
+            lines.append(f"• ID: {deal_id} | Name: {name} | Value: {value}")
+        lines.append("-" * 60)
+        return "\n".join(lines)
+    except KylasAPIError as e:
+        return f"✗ Lookup failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("lookup_deals_for_task_tool")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def lookup_companies_for_task_tool(search_term: str = "") -> str:
+    """
+    Look up companies to associate with a task.
+    Returns top 10 companies matching the search term (searches by name).
+    Use this when the user wants to create a task for a specific company.
+    """
+    try:
+        _reset_api_call_count()
+        result = await lookup_companies_for_task(search_term)
+        companies = result if isinstance(result, list) else result.get("data", result.get("content", []))
+        if not companies:
+            return f"No companies found matching '{search_term}'."
+        lines = [f"Found {len(companies)} compan(ies) matching '{search_term}':", "-" * 60]
+        for company in companies[:10]:
+            company_id = company.get("id", "?")
+            name = company.get("name", "—")
+            industry = company.get("industry", "—")
+            lines.append(f"• ID: {company_id} | Name: {name} | Industry: {industry}")
+        lines.append("-" * 60)
+        return "\n".join(lines)
+    except KylasAPIError as e:
+        return f"✗ Lookup failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("lookup_companies_for_task_tool")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def search_tasks_for_lead(
+    lead_id: int,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "dueDate,asc",
+) -> str:
+    """
+    Find tasks associated with a specific lead.
+    Pass the lead ID to get all tasks linked to that lead.
+    Internally filters by associatedLeads field.
+    """
+    try:
+        _reset_api_call_count()
+        filters = [{"field": "associatedLeads", "operator": "equal", "value": int(lead_id)}]
+        return await search_tasks_logic(filters, page, size, sort)
+    except ValueError as e:
+        return f"✗ Invalid lead ID: {e}"
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_tasks_for_lead")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def search_tasks_for_contact(
+    contact_id: int,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "dueDate,asc",
+) -> str:
+    """
+    Find tasks associated with a specific contact.
+    Pass the contact ID to get all tasks linked to that contact.
+    Internally filters by associatedContacts field.
+    """
+    try:
+        _reset_api_call_count()
+        filters = [{"field": "associatedContacts", "operator": "equal", "value": int(contact_id)}]
+        return await search_tasks_logic(filters, page, size, sort)
+    except ValueError as e:
+        return f"✗ Invalid contact ID: {e}"
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_tasks_for_contact")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def search_tasks_for_deal(
+    deal_id: int,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "dueDate,asc",
+) -> str:
+    """
+    Find tasks associated with a specific deal.
+    Pass the deal ID to get all tasks linked to that deal.
+    Internally filters by associatedDeals field.
+    """
+    try:
+        _reset_api_call_count()
+        filters = [{"field": "associatedDeals", "operator": "equal", "value": int(deal_id)}]
+        return await search_tasks_logic(filters, page, size, sort)
+    except ValueError as e:
+        return f"✗ Invalid deal ID: {e}"
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_tasks_for_deal")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def search_tasks_for_company(
+    company_id: int,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "dueDate,asc",
+) -> str:
+    """
+    Find tasks associated with a specific company.
+    Pass the company ID to get all tasks linked to that company.
+    Internally filters by associatedCompanies field.
+    """
+    try:
+        _reset_api_call_count()
+        filters = [{"field": "associatedCompanies", "operator": "equal", "value": int(company_id)}]
+        return await search_tasks_logic(filters, page, size, sort)
+    except ValueError as e:
+        return f"✗ Invalid company ID: {e}"
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_tasks_for_company")
         return f"✗ Unexpected error: {str(e)}"
 
 
