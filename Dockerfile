@@ -1,4 +1,4 @@
-# Kylas CRM MCP Server - Lead Only
+# Kylas CRM MCP Server - Lead & Deal Management
 # MCP Registry: set io.modelcontextprotocol.server.name to your server name (e.g. io.github.USERNAME/kylas-crm)
 FROM python:3.11-slim
 LABEL io.modelcontextprotocol.server.name="io.github.akshaykylas94/kylas-crm"
