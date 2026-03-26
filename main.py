@@ -158,12 +158,14 @@ This provides:
 **Create lead with stage** (e.g. "create lead with open stage"):
 - User must confirm which pipeline before creating. Follow the rules above (list pipelines, get confirmation; if only one pipeline, still confirm). Then get_pipeline_stages for that pipeline, pick the matching stage (e.g. Open), and include pipeline + pipelineStage (or pipeline object with stage) in create_lead field_values.
 
-**Update lead pipeline/stage** (e.g. "move this lead to Open", "set stage to Won"):
-- If the user did **not** specify which pipeline: call lookup_pipelines, list pipelines, and ask which pipeline to use. Then get_pipeline_stages for that pipeline and proceed with update_lead.
-- If the lead **already has a pipeline** and the user is moving the lead to a **different pipeline** (e.g. lead is in "Default Lead Pipeline" and user says "move to new PIpeline"): ask for confirmation: "This lead is already in [current pipeline name]. Are you sure you want to move it to [new pipeline name]?" Only after the user confirms, call update_lead with the new pipeline and stage.
-- If only one pipeline exists and user didn’t name it: still ask for confirmation before updating.
-
-- **When moving to Closed Lost or Closed Unqualified:** A closing reason is required. Call **get_pipeline_details**(pipeline_id) to get the pipeline's **lostReasons** (for Closed Lost) or **unqualifiedReasons** (for Closed Unqualified). Present the list to the user and ask them to pick one. Then call update_lead with pipeline, stage, and **pipelineStageReason** set to the **exact string** the user chose (e.g. "No followup", "Booked with competitor", "False enquiry").
+**Move lead to a pipeline stage** (e.g. "move this lead to Open", "set stage to Won"):
+- **Use `update_lead(lead_id, {"pipelineStage": stage_id})` to move a lead to a specific pipeline stage.**
+- If the user did **not** specify which pipeline: call lookup_pipelines, list pipelines, and ask which pipeline to use. Then call get_pipeline_stages for that pipeline.
+- Once the user confirms the pipeline and stage, call **update_lead** with the lead_id and field_values `{"pipelineStage": stage_id}` from get_pipeline_stages.
+- The tool automatically fetches the correct `forecastingType` for the stage and sends the full lead object.
+- If the lead **already has a pipeline** and the user is moving to a **different pipeline**: ask for confirmation first (e.g. "This lead is in [current pipeline]. Move it to [new pipeline]?").
+- If only one pipeline exists and user didn’t name it: still ask for confirmation.
+- **When moving to Closed Lost or Closed Unqualified:** A closing reason may be required (check with get_pipeline_details). If required, ask the user to pick a reason from lostReasons or unqualifiedReasons, then call update_lead with both `{"pipelineStage": stage_id, "pipelineStageReason": reason_string}`.
 
 **Search/filter by stage** (e.g. "open leads", "closed leads", "leads in Won"):
 - Same as above: ask for pipeline first (list and get confirmation), then get_pipeline_stages, then search_leads with pipeline + pipelineStage filters.
@@ -182,9 +184,16 @@ This provides:
 - All other instructions (email/phone normalization, timezone handling, lookup_users, lookup_products, custom fields) apply the same to contacts as leads.
 
 ### Task-Specific Operations (NO PIPELINE/STAGE)
+- **Create Task with Entity Association:** When creating a task on a lead, contact, deal, or company, include the **"relation"** field:
+  ```json
+  "relation": [
+    {"targetEntityId": <id>, "targetEntityType": "LEAD|CONTACT|DEAL|COMPANY", "targetEntityName": "<entity_name>"}
+  ]
+  ```
+  Example: `create_task({"name": "Follow up", "relation": [{"targetEntityId": 45089710, "targetEntityType": "LEAD", "targetEntityName": "John Doe"}]})`
 - **Search Tasks:** Use `search_tasks` with filters or `search_tasks_by_term` for multi-field search. **IMPORTANT:** Tasks do NOT support pipeline or pipelineStage filters.
-- **Update Task:** Use `update_task` with task ID and field_values. Same field format as create_task.
-- **Fields available:** title, description, status, priority, dueDate, relatedTo, ownerId, custom fields, etc.
+- **Update Task:** Use `update_task` with task ID and field_values. Same field format as create_task (including relation if updating associations).
+- **Fields available:** name, description, status, priority, dueDate, assignedTo, reminder, relation, custom fields, etc.
 - **Fields NOT available:** pipeline, pipelineStage (these are Lead-specific), emails, phoneNumbers (Contact-specific).
 - All other instructions (timezone handling, lookup_users, lookup_products, custom fields) apply the same to tasks.
 
@@ -426,6 +435,9 @@ Before creating or updating a deal, you MUST call `get_deal_field_instructions` 
 ### Pipeline and pipeline stage (create, update, search)
 - **Always resolve pipeline first when stage is involved.**
 - Call **lookup_pipelines** with `entity_type="DEAL"` when resolving a deal pipeline.
+- **To move a deal to a different stage in the same pipeline:** Use `update_deal(deal_id, {"pipelineStage": stage_id})`. The tool automatically updates the nested `pipeline.stage.id` and fetches the correct `forecastingType`.
+- **To move a deal to a completely different pipeline:** Use `update_deal(deal_id, {"pipeline": {...}, "forecastingType": "..."})` with the full pipeline object including nested stage and the matching forecastingType.
+- For closing reasons (Closed Lost, Closed Unqualified): call get_pipeline_details and ask user to pick a reason, then use update_deal with `pipelineStageReason` field.
 - Then follow the same workflow as leads: ask for confirmation, call get_pipeline_stages, get_pipeline_details for closing reasons, etc.
 
 ### Date and datetime fields — timezone from current user (GET /users/me)
@@ -580,7 +592,8 @@ def _build_search_json_rule(
         }
         # Pipeline/pipelineStage: API expects dependentFieldIds and relatedFieldIds for lead search
         if field_name == "pipeline":
-            rule["dependentFieldIds"] = ["pipelineStage", "pipelineStageReason"]
+            rule["dependentFieldIds"] = ["pipelineStage", ""
+                                                          ""]
         elif field_name == "pipelineStage":
             rule["relatedFieldIds"] = ["pipeline"]
         # Date/datetime fields: API requires timeZone; use filter's timeZone or current user's (default_timezone) or fallback
@@ -869,7 +882,7 @@ async def lookup_pipelines_logic(
         name = p.get("name", p.get("displayName", "—"))
         lines.append(f"  • ID: {pid}  |  Name: {name}")
     lines.append("-" * 50)
-    lines.append("Ask the user to confirm which pipeline to use (list id and name). Do NOT call get_pipeline_stages until the user has confirmed. After confirmation, call get_pipeline_stages with that pipeline ID only, then search_leads with pipeline + pipelineStage filters.")
+    lines.append("Ask the user to confirm which pipeline to use (list id and name). Do NOT call get_pipeline_stages until the user has confirmed. After confirmation, call get_pipeline_stages with that pipeline ID only, then search or update with pipeline + pipelineStage filters.")
     return "\n".join(lines)
 
 
@@ -881,12 +894,18 @@ async def lookup_pipelines(
     size: int = 50,
 ) -> str:
     """
-    Look up pipelines by name (for leads). Use when the user asks for leads by stage (e.g. open/closed/won/lost) but does not specify which pipeline.
+    Look up pipelines by name for leads or deals. Use when the user asks for items by stage but does not specify which pipeline.
+
+    **For Leads:** lookup_pipelines(query="", entity_type="LEAD")
+    **For Deals:** lookup_pipelines(query="", entity_type="DEAL")
+
+    Workflow:
     - Call this first; do NOT call get_pipeline_stages until after the user confirms the pipeline.
     - Present the pipeline(s) (id and name) and ask the user which pipeline they mean. If only one pipeline is found, still ask for confirmation.
-    - Only after the user confirms, call get_pipeline_stages with that pipeline ID to get stages for that pipeline, then search_leads.
+    - Only after the user confirms, call get_pipeline_stages with that pipeline ID to get stages, then search_leads or update_deal/update_lead.
+
     query: Search string. Use "name:<pipeline_name>" or just the pipeline name; empty string returns all pipelines for the entity.
-    entity_type: Entity type (default LEAD).
+    entity_type: Entity type - "LEAD" (default) or "DEAL".
     page: 0-based page (default 0).
     size: Max 50 (default 50).
     """
@@ -1290,6 +1309,36 @@ async def update_lead_logic(lead_id: int, field_values: Dict[str, Any]) -> Dict[
         for key, value in payload.items():
             if key == "customFieldValues" and isinstance(value, dict):
                 merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
+            elif key == "pipelineStage" and isinstance(value, (int, str)):
+                # Special handling: pipelineStage should update the existing pipeline's stage ID
+                # Also update forecastingType to match the stage's forecastingType
+                stage_id = int(value)
+                if isinstance(merged.get("pipeline"), dict):
+                    pipeline_id = merged["pipeline"].get("id")
+                    if not isinstance(merged["pipeline"].get("stage"), dict):
+                        merged["pipeline"]["stage"] = {}
+                    merged["pipeline"]["stage"]["id"] = stage_id
+
+                    # Fetch pipeline details to get the correct forecastingType for this stage
+                    try:
+                        if pipeline_id:
+                            pipeline_details = await get_pipeline_details_logic(pipeline_id)
+                            # Find the stage in the pipeline details and get its forecastingType
+                            if isinstance(pipeline_details, dict):
+                                stages = pipeline_details.get("stages", [])
+                                for stage in stages:
+                                    if stage.get("id") == stage_id:
+                                        forecast_type = stage.get("forecastingType")
+                                        if forecast_type:
+                                            merged["forecastingType"] = forecast_type
+                                        break
+                    except Exception as e:
+                        logger.warning("Could not fetch forecastingType for stage %s: %s", stage_id, e)
+                        # Continue without updating forecastingType; user can pass it explicitly if needed
+                else:
+                    # If no existing pipeline, we can't update stage
+                    logger.warning("Trying to set pipelineStage but lead has no pipeline object")
+                    raise KylasAPIError("Lead has no pipeline; cannot set stage. Use move_lead_to_stage instead.")
             else:
                 merged[key] = value
         response = await client.put(f"/leads/{lead_id}", json=merged)
@@ -2190,6 +2239,21 @@ async def create_task(field_values: Dict[str, Any]) -> str:
     """
     Create a task with dynamic field values. Same format as create_contact/create_lead but task-specific.
     ALWAYS call get_task_field_instructions FIRST to get field names and IDs.
+
+    **Important:** To assign the task to entities (lead, contact, deal, company), include "relation" in field_values:
+    "relation": [
+      {"targetEntityId": <lead_id>, "targetEntityType": "LEAD", "targetEntityName": "<lead_name>"},
+      {"targetEntityId": <contact_id>, "targetEntityType": "CONTACT", "targetEntityName": "<contact_name>"}
+    ]
+
+    Example: create_task({
+      "name": "Follow up",
+      "dueDate": "2026-03-26T18:29:59.999Z",
+      "assignedTo": 594,
+      "relation": [
+        {"targetEntityId": 45089710, "targetEntityType": "LEAD", "targetEntityName": "Akshay"}
+      ]
+    })
     """
     try:
         _reset_api_call_count()
@@ -2799,6 +2863,36 @@ async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[
         for key, value in payload.items():
             if key == "customFieldValues" and isinstance(value, dict):
                 merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
+            elif key == "pipelineStage" and isinstance(value, (int, str)):
+                # Special handling: pipelineStage should update the existing pipeline's stage ID
+                # Also update forecastingType to match the stage's forecastingType
+                stage_id = int(value)
+                if isinstance(merged.get("pipeline"), dict):
+                    pipeline_id = merged["pipeline"].get("id")
+                    if not isinstance(merged["pipeline"].get("stage"), dict):
+                        merged["pipeline"]["stage"] = {}
+                    merged["pipeline"]["stage"]["id"] = stage_id
+
+                    # Fetch pipeline details to get the correct forecastingType for this stage
+                    try:
+                        if pipeline_id:
+                            pipeline_details = await get_pipeline_details_logic(pipeline_id)
+                            # Find the stage in the pipeline details and get its forecastingType
+                            if isinstance(pipeline_details, dict):
+                                stages = pipeline_details.get("stages", [])
+                                for stage in stages:
+                                    if stage.get("id") == stage_id:
+                                        forecast_type = stage.get("forecastingType")
+                                        if forecast_type:
+                                            merged["forecastingType"] = forecast_type
+                                        break
+                    except Exception as e:
+                        logger.warning("Could not fetch forecastingType for stage %s: %s", stage_id, e)
+                        # Continue without updating forecastingType; user can pass it explicitly if needed
+                else:
+                    # If no existing pipeline, we can't update stage
+                    logger.warning("Trying to set pipelineStage but deal has no pipeline object")
+                    raise KylasAPIError("Deal has no pipeline; cannot set stage. Use move_deal_to_stage instead.")
             else:
                 merged[key] = value
         response = await client.put(f"/deals/{deal_id}", json=merged)
@@ -2815,6 +2909,11 @@ async def update_deal(deal_id: int, field_values: Dict[str, Any]) -> str:
 
     deal_id: The deal ID to update (e.g. from search_deals or search_deals_by_term results).
     field_values: Map of field identifier to value (same as create_deal).
+
+    **Pipeline updates:**
+    - To change stage in current pipeline: {"pipelineStage": stage_id}
+      (automatically updates pipeline.stage.id and forecastingType)
+    - To change to different pipeline: {"pipeline": {"id": id, "name": "name", "stage": {"id": id, "name": "name"}}, "forecastingType": "..."}
     """
     try:
         _reset_api_call_count()
