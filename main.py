@@ -3291,6 +3291,65 @@ async def search_idle_deals(
 
 
 # ---------------------------------------------------------------------------
+# NOTES: Add notes to Lead, Contact, Deal, Company
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def add_note(entity_type: str, entity_id: int, note_text: str) -> str:
+    """
+    Add a note to a Lead, Contact, Deal, or Company.
+
+    entity_type: The entity type ("LEAD", "CONTACT", "DEAL", or "COMPANY").
+    entity_id: The ID of the entity (e.g. lead ID, contact ID, deal ID, company ID).
+    note_text: The note text to add (supports basic HTML formatting).
+
+    Returns the note details if successful.
+    """
+    try:
+        _reset_api_call_count()
+        entity_type_upper = entity_type.upper().strip()
+        if entity_type_upper not in ["LEAD", "CONTACT", "DEAL", "COMPANY"]:
+            return f"✗ Invalid entity type: '{entity_type}'. Must be one of: LEAD, CONTACT, DEAL, COMPANY"
+
+        entity_id = int(entity_id)
+        if not note_text or not note_text.strip():
+            return "✗ Note text cannot be empty."
+
+        # Wrap note text in <div> tags for API
+        description = f"<div>{note_text}</div>"
+
+        payload = {
+            "sourceEntity": {
+                "description": description,
+                "mentions": None,
+            },
+            "targetEntityId": str(entity_id),
+            "targetEntityType": entity_type_upper,
+        }
+
+        logger.info(
+            f"Adding note to {entity_type_upper} {entity_id}"
+        )
+
+        async with get_client() as client:
+            response = await client.post("/notes/relation", json=payload)
+            await handle_api_response(response, "Add note")
+
+            logger.info(f"Note added to {entity_type_upper} {entity_id}")
+            return (
+                f"✓ Note added successfully to {entity_type_upper} {entity_id}.\n"
+                f"  Note: {note_text[:100]}..."
+            )
+    except ValueError as e:
+        return f"✗ Invalid entity ID: {str(e)}"
+    except KylasAPIError as e:
+        return f"✗ Failed to add note: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("add_note")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
 
