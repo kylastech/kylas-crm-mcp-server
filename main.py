@@ -480,12 +480,15 @@ def _format_field(field: Dict[str, Any], include_filterable: bool = False) -> Li
     filterable_marker = " [FILTERABLE]" if (include_filterable and filterable) else ""
     lines.append(f"{prefix} '{label}' ({identifier}) - Type: {field_type}{required_marker}{filterable_marker}")
     if field_type in ["PICK_LIST", "MULTI_PICKLIST"]:
-        picklist = field.get("picklist", {})
-        values = picklist.get("values", [])
+        picklist = field.get("picklist") or {}
+        # Deals use "picklistValues", Leads use "values"
+        values = picklist.get("values") or picklist.get("picklistValues", [])
         if values:
             use_name = name in PICKLIST_FIELDS_USE_INTERNAL_NAME
             lines.append("  └─ Options (use internal name in search)" if use_name else "  └─ Options (use ID in search):")
             for val in values:
+                if not isinstance(val, dict):
+                    continue
                 val_label = val.get("displayName") or val.get("label") or val.get("name") or "Unknown"
                 val_id = val.get("id", "")
                 val_name = val.get("name", "")
@@ -506,8 +509,10 @@ async def _fetch_lead_fields() -> List[Dict[str, Any]]:
         data = await handle_api_response(response, "Fetch lead fields")
         if isinstance(data, list):
             fields = data
-        else:
+        elif isinstance(data, dict):
             fields = data.get("data", data.get("content", []))
+        else:
+            fields = []
         return [f for f in fields if f.get("active", True)]
 
 
@@ -1838,6 +1843,9 @@ def _format_contact_for_display(contact: Dict[str, Any]) -> str:
     lines.append(f"Owner ID: {contact.get('ownerId', '—')}")
     lines.append(f"Created At: {contact.get('createdAt', '—')}")
     lines.append(f"Updated At: {contact.get('updatedAt', '—')}")
+    ad = contact.get("associatedDeals") or []
+    if ad:
+        lines.append(f"Associated deal IDs: {ad}")
     # Custom fields
     custom = contact.get("customFieldValues") or {}
     if custom:
@@ -1915,14 +1923,20 @@ async def update_contact(contact_id: int, field_values: Dict[str, Any]) -> str:
         return f"✗ Unexpected error: {str(e)}"
 
 
+async def get_contact_logic(contact_id: int) -> Dict[str, Any]:
+    """Fetch a single contact by ID (GET /contacts/{id}). Returns full contact object."""
+    contact_id = int(contact_id)
+    async with get_client() as client:
+        response = await client.get(f"/contacts/{contact_id}")
+        return await handle_api_response(response, "Get contact")
+
+
 @mcp.tool()
 async def get_contact(contact_id: int) -> str:
     """Get full details of a contact by ID."""
     try:
         _reset_api_call_count()
-        async with get_client() as client:
-            response = await client.get(f"/contacts/{contact_id}")
-            contact = await handle_api_response(response, "Get contact")
+        contact = await get_contact_logic(contact_id)
         return _format_contact_for_display(contact)
     except KylasAPIError as e:
         return f"✗ Failed to get contact: {e.message}\n  Details: {e.response_body}"
@@ -2677,8 +2691,10 @@ async def _fetch_deal_fields() -> List[Dict[str, Any]]:
         data = await handle_api_response(response, "Fetch deal fields")
         if isinstance(data, list):
             fields = data
-        else:
+        elif isinstance(data, dict):
             fields = data.get("data", data.get("content", []))
+        else:
+            fields = []
         return [f for f in fields if f.get("active", True)]
 
 
@@ -2863,6 +2879,41 @@ async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[
         for key, value in payload.items():
             if key == "customFieldValues" and isinstance(value, dict):
                 merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
+            elif key in ["contacts", "associatedContacts"] and isinstance(value, list):
+                # Handle contact associations: merge with existing associatedContacts
+                new_contacts = []
+                for contact in value:
+                    if isinstance(contact, dict):
+                        # Contact object with id and possibly name
+                        contact_id = contact.get("id")
+                        contact_name = contact.get("name")
+                        if contact_id:
+                            # If no name provided, fetch it from the API
+                            if not contact_name:
+                                try:
+                                    contact_details = await get_contact_logic(contact_id)
+                                    contact_name = f"{contact_details.get('firstName', '')} {contact_details.get('lastName', '')}".strip()
+                                except Exception as e:
+                                    logger.warning(f"Could not fetch contact {contact_id} details: {e}")
+                                    contact_name = f"Contact {contact_id}"
+                            new_contacts.append({"id": contact_id, "name": contact_name})
+                    elif isinstance(contact, (int, str)):
+                        # Just an ID, fetch the contact
+                        try:
+                            contact_id = int(contact)
+                            contact_details = await get_contact_logic(contact_id)
+                            contact_name = f"{contact_details.get('firstName', '')} {contact_details.get('lastName', '')}".strip()
+                            new_contacts.append({"id": contact_id, "name": contact_name})
+                        except Exception as e:
+                            logger.warning(f"Could not fetch contact {contact}: {e}")
+
+                # Merge with existing associatedContacts (avoid duplicates by ID)
+                existing_contacts = merged.get("associatedContacts", []) or []
+                existing_ids = {c.get("id") for c in existing_contacts if isinstance(c, dict)}
+                for contact in new_contacts:
+                    if contact.get("id") not in existing_ids:
+                        existing_contacts.append(contact)
+                merged["associatedContacts"] = existing_contacts
             elif key == "pipelineStage" and isinstance(value, (int, str)):
                 # Special handling: pipelineStage should update the existing pipeline's stage ID
                 # Also update forecastingType to match the stage's forecastingType
@@ -2914,6 +2965,10 @@ async def update_deal(deal_id: int, field_values: Dict[str, Any]) -> str:
     - To change stage in current pipeline: {"pipelineStage": stage_id}
       (automatically updates pipeline.stage.id and forecastingType)
     - To change to different pipeline: {"pipeline": {"id": id, "name": "name", "stage": {"id": id, "name": "name"}}, "forecastingType": "..."}
+
+    **Link contacts (Kylas deal PUT):** use `associatedContacts` with `{id, name}` per contact, e.g.
+    `{"associatedContacts": [{"id": 4942095, "name": "aditya tambe"}]}`. Existing rows are kept; duplicates by id are skipped.
+    You may also use `contacts` as an alias (same merge into `associatedContacts`). If `name` is omitted, it is loaded from GET /contacts/{id}.
     """
     try:
         _reset_api_call_count()
