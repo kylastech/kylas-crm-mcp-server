@@ -231,6 +231,7 @@ OPERATOR_MAPPING = {
     "FORECASTING_TYPE": ["equal", "not_equal", "in", "not_in", "is_empty", "is_not_empty"],
     "ENTITY_FIELDS": ["equal", "not_equal", "in", "not_in", "is_not_null", "is_null"],
     "LOOK_UP": ["equal", "not_equal", "is_not_null", "is_null", "in", "not_in"],
+    "MEETING_ORGANIZER": ["equal", "not_equal", "is_not_null", "is_null", "in", "not_in"],
     "PIPELINE_STAGE": ["equal", "not_equal", "in", "not_in"],
     "PIPELINE": ["equal", "not_equal", "is_not_null", "is_null", "in", "not_in"],
 }
@@ -508,10 +509,132 @@ Before creating or updating a company, you MUST call `get_company_field_instruct
 """
 
 # ---------------------------------------------------------------------------
+# Meeting System Instructions
+# ---------------------------------------------------------------------------
+
+MEETING_SYSTEM_INSTRUCTIONS = """
+# Kylas CRM MCP Server - Meeting Operations
+
+## CRITICAL: Workflow for Meetings
+
+### Step 1: ALWAYS call `get_meeting_field_instructions` FIRST
+Before creating or updating a meeting, you MUST call `get_meeting_field_instructions` to get:
+- All available meeting fields (standard and custom)
+- Timezone picklist with IDs
+- Status options (scheduled, missed, conducted, cancelled)
+- Medium options (OFFLINE, GOOGLE, MICROSOFT)
+
+### Step 2: Ask the user for required details
+Before creating a meeting, ask for:
+1. **Title** — meeting title (required)
+2. **Date and time** — start (from) and end (to) datetime (required). Convert to UTC using get_current_user + parse_datetime_to_utc_iso_tool.
+3. **Participants** — who should attend (required). Use **lookup_meeting_invitees** first (or lookup_users for users only). Format: [{"id": user_id, "entity": "user|lead|contact|external"}] per API
+4. **Related entities** (optional) — link to leads, contacts, deals, or companies. Format: [{"id": entity_id, "entity": "lead|contact|deal|company"}]
+5. **Location** (optional) — meeting location
+6. **All day** (optional) — whether it's an all-day meeting
+
+### Create meeting payload format
+```json
+{
+  "title": "Meeting Title",
+  "from": "2024-01-15T08:00:00.000Z",
+  "to": "2024-01-15T08:30:00.000Z",
+  "allDay": false,
+  "timezone": {"id": 372, "name": "Asia/Calcutta"},
+  "participants": [{"id": 2530, "entity": "user"}],
+  "relatedTo": [{"id": 150, "entity": "contact"}, {"id": 169, "entity": "deal"}],
+  "location": "Office",
+  "description": "Discussion about project"
+}
+```
+
+### NEVER guess IDs
+- Use **lookup_meeting_invitees** when the user mentions organizer or invitees by name (GET /search/meeting-invitee/lookup). Pick the row with the right **entity** (organizer is usually **user**).
+- Use `lookup_users` for plain user ID resolution outside meeting-invitee context
+- Use entity search tools to find IDs for relatedTo (e.g. search_leads_by_term, search_contacts_by_term, search_deals_by_term)
+
+### Search/Filter meetings
+- **By associated lead / contact / deal / company:** Always **resolve the entity id first** using the meeting lookup tools (same endpoints as Kylas web), then `search_meetings` with **long** rules:
+  - Lead: **lookup_leads_for_meeting** (GET /search/lead/lookup?q=…, default `firstName:`) → filter `associatedLeads` `equal` `<lead_id>`
+  - Contact: **lookup_contacts_for_meeting** (GET /search/contact/lookup?q=…, default `firstName:`) → `associatedContacts`
+  - Deal: **lookup_deals_for_meeting** (GET /search/deal/lookup?q=…, default `name:`) → `associatedDeals`
+  - Company: **lookup_companies_for_meeting** (GET /companies/lookup?view=meeting&q=…, default `comp:`) → `associatedCompanies`
+  - Combine multiple rules in one jsonRule with **AND** (same as web).
+- **Presence only:** `associatedLeads` / `associatedContacts` / `associatedDeals` / `associatedCompanies` with `is_not_null` or `is_null` and value null.
+- **By organizer:** Call **lookup_meeting_invitees** first, then `search_meetings` with filter `{"field": "organizer", "operator": "equal", "value": <user_id>}` using the **user** row's id (if the API accepts the rule).
+- **By title:** Use `search_meetings_by_term` with the search term.
+- **By specific field (status, date range, etc.):** Use `search_meetings` with filters.
+  - Status filter: use internal name — "scheduled", "conducted", "missed", "cancelled"
+  - Date filters: use from/to fields with operators like "greater", "less", "between"
+- Call `get_meeting_field_instructions` first to see filterable fields.
+
+### Cancel vs Delete meetings
+- **cancel_meeting** — changes status to "cancelled" (reversible, meeting record preserved)
+- **delete_meeting** — permanently removes the meeting (irreversible). Confirm with user before deleting.
+
+### Notes on meetings
+- Use `add_note("MEETING", meeting_id, "note text")` to add notes to a meeting.
+"""
+
+# ---------------------------------------------------------------------------
+# Call Log System Instructions
+# ---------------------------------------------------------------------------
+
+CALL_LOG_SYSTEM_INSTRUCTIONS = """
+# Kylas CRM MCP Server - Call Log Operations
+
+## CRITICAL: Workflow for Call Logs
+
+### Step 1: ALWAYS call `get_call_log_field_instructions` FIRST
+Before creating a call log, you MUST call `get_call_log_field_instructions` to get:
+- All available call log fields
+- Outcome options (connected, rejected, busy, no_answer, missed_call, in_progress)
+- Call type options (incoming, outgoing)
+- Call disposition options
+- Sentiment options
+
+### Step 2: Ask the user for required details before creating
+Before creating a call log, ask for:
+1. **Entity** — which lead, contact, or deal is this call for? Search to get the ID.
+2. **Phone number** — the phone number used in the call
+3. **Call type** — "incoming" or "outgoing"
+4. **Outcome** — "connected", "rejected", "busy", "no_answer", "missed_call", "in_progress"
+5. **Start time** — when did the call start? Convert to UTC.
+6. **Duration** (optional) — how long was the call in seconds?
+7. **Notes** (optional) — any call notes?
+
+### Call log on a Lead
+```json
+{
+  "outcome": "connected", "callType": "outgoing",
+  "startTime": "2024-01-15T08:00:00.000Z",
+  "phoneNumber": "9618488578", "duration": "420",
+  "relatedTo": {"id": 297573, "entity": "lead", "phoneNumber": "9618488578"},
+  "notes": [{"description": "Discussed pricing"}]
+}
+```
+
+### Call log on a Contact
+Same as lead but `"entity": "contact"` in relatedTo.
+
+### Call log on a Deal
+Same as lead but `"entity": "deal"` in relatedTo. Optionally add `associatedTo` to link a contact:
+```json
+"associatedTo": [{"id": 112936, "entity": "contact", "phoneNumber": "9848022338"}]
+```
+
+### Fetching call logs
+- Use `get_call_logs(entity_id, entity_type)` to get call logs for a lead, contact, or deal.
+
+### Notes on call logs
+- Use `add_note("CALL_LOG", call_log_id, "note text")` to add notes to a call log.
+"""
+
+# ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("Kylas CRM (Lead + Deal + Company)", instructions=SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" + COMPANY_SYSTEM_INSTRUCTIONS)
+mcp = FastMCP("Kylas CRM", instructions=SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" + COMPANY_SYSTEM_INSTRUCTIONS + "\n\n" + MEETING_SYSTEM_INSTRUCTIONS + "\n\n" + CALL_LOG_SYSTEM_INSTRUCTIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +718,7 @@ def _rule_type_for_value(field_type: str, field_name: str, value: Any) -> str:
     if field_type == "NUMBER":
         return "double"
     # User look-up fields: createdBy, updatedBy, convertedBy, ownerId, importedBy — value is user ID (long)
-    if field_type in ("LOOK_UP", "ENTITY_FIELDS"):
+    if field_type in ("LOOK_UP", "ENTITY_FIELDS", "MEETING_ORGANIZER"):
         return "long"
     # Date/datetime: standard and custom (e.g. cfDateField); value = single ISO string, [start,end], or null
     if field_type in ("DATETIME_PICKER", "DATE", "DATE_PICKER"):
@@ -3922,17 +4045,1455 @@ async def search_idle_companies(
         return f"✗ Unexpected error: {str(e)}"
 
 
+# ===========================================================================
+# MEETING ENTITY
+# ===========================================================================
+
 # ---------------------------------------------------------------------------
-# NOTES: Add notes to Lead, Contact, Deal, Company
+# Meeting field metadata helpers
+# ---------------------------------------------------------------------------
+
+MEETING_PICKLIST_FIELDS_USE_INTERNAL_NAME = {"status", "medium"}
+
+async def _fetch_meeting_fields() -> List[Dict[str, Any]]:
+    """Fetch meeting field metadata from Kylas API. Returns list of field dicts."""
+    async with get_client() as client:
+        response = await client.get(
+            "/meetings/fields",
+            params={"custom-only": "false", "page": 0, "size": 100}
+        )
+        data = await handle_api_response(response, "Fetch meeting fields")
+        if isinstance(data, list):
+            fields = data
+        elif isinstance(data, dict):
+            fields = data.get("data", data.get("content", []))
+        else:
+            fields = []
+        return [f for f in fields if f.get("active", True)]
+
+
+async def _get_meeting_custom_field_id_to_name() -> Dict[str, str]:
+    """Return mapping of custom field ID (string) -> internal name."""
+    fields = await _fetch_meeting_fields()
+    custom = [f for f in fields if not f.get("standard", False)]
+    return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
+
+
+def _format_meeting_field(field: Dict[str, Any]) -> List[str]:
+    """Format a single meeting field for the cheat sheet."""
+    lines = []
+    name = field.get("name", "")
+    display = field.get("displayName", name)
+    field_type = field.get("type", "TEXT_FIELD")
+    is_required = field.get("required", False)
+    filterable = field.get("filterable", False)
+    is_internal = field.get("internal", False)
+    is_standard = field.get("standard", True)
+
+    identifier = f"API name: {name}" if is_standard else f"Field ID: {field.get('id', '?')}"
+    required_marker = " *REQUIRED*" if is_required else ""
+    filterable_marker = " [FILTERABLE]" if filterable else ""
+    internal_marker = " (internal)" if is_internal else ""
+
+    lines.append(f"  '{display}' ({identifier}) - Type: {field_type}{required_marker}{filterable_marker}{internal_marker}")
+
+    if field_type in ["ENTITY_PICKLIST", "PICK_LIST", "MULTI_PICKLIST"]:
+        picklist = field.get("picklist") or {}
+        values = picklist.get("picklistValues") or picklist.get("values", [])
+        if values and field_type != "PICK_LIST":
+            # For ENTITY_PICKLIST like status/medium, show internal names
+            lines.append("  └─ Options (use internal name):")
+            for val in values:
+                if not isinstance(val, dict):
+                    continue
+                val_label = val.get("displayName") or val.get("name") or "Unknown"
+                val_name = val.get("name", "")
+                lines.append(f"     • {val_label} (name: '{val_name}')")
+    return lines
+
+
+async def get_meeting_field_instructions_logic() -> str:
+    fields = await _fetch_meeting_fields()
+    standard = [f for f in fields if f.get("standard", False)]
+    custom = [f for f in fields if not f.get("standard", False)]
+    lines = [
+        "=" * 60,
+        "KYLAS CRM - MEETING FIELDS CHEAT SHEET",
+        "=" * 60,
+        "",
+        "## STANDARD FIELDS",
+        "-" * 40,
+    ]
+    for f in standard:
+        lines.extend(_format_meeting_field(f))
+    if custom:
+        lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
+        for f in custom:
+            lines.extend(_format_meeting_field(f))
+    lines.extend([
+        "",
+        "## CREATE MEETING PAYLOAD FORMAT",
+        "-" * 40,
+        "Required fields: title, from, to, participants (at least one user)",
+        "",
+        "participants: [{\"id\": <user_id>, \"entity\": \"user\"}]",
+        "  - Use lookup_users for users only; use lookup_meeting_invitees to resolve users/leads/contacts/external for meetings",
+        "organizer / invitee by name: call lookup_meeting_invitees first (GET /search/meeting-invitee/lookup), then use the matching id + entity",
+        "",
+        "relatedTo: [{\"id\": <entity_id>, \"entity\": \"lead|contact|deal|company\"}]",
+        "  - Links meeting to leads, contacts, deals, or companies",
+        "Meeting search: associatedLeads, associatedContacts, associatedDeals, associatedCompanies — is_null / is_not_null or equal <id> (type long). Resolve ids via lookup_leads_for_meeting, lookup_contacts_for_meeting, lookup_deals_for_meeting, lookup_companies_for_meeting first.",
+        "",
+        "timezone: {\"id\": <tz_picklist_id>, \"name\": \"Asia/Calcutta\"}",
+        "  - Use timezone picklist ID from field instructions above",
+        "",
+        "from/to: UTC ISO datetime strings (e.g. \"2024-01-15T08:00:00.000Z\")",
+        "  - Convert user's local time to UTC using parse_datetime_to_utc_iso_tool",
+        "",
+        "allDay: true/false (default false)",
+        "",
+        "=" * 60,
+        "END OF CHEAT SHEET",
+        "=" * 60,
+    ])
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_meeting_field_instructions() -> str:
+    """
+    Get all meeting fields for the current tenant. CALL THIS FIRST before creating or updating a meeting.
+    Returns a cheat sheet with API names, picklist options, and required fields.
+    """
+    try:
+        _reset_api_call_count()
+        logger.info("Fetching meeting field instructions")
+        result = await get_meeting_field_instructions_logic()
+        return result
+    except KylasAPIError as e:
+        return f"Error: {e.message}"
+    except Exception as e:
+        logger.exception("get_meeting_field_instructions")
+        return f"Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Meeting invitee / organizer lookup (users, leads, contacts, external)
+# ---------------------------------------------------------------------------
+
+def _primary_email_from_invitee_row(row: Dict[str, Any]) -> str:
+    emails = row.get("emails") or []
+    if not emails:
+        return "—"
+    for e in emails:
+        if isinstance(e, dict) and e.get("primary"):
+            return str(e.get("value") or "—")
+    first = emails[0]
+    if isinstance(first, dict):
+        return str(first.get("value") or "—")
+    return "—"
+
+
+async def lookup_meeting_invitees_logic(query: str) -> str:
+    """
+    GET /search/meeting-invitee/lookup?q=<query>
+    Returns users, leads, contacts, and external invitees (id, name, entity).
+    """
+    q = (query or "").strip()
+    if not q:
+        return (
+            "Error: query cannot be empty. Examples: "
+            "'key:' for a broad list, 'name:Akshay' if the API supports field:value, "
+            "or a partial name string."
+        )
+    logger.info("Meeting invitee lookup: q=%s", q)
+    async with get_client() as client:
+        response = await client.get(
+            "/search/meeting-invitee/lookup",
+            params={"q": q},
+        )
+        data = await handle_api_response(response, "Meeting invitee lookup")
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = data.get("content", data.get("data", []))
+    else:
+        rows = []
+    if not rows:
+        return f"No meeting invitees found matching '{q}'."
+    lines = [
+        f"Found {len(rows)} invitee(s) matching '{q}'",
+        "-" * 60,
+        "Use id + entity when adding participants or resolving organizer (organizer is usually entity=user).",
+        "-" * 60,
+    ]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("id", "?")
+        name = row.get("name", "—")
+        entity = row.get("entity", "—")
+        email = _primary_email_from_invitee_row(row)
+        lines.append(f"  • ID: {rid}  |  Entity: {entity}  |  Name: {name}  |  Email: {email}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def lookup_meeting_invitees(query: str) -> str:
+    """
+    Look up meeting invitees and organizer candidates (users, leads, contacts, external).
+    Calls GET /search/meeting-invitee/lookup — same as the Kylas web app.
+
+    Call this FIRST when the user mentions meeting organizer or invitees by name, before
+    search_meetings (organizer filter) or create_meeting (participants). Rows include
+    id, name, entity (user | lead | contact | external); for organizer, use the user row
+    that matches the person's name.
+
+    query: Search string (e.g. broad 'key:' or a name / field:value pattern per your tenant).
+    """
+    try:
+        _reset_api_call_count()
+        return await lookup_meeting_invitees_logic(query)
+    except KylasAPIError as e:
+        return f"Error: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("lookup_meeting_invitees")
+        return f"Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Meeting related-entity lookup (resolve IDs before meetings/search filters)
+# ---------------------------------------------------------------------------
+
+def _meeting_lookup_rows_from_response(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if isinstance(data, dict):
+        inner = data.get("content", data.get("data", []))
+        if isinstance(inner, list):
+            return [r for r in inner if isinstance(r, dict)]
+    return []
+
+
+def _format_meeting_entity_lookup_result(label: str, q: str, rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return f"No {label} found matching lookup query '{q}'."
+    lines = [
+        f"Found {len(rows)} {label} matching '{q}' (use id in search_meetings filter associatedLeads / associatedContacts / associatedDeals / associatedCompanies)",
+        "-" * 60,
+    ]
+    for row in rows:
+        rid = row.get("id", "?")
+        name = row.get("name") or row.get("displayName") or "—"
+        extra = _primary_email_from_invitee_row(row)
+        if extra != "—":
+            lines.append(f"  • ID: {rid}  |  Name: {name}  |  Email: {extra}")
+        else:
+            lines.append(f"  • ID: {rid}  |  Name: {name}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+async def lookup_leads_for_meeting_logic(query: str) -> str:
+    """GET /search/lead/lookup?q= — meeting context (same as Kylas web)."""
+    q = (query or "firstName:").strip() or "firstName:"
+    logger.info("Meeting lead lookup: q=%s", q)
+    async with get_client() as client:
+        response = await client.get("/search/lead/lookup", params={"q": q})
+        data = await handle_api_response(response, "Lookup leads for meeting")
+    rows = _meeting_lookup_rows_from_response(data)
+    return _format_meeting_entity_lookup_result("lead(s)", q, rows)
+
+
+async def lookup_contacts_for_meeting_logic(query: str) -> str:
+    """GET /search/contact/lookup?q= — meeting context."""
+    q = (query or "firstName:").strip() or "firstName:"
+    logger.info("Meeting contact lookup: q=%s", q)
+    async with get_client() as client:
+        response = await client.get("/search/contact/lookup", params={"q": q})
+        data = await handle_api_response(response, "Lookup contacts for meeting")
+    rows = _meeting_lookup_rows_from_response(data)
+    return _format_meeting_entity_lookup_result("contact(s)", q, rows)
+
+
+async def lookup_deals_for_meeting_logic(query: str) -> str:
+    """GET /search/deal/lookup?q= — meeting context."""
+    q = (query or "name:").strip() or "name:"
+    logger.info("Meeting deal lookup: q=%s", q)
+    async with get_client() as client:
+        response = await client.get("/search/deal/lookup", params={"q": q})
+        data = await handle_api_response(response, "Lookup deals for meeting")
+    rows = _meeting_lookup_rows_from_response(data)
+    return _format_meeting_entity_lookup_result("deal(s)", q, rows)
+
+
+async def lookup_companies_for_meeting_logic(query: str) -> str:
+    """GET /companies/lookup?view=meeting&q= — meeting context."""
+    q = (query or "comp:").strip() or "comp:"
+    logger.info("Meeting company lookup: q=%s", q)
+    async with get_client() as client:
+        response = await client.get("/companies/lookup", params={"view": "meeting", "q": q})
+        data = await handle_api_response(response, "Lookup companies for meeting")
+    rows = _meeting_lookup_rows_from_response(data)
+    return _format_meeting_entity_lookup_result("compan(y/ies)", q, rows)
+
+
+@mcp.tool()
+async def lookup_leads_for_meeting(query: str = "firstName:") -> str:
+    """
+    Look up leads for meeting association / search filters. GET /search/lead/lookup (Kylas web).
+
+    Call FIRST when the user wants meetings linked to a lead by name — then search_meetings with
+    {"field": "associatedLeads", "operator": "equal", "value": <lead_id>}.
+
+    query: Lookup q string (default firstName: for a broad list; e.g. firstName:John or companyName:Acme per tenant).
+    """
+    try:
+        _reset_api_call_count()
+        return await lookup_leads_for_meeting_logic(query)
+    except KylasAPIError as e:
+        return f"Error: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("lookup_leads_for_meeting")
+        return f"Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def lookup_contacts_for_meeting(query: str = "firstName:") -> str:
+    """
+    Look up contacts for meeting association / search filters. GET /search/contact/lookup.
+
+    Then search_meetings with {"field": "associatedContacts", "operator": "equal", "value": <contact_id>}.
+
+    query: Lookup q (default firstName:).
+    """
+    try:
+        _reset_api_call_count()
+        return await lookup_contacts_for_meeting_logic(query)
+    except KylasAPIError as e:
+        return f"Error: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("lookup_contacts_for_meeting")
+        return f"Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def lookup_deals_for_meeting(query: str = "name:") -> str:
+    """
+    Look up deals for meeting association / search filters. GET /search/deal/lookup.
+
+    Then search_meetings with {"field": "associatedDeals", "operator": "equal", "value": <deal_id>}.
+
+    query: Lookup q (default name:).
+    """
+    try:
+        _reset_api_call_count()
+        return await lookup_deals_for_meeting_logic(query)
+    except KylasAPIError as e:
+        return f"Error: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("lookup_deals_for_meeting")
+        return f"Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def lookup_companies_for_meeting(query: str = "comp:") -> str:
+    """
+    Look up companies for meeting association / search filters. GET /companies/lookup?view=meeting.
+
+    Then search_meetings with {"field": "associatedCompanies", "operator": "equal", "value": <company_id>}.
+
+    query: Lookup q (default comp:).
+    """
+    try:
+        _reset_api_call_count()
+        return await lookup_companies_for_meeting_logic(query)
+    except KylasAPIError as e:
+        return f"Error: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("lookup_companies_for_meeting")
+        return f"Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Meeting search rule builder
+# ---------------------------------------------------------------------------
+
+# POST /meetings/search supports these fields even when GET /meetings/fields omits them from metadata.
+_MEETING_SEARCH_SYNTHETIC_FILTERABLE: Dict[str, Dict[str, Any]] = {
+    "associatedLeads": {"type": "LOOK_UP", "standard": True},
+    "associatedContacts": {"type": "LOOK_UP", "standard": True},
+    "associatedDeals": {"type": "LOOK_UP", "standard": True},
+    "associatedCompanies": {"type": "LOOK_UP", "standard": True},
+}
+
+
+def _build_meeting_search_json_rule(
+    filters: List[Dict[str, Any]],
+    filterable_map: Dict[str, Dict[str, Any]],
+    default_timezone: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    Build jsonRule for POST /meetings/search. Returns (jsonRule, error_message).
+    Uses MEETING_PICKLIST_FIELDS_USE_INTERNAL_NAME for picklist rule_type.
+    """
+    tz_for_date = default_timezone or DEFAULT_TIMEZONE
+    rules = []
+    for i, f in enumerate(filters):
+        field_name = f.get("field")
+        operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        value = f.get("value")
+
+        if not field_name:
+            return {}, f"Filter #{i + 1}: missing 'field'."
+        if field_name in _MEETING_SEARCH_SYNTHETIC_FILTERABLE:
+            meta = dict(_MEETING_SEARCH_SYNTHETIC_FILTERABLE[field_name])
+        elif field_name in filterable_map:
+            meta = filterable_map[field_name]
+        else:
+            return {}, (
+                f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. "
+                "Use [FILTERABLE] from get_meeting_field_instructions, or synthetic meeting fields: "
+                "associatedLeads, associatedContacts, associatedDeals, associatedCompanies (LOOK_UP; equal / is_null / is_not_null)."
+            )
+        api_type = meta.get("type", "TEXT_FIELD")
+        allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
+        if operator not in allowed:
+            return {}, f"Filter #{i + 1}: operator '{operator}' not allowed for field '{field_name}' (type {api_type}). Allowed: {', '.join(allowed)}."
+
+        # Meeting-specific picklist handling
+        if api_type in ("PICK_LIST", "MULTI_PICKLIST", "ENTITY_PICKLIST"):
+            rule_type = "string" if field_name in MEETING_PICKLIST_FIELDS_USE_INTERNAL_NAME else "long"
+        else:
+            rule_type = _rule_type_for_value(api_type, field_name, value)
+        if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
+            try:
+                value = float(value) if rule_type == "double" else int(value)
+            except (TypeError, ValueError):
+                value = value
+
+        is_custom = not meta.get("standard", True)
+        rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
+
+        rule = {
+            "operator": operator,
+            "id": field_name,
+            "field": rule_field,
+            "type": rule_type,
+            "value": value,
+            "relatedFieldIds": None,
+        }
+        if rule_type == "date":
+            rule["timeZone"] = f.get("timeZone") or tz_for_date
+        rules.append(rule)
+
+    return {"rules": rules, "condition": "AND", "valid": True}, None
+
+
+# ---------------------------------------------------------------------------
+# Meeting create/update/get logic
+# ---------------------------------------------------------------------------
+
+async def create_meeting_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a meeting with the given field_values."""
+    payload = dict(field_values)
+    if not payload:
+        raise KylasAPIError("field_values cannot be empty")
+    # Ensure required fields
+    if not payload.get("title"):
+        raise KylasAPIError("title is required for creating a meeting")
+    if not payload.get("from"):
+        raise KylasAPIError("'from' datetime is required for creating a meeting")
+    if not payload.get("to"):
+        raise KylasAPIError("'to' datetime is required for creating a meeting")
+    if not payload.get("participants"):
+        raise KylasAPIError("participants is required (at least one user). Use [{\"id\": <user_id>, \"entity\": \"user\"}]")
+
+    logger.info("Creating meeting: %s", payload.get("title", ""))
+    async with get_client() as client:
+        response = await client.post("/meetings", json=payload)
+        result = await handle_api_response(response, "Create meeting")
+        logger.info("Meeting created with ID: %s", result.get("id"))
+        return result
+
+
+@mcp.tool()
+async def create_meeting(field_values: Dict[str, Any]) -> str:
+    """
+    Create a meeting in Kylas CRM.
+
+    You MUST call get_meeting_field_instructions FIRST. Then ask the user for required details.
+
+    field_values: Meeting payload with these fields:
+    - title (str, REQUIRED): Meeting title
+    - from (str, REQUIRED): Start datetime in UTC ISO format (e.g. "2024-01-15T08:00:00.000Z")
+    - to (str, REQUIRED): End datetime in UTC ISO format
+    - allDay (bool): Whether it's an all-day meeting (default false)
+    - participants (list, REQUIRED): List of invitees, e.g. [{"id": 2530, "entity": "user"}]
+      Use lookup_users to find user IDs.
+    - relatedTo (list): Related entities, e.g. [{"id": 150, "entity": "contact"}, {"id": 169, "entity": "deal"}]
+      Entity can be: "lead", "contact", "deal", "company"
+    - timezone (dict): e.g. {"id": 372, "name": "Asia/Calcutta"} — get ID from get_meeting_field_instructions
+    - location (str): Meeting location
+    - description (str): Meeting description
+
+    IMPORTANT: Convert user's local datetime to UTC using get_current_user (for timezone) then parse_datetime_to_utc_iso_tool.
+    """
+    try:
+        _reset_api_call_count()
+        result = await create_meeting_logic(field_values)
+        meeting_id = result.get("id", "?")
+        title = result.get("title", "Meeting")
+        return f"✓ Meeting created successfully.\n  ID: {meeting_id}\n  Title: {title}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to create meeting: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("create_meeting")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def update_meeting_logic(meeting_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """GET the meeting first, merge field_values into it, then PUT the full body."""
+    meeting_id = int(meeting_id)
+    fv = dict(field_values)
+    if not fv:
+        raise KylasAPIError("field_values cannot be empty for update.")
+    logger.info("Updating meeting %s with fields: %s", meeting_id, list(fv.keys()))
+    async with get_client() as client:
+        get_response = await client.get(f"/meetings/{meeting_id}")
+        existing = await handle_api_response(get_response, "Get meeting")
+        merged = dict(existing)
+        for key, value in fv.items():
+            if key == "participants" and isinstance(value, list):
+                # Merge participants, avoid duplicates by (id, entity)
+                existing_participants = merged.get("participants", []) or []
+                existing_keys = {(p.get("id"), p.get("entity")) for p in existing_participants if isinstance(p, dict)}
+                for p in value:
+                    if isinstance(p, dict) and (p.get("id"), p.get("entity")) not in existing_keys:
+                        existing_participants.append(p)
+                merged["participants"] = existing_participants
+            elif key == "relatedTo" and isinstance(value, list):
+                # Merge relatedTo, avoid duplicates by (id, entity)
+                existing_related = merged.get("relatedTo", []) or []
+                existing_keys = {(r.get("id"), r.get("entity")) for r in existing_related if isinstance(r, dict)}
+                for r in value:
+                    if isinstance(r, dict) and (r.get("id"), r.get("entity")) not in existing_keys:
+                        existing_related.append(r)
+                merged["relatedTo"] = existing_related
+            elif key == "customFieldValues" and isinstance(value, dict):
+                merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
+            else:
+                merged[key] = value
+        response = await client.put(f"/meetings/{meeting_id}", json=merged)
+        result = await handle_api_response(response, "Update meeting")
+        logger.info("Meeting %s updated", meeting_id)
+        return result
+
+
+@mcp.tool()
+async def update_meeting(meeting_id: int, field_values: Dict[str, Any]) -> str:
+    """
+    Update a meeting in Kylas CRM. Fetches the meeting first, merges your field_values, then PUTs the full body.
+
+    meeting_id: The meeting ID to update.
+    field_values: Map of field to value (same format as create_meeting).
+      - Participants and relatedTo are merged with existing (duplicates by id+entity are skipped).
+      - Other fields are overwritten.
+    """
+    try:
+        _reset_api_call_count()
+        result = await update_meeting_logic(meeting_id, field_values)
+        mid = result.get("id", meeting_id)
+        title = result.get("title", "Meeting")
+        return f"✓ Meeting updated successfully.\n  ID: {mid}\n  Title: {title}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to update meeting: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("update_meeting")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def get_meeting_logic(meeting_id: int) -> Dict[str, Any]:
+    """Fetch a single meeting by ID (GET /meetings/{id})."""
+    meeting_id = int(meeting_id)
+    async with get_client() as client:
+        response = await client.get(f"/meetings/{meeting_id}")
+        return await handle_api_response(response, "Get meeting")
+
+
+def _format_meeting_for_display(meeting: Dict[str, Any]) -> str:
+    """Format a meeting object into a readable multi-line string."""
+    lines = ["=" * 60, "MEETING DETAILS", "=" * 60]
+    lines.append(f"ID: {meeting.get('id', '—')}")
+    lines.append(f"Title: {meeting.get('title', '—')}")
+    lines.append(f"Status: {meeting.get('status', '—')}")
+    lines.append(f"From: {meeting.get('from', '—')}")
+    lines.append(f"To: {meeting.get('to', '—')}")
+    lines.append(f"All Day: {meeting.get('allDay', False)}")
+    lines.append(f"Location: {meeting.get('location', '—')}")
+    lines.append(f"Description: {meeting.get('description', '—')}")
+    # Medium
+    medium = meeting.get("medium")
+    if isinstance(medium, dict):
+        lines.append(f"Medium: {medium.get('displayName', medium.get('name', '—'))}")
+    elif medium:
+        lines.append(f"Medium: {medium}")
+    # Provider Link
+    provider_link = meeting.get("providerLink")
+    if provider_link:
+        lines.append(f"Joining Link: {provider_link}")
+    # Timezone
+    tz = meeting.get("timezone") or {}
+    if isinstance(tz, dict):
+        lines.append(f"Timezone: {tz.get('name', '—')}")
+    # Owner
+    owner = meeting.get("owner") or {}
+    if isinstance(owner, dict):
+        lines.append(f"Owner: {owner.get('name', '—')} (ID: {owner.get('id', '—')})")
+    # Participants
+    participants = meeting.get("participants") or []
+    if participants:
+        lines.append("Participants:")
+        for p in participants:
+            if isinstance(p, dict):
+                pname = p.get("name", "—")
+                pemail = p.get("email", "")
+                pentity = p.get("entity", "")
+                rsvp = p.get("rsvpResponse", "—")
+                lines.append(f"  • {pname} ({pentity}) - {pemail} [RSVP: {rsvp}]")
+    # Related To
+    related = meeting.get("relatedTo") or []
+    if related:
+        lines.append("Related To:")
+        for r in related:
+            if isinstance(r, dict):
+                rname = r.get("name", "—")
+                rentity = r.get("entity", "")
+                rid = r.get("id", "—")
+                lines.append(f"  • {rname} ({rentity}, ID: {rid})")
+    # Metadata
+    lines.append(f"Created By: {(meeting.get('createdBy') or {}).get('name', '—')}")
+    lines.append(f"Created At: {meeting.get('createdAt', '—')}")
+    lines.append(f"Updated At: {meeting.get('updatedAt', '—')}")
+    # Custom fields
+    custom = meeting.get("customFieldValues") or {}
+    if custom:
+        lines.append("")
+        lines.append("Custom fields:")
+        for k, v in custom.items():
+            lines.append(f"  {k}: {v}")
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_meeting(meeting_id: int) -> str:
+    """
+    Get full details of a meeting by ID (GET /meetings/{id}).
+    meeting_id: The meeting ID.
+    """
+    try:
+        _reset_api_call_count()
+        meeting = await get_meeting_logic(meeting_id)
+        return _format_meeting_for_display(meeting)
+    except KylasAPIError as e:
+        return f"✗ Failed to get meeting: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("get_meeting")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Meeting cancel and delete
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def cancel_meeting(meeting_id: int) -> str:
+    """
+    Cancel a scheduled meeting. Changes the meeting status to 'cancelled'.
+    meeting_id: The meeting ID to cancel.
+    """
+    try:
+        _reset_api_call_count()
+        meeting_id = int(meeting_id)
+        logger.info("Cancelling meeting %s", meeting_id)
+        async with get_client() as client:
+            # First get the meeting, then POST to cancel
+            get_response = await client.get(f"/meetings/{meeting_id}")
+            existing = await handle_api_response(get_response, "Get meeting")
+            response = await client.post(f"/meetings/{meeting_id}/cancel", json=existing)
+            await handle_api_response(response, "Cancel meeting")
+            return f"✓ Meeting {meeting_id} cancelled successfully."
+    except KylasAPIError as e:
+        return f"✗ Failed to cancel meeting: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("cancel_meeting")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def delete_meeting(meeting_id: int) -> str:
+    """
+    Permanently delete a meeting. This action cannot be undone.
+    meeting_id: The meeting ID to delete.
+    """
+    try:
+        _reset_api_call_count()
+        meeting_id = int(meeting_id)
+        logger.info("Deleting meeting %s", meeting_id)
+        async with get_client() as client:
+            response = await client.delete(f"/meetings/{meeting_id}")
+            await handle_api_response(response, "Delete meeting")
+            return f"✓ Meeting {meeting_id} deleted successfully."
+    except KylasAPIError as e:
+        return f"✗ Failed to delete meeting: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("delete_meeting")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Meeting search logic
+# ---------------------------------------------------------------------------
+
+# Unfiltered list matches Kylas web: POST /meetings/search with empty rules (not jsonRule null).
+_MEETING_SEARCH_JSON_RULE_ALL: Dict[str, Any] = {"condition": "AND", "rules": [], "valid": True}
+
+
+def _meetings_search_api_page(page_zero_based: int) -> int:
+    """POST /meetings/search uses 1-based page; tools stay 0-based."""
+    return int(page_zero_based) + 1
+
+
+async def search_meetings_logic(
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "from,desc",
+) -> str:
+    """Search meetings with jsonRule; only filterable fields allowed."""
+    fields_list = await _fetch_meeting_fields()
+    filterable_map = _get_filterable_fields_map(fields_list)
+    if not filterable_map:
+        return "No filterable meeting fields found for this tenant."
+    default_tz = None
+    date_field_types = {"DATETIME_PICKER", "DATE", "DATE_PICKER"}
+    for f in filters:
+        fn = f.get("field")
+        if fn and fn in filterable_map and filterable_map[fn].get("type") in date_field_types and not f.get("timeZone"):
+            try:
+                user = await _fetch_current_user()
+                default_tz = user.get("timezone") or DEFAULT_TIMEZONE
+            except Exception:
+                default_tz = DEFAULT_TIMEZONE
+            break
+    json_rule, err = _build_meeting_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    if err:
+        return f"Invalid filters: {err}"
+    payload = {"jsonRule": json_rule}
+    params = {"page": _meetings_search_api_page(page), "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching meetings with %d filter(s)", len(filters))
+    async with get_client() as client:
+        response = await client.post("/meetings/search", params=params, json=payload)
+        data = await handle_api_response(response, "Search meetings")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No meetings found matching the filters. (Total in DB: {total})"
+    lines = [f"Found {len(results)} meeting(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for m in results:
+        mid = m.get("id", "?")
+        title = m.get("title", "—")
+        status = m.get("status", "—")
+        from_dt = m.get("from", "—")
+        to_dt = m.get("to", "—")
+        location = m.get("location", "—") or "—"
+        lines.append(f"• ID: {mid} | Title: {title} | Status: {status} | From: {from_dt} | To: {to_dt} | Location: {location}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_meetings(
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "from,desc",
+) -> str:
+    """
+    Search/filter meetings. Use [FILTERABLE] from get_meeting_field_instructions, plus synthetic fields:
+    associatedLeads, associatedContacts, associatedDeals, associatedCompanies (long; equal / is_null / is_not_null).
+    Resolve entity ids with lookup_leads_for_meeting, lookup_contacts_for_meeting, lookup_deals_for_meeting,
+    lookup_companies_for_meeting before filtering by equal.
+
+    filters: List of filter objects. Each must have:
+      - field (str): e.g. title, status, from, owner, associatedLeads, associatedContacts, associatedDeals, associatedCompanies.
+      - operator (str): e.g. equal, contains, is_null, is_not_null.
+      - value: For status use internal name. For associated* equal, numeric id. For is_null / is_not_null, omit or null.
+      - timeZone (str, optional): For date/datetime filters.
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "from,desc" (default).
+    """
+    try:
+        _reset_api_call_count()
+        if not filters:
+            return "Error: filters list cannot be empty."
+        return await search_meetings_logic(filters, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_meetings")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def search_meetings_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "from,desc",
+) -> str:
+    """Search meetings by title term via POST /meetings/search."""
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    # Search by title field
+    json_rule = {
+        "rules": [
+            {
+                "operator": "contains",
+                "id": "title",
+                "field": "title",
+                "type": "string",
+                "value": term,
+                "relatedFieldIds": None,
+            }
+        ],
+        "condition": "AND",
+        "valid": True,
+    }
+    payload = {"jsonRule": json_rule}
+    params = {"page": _meetings_search_api_page(page), "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching meetings by term: %r", term)
+    async with get_client() as client:
+        response = await client.post("/meetings/search", params=params, json=payload)
+        data = await handle_api_response(response, "Search meetings by term")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No meetings found matching '{term}'. (Total in DB: {total})"
+    lines = [f"Found {len(results)} meeting(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for m in results:
+        mid = m.get("id", "?")
+        title = m.get("title", "—")
+        status = m.get("status", "—")
+        from_dt = m.get("from", "—")
+        to_dt = m.get("to", "—")
+        location = m.get("location", "—") or "—"
+        lines.append(f"• ID: {mid} | Title: {title} | Status: {status} | From: {from_dt} | To: {to_dt} | Location: {location}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_meetings_by_term(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "from,desc",
+) -> str:
+    """
+    Search meetings by title. Use when the user asks for "meetings with X" or "meetings about Y".
+    For filtering by specific fields (status, date range, etc.), use search_meetings instead.
+
+    search_term: The term to search for in meeting titles (e.g. "demo", "call with John").
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "from,desc" (default).
+    """
+    try:
+        _reset_api_call_count()
+        return await search_meetings_by_term_logic(search_term, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_meetings_by_term")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def search_all_meetings(
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "from,asc",
+) -> str:
+    """
+    Get all meetings (no filters). Use when user asks to see upcoming meetings or all meetings.
+
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "from,asc" (default — upcoming first).
+    """
+    try:
+        _reset_api_call_count()
+        payload = {"jsonRule": _MEETING_SEARCH_JSON_RULE_ALL}
+        params = {"page": _meetings_search_api_page(page), "size": min(size, 100)}
+        if sort:
+            params["sort"] = sort
+        logger.info("Fetching all meetings (page %d)", page)
+        async with get_client() as client:
+            response = await client.post("/meetings/search", params=params, json=payload)
+            data = await handle_api_response(response, "Search all meetings")
+        results = data.get("content", data.get("data", []))
+        total = data.get("totalElements", data.get("total", len(results)))
+        total_pages = data.get("totalPages", 1)
+        if not results:
+            return "No meetings found."
+        lines = [f"Found {len(results)} meeting(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+        for m in results:
+            mid = m.get("id", "?")
+            title = m.get("title", "—")
+            status = m.get("status", "—")
+            from_dt = m.get("from", "—")
+            to_dt = m.get("to", "—")
+            location = m.get("location", "—") or "—"
+            lines.append(f"• ID: {mid} | Title: {title} | Status: {status} | From: {from_dt} | To: {to_dt} | Location: {location}")
+        lines.append("-" * 60)
+        return "\n".join(lines)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_all_meetings")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ===========================================================================
+# CALL LOG ENTITY
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Call Log field metadata helpers
+# ---------------------------------------------------------------------------
+
+CALL_LOG_PICKLIST_FIELDS_USE_INTERNAL_NAME = {"outcome", "callType", "overallSentiment", "callDisposition", "customerEmotion"}
+
+
+async def _fetch_call_log_fields() -> List[Dict[str, Any]]:
+    """Fetch call log field metadata from Kylas API."""
+    async with get_client() as client:
+        response = await client.get(
+            "/call-logs/fields",
+            params={"custom-only": "false", "page": 0, "size": 100}
+        )
+        data = await handle_api_response(response, "Fetch call log fields")
+        if isinstance(data, list):
+            fields = data
+        elif isinstance(data, dict):
+            fields = data.get("data", data.get("content", []))
+        else:
+            fields = []
+        return [f for f in fields if f.get("active", True)]
+
+
+async def get_call_log_field_instructions_logic() -> str:
+    fields = await _fetch_call_log_fields()
+    standard = [f for f in fields if f.get("standard", False)]
+    custom = [f for f in fields if not f.get("standard", False)]
+    lines = [
+        "=" * 60,
+        "KYLAS CRM - CALL LOG FIELDS CHEAT SHEET",
+        "=" * 60,
+        "",
+        "## STANDARD FIELDS",
+        "-" * 40,
+    ]
+    for f in standard:
+        lines.extend(_format_meeting_field(f))
+    if custom:
+        lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
+        for f in custom:
+            lines.extend(_format_meeting_field(f))
+    lines.extend([
+        "",
+        "## CREATE CALL LOG PAYLOAD FORMAT",
+        "-" * 40,
+        "Required: outcome, startTime, phoneNumber, callType",
+        "",
+        "outcome: 'connected', 'rejected', 'busy', 'no_answer', 'missed_call', 'in_progress'",
+        "callType: 'incoming' or 'outgoing'",
+        "startTime: UTC ISO datetime (e.g. '2024-01-15T08:00:00.000Z')",
+        "phoneNumber: phone number string (e.g. '9618488578')",
+        "duration: call duration in seconds (e.g. 420)",
+        "",
+        "relatedTo: {\"id\": <entity_id>, \"entity\": \"lead|contact|deal\", \"phoneNumber\": \"...\"}",
+        "  - Links call log to a lead, contact, or deal",
+        "",
+        "associatedTo (optional, for deal calls): [{\"id\": <contact_id>, \"entity\": \"contact\", \"phoneNumber\": \"...\"}]",
+        "  - Associate a contact when logging a call on a deal",
+        "",
+        "notes (optional): [{\"description\": \"Note text\"}]",
+        "",
+        "callRecording (optional): {\"url\": \"https://...\", \"fileName\": \"call.mp3\", \"data\": \"\"}",
+        "",
+        "=" * 60,
+        "END OF CHEAT SHEET",
+        "=" * 60,
+    ])
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_call_log_field_instructions() -> str:
+    """
+    Get all call log fields for the current tenant. CALL THIS FIRST before creating a call log.
+    Returns a cheat sheet with field names, outcome/callType options, and payload format.
+    """
+    try:
+        _reset_api_call_count()
+        logger.info("Fetching call log field instructions")
+        result = await get_call_log_field_instructions_logic()
+        return result
+    except KylasAPIError as e:
+        return f"Error: {e.message}"
+    except Exception as e:
+        logger.exception("get_call_log_field_instructions")
+        return f"Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Call Log create/update/get logic
+# ---------------------------------------------------------------------------
+
+async def create_call_log_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a call log with the given field_values."""
+    payload = dict(field_values)
+    if not payload:
+        raise KylasAPIError("field_values cannot be empty")
+    if not payload.get("outcome"):
+        raise KylasAPIError("outcome is required (e.g. 'connected', 'rejected', 'busy', 'no_answer', 'missed_call')")
+    if not payload.get("startTime"):
+        raise KylasAPIError("startTime is required (UTC ISO datetime)")
+    if not payload.get("phoneNumber"):
+        raise KylasAPIError("phoneNumber is required")
+    if not payload.get("callType"):
+        raise KylasAPIError("callType is required ('incoming' or 'outgoing')")
+    if not payload.get("relatedTo"):
+        raise KylasAPIError("relatedTo is required — specify which entity this call is for: {\"id\": <id>, \"entity\": \"lead|contact|deal\", \"phoneNumber\": \"...\"}")
+
+    logger.info("Creating call log: %s on %s", payload.get("callType"), payload.get("relatedTo", {}).get("entity", "?"))
+    async with get_client() as client:
+        response = await client.post("/call-logs/", json=payload)
+        result = await handle_api_response(response, "Create call log")
+        logger.info("Call log created with ID: %s", result.get("id"))
+        return result
+
+
+@mcp.tool()
+async def create_call_log(field_values: Dict[str, Any]) -> str:
+    """
+    Create a call log in Kylas CRM. Links a call to a lead, contact, or deal.
+
+    You MUST call get_call_log_field_instructions FIRST. Then ask the user for required details:
+    1. Which entity (lead/contact/deal) and its ID
+    2. Phone number
+    3. Call type: "incoming" or "outgoing"
+    4. Outcome: "connected", "rejected", "busy", "no_answer", "missed_call", "in_progress"
+    5. Start time (convert to UTC using get_current_user + parse_datetime_to_utc_iso_tool)
+    6. Duration in seconds (optional)
+    7. Notes (optional)
+
+    field_values: Call log payload:
+    - outcome (str, REQUIRED): "connected", "rejected", "busy", "no_answer", "missed_call", "in_progress"
+    - callType (str, REQUIRED): "incoming" or "outgoing"
+    - startTime (str, REQUIRED): UTC ISO datetime (e.g. "2024-01-15T08:00:00.000Z")
+    - phoneNumber (str, REQUIRED): Phone number (e.g. "9618488578")
+    - duration (int/str): Duration in seconds (e.g. 420)
+    - relatedTo (dict, REQUIRED): {"id": <entity_id>, "entity": "lead|contact|deal", "phoneNumber": "..."}
+    - associatedTo (list, optional): For deal calls, associate contacts: [{"id": <contact_id>, "entity": "contact", "phoneNumber": "..."}]
+    - notes (list, optional): [{"description": "Note text"}]
+    - callRecording (dict, optional): {"url": "https://...", "fileName": "call.mp3", "data": ""}
+    """
+    try:
+        _reset_api_call_count()
+        result = await create_call_log_logic(field_values)
+        log_id = result.get("id", "?")
+        outcome = result.get("outcome", "")
+        call_type = result.get("callType", "")
+        return f"✓ Call log created successfully.\n  ID: {log_id}\n  Type: {call_type}\n  Outcome: {outcome}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to create call log: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("create_call_log")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def update_call_log_logic(call_log_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """Update a call log via PUT (full replace)."""
+    call_log_id = int(call_log_id)
+    fv = dict(field_values)
+    if not fv:
+        raise KylasAPIError("field_values cannot be empty for update.")
+    logger.info("Updating call log %s", call_log_id)
+    async with get_client() as client:
+        response = await client.put(f"/call-logs/{call_log_id}", json=fv)
+        result = await handle_api_response(response, "Update call log")
+        logger.info("Call log %s updated", call_log_id)
+        return result
+
+
+@mcp.tool()
+async def update_call_log(call_log_id: int, field_values: Dict[str, Any]) -> str:
+    """
+    Update a call log in Kylas CRM (PUT — full replace).
+
+    call_log_id: The call log ID to update.
+    field_values: Full call log payload (same format as create_call_log).
+      Must include all required fields: outcome, startTime, phoneNumber, callType, relatedTo.
+    """
+    try:
+        _reset_api_call_count()
+        result = await update_call_log_logic(call_log_id, field_values)
+        lid = result.get("id", call_log_id)
+        return f"✓ Call log updated successfully.\n  ID: {lid}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to update call log: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("update_call_log")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+def _format_call_log_for_display(log: Dict[str, Any]) -> str:
+    """Format a call log object into a readable multi-line string."""
+    lines = ["=" * 60, "CALL LOG DETAILS", "=" * 60]
+    lines.append(f"ID: {log.get('id', '—')}")
+    lines.append(f"Call Type: {log.get('callType', '—')}")
+    lines.append(f"Outcome: {log.get('outcome', '—')}")
+    lines.append(f"Phone Number: {log.get('phoneNumber', '—')}")
+    lines.append(f"Start Time: {log.get('startTime', '—')}")
+    lines.append(f"Duration: {log.get('duration', '—')} seconds")
+    # Related To
+    related = log.get("relatedTo") or {}
+    if isinstance(related, dict):
+        lines.append(f"Related To: {related.get('name', '—')} ({related.get('entity', '—')}, ID: {related.get('id', '—')})")
+    # Associated To
+    associated = log.get("associatedTo") or []
+    if associated:
+        lines.append("Associated To:")
+        for a in associated:
+            if isinstance(a, dict):
+                lines.append(f"  • {a.get('name', '—')} ({a.get('entity', '—')}, ID: {a.get('id', '—')})")
+    # Notes
+    notes = log.get("notes") or []
+    if notes:
+        lines.append("Notes:")
+        for n in notes:
+            if isinstance(n, dict):
+                lines.append(f"  • {n.get('description', '—')}")
+    # Call Recording
+    recording = log.get("callRecording") or {}
+    if isinstance(recording, dict) and recording.get("url"):
+        lines.append(f"Recording: {recording.get('fileName', '—')} — {recording.get('url', '—')}")
+    # Call Summary & Sentiment
+    summary = log.get("callSummary")
+    if summary:
+        lines.append(f"Call Summary: {summary}")
+    sentiment = log.get("overallSentiment")
+    if sentiment:
+        lines.append(f"Overall Sentiment: {sentiment}")
+    disposition = log.get("callDisposition")
+    if disposition:
+        lines.append(f"Call Disposition: {disposition}")
+    # Metadata
+    owner = log.get("owner") or {}
+    if isinstance(owner, dict):
+        lines.append(f"Logged By: {owner.get('name', '—')} (ID: {owner.get('id', '—')})")
+    lines.append(f"Created At: {log.get('createdAt', '—')}")
+    lines.append(f"Updated At: {log.get('updatedAt', '—')}")
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_call_logs(entity_id: int, entity_type: str, page: int = 0, size: int = 20) -> str:
+    """
+    Get call logs for a specific lead, contact, or deal.
+
+    entity_id: The ID of the lead, contact, or deal.
+    entity_type: "lead", "contact", or "deal".
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    """
+    try:
+        _reset_api_call_count()
+        entity_type_lower = entity_type.strip().lower()
+        if entity_type_lower not in ["lead", "contact", "deal"]:
+            return f"✗ Invalid entity type: '{entity_type}'. Must be one of: lead, contact, deal"
+        entity_id = int(entity_id)
+        logger.info("Fetching call logs for %s %s", entity_type_lower, entity_id)
+        async with get_client() as client:
+            response = await client.get(
+                f"/call-logs/{entity_id}",
+                params={"relatedToType": entity_type_lower, "page": page, "size": min(size, 100)}
+            )
+            data = await handle_api_response(response, "Get call logs")
+
+        # Handle paginated response
+        if isinstance(data, dict):
+            results = data.get("content", data.get("data", []))
+            total = data.get("totalElements", data.get("total", len(results)))
+            total_pages = data.get("totalPages", 1)
+        elif isinstance(data, list):
+            results = data
+            total = len(results)
+            total_pages = 1
+        else:
+            results = []
+            total = 0
+            total_pages = 1
+
+        if not results:
+            return f"No call logs found for {entity_type_lower} {entity_id}."
+
+        lines = [f"Found {len(results)} call log(s) for {entity_type_lower} {entity_id} (total {total})", "-" * 60]
+        for log in results:
+            lid = log.get("id", "?")
+            call_type = log.get("callType", "—")
+            outcome = log.get("outcome", "—")
+            phone = log.get("phoneNumber", "—")
+            start = log.get("startTime", "—")
+            duration = log.get("duration", "—")
+            lines.append(f"• ID: {lid} | Type: {call_type} | Outcome: {outcome} | Phone: {phone} | Start: {start} | Duration: {duration}s")
+        lines.append("-" * 60)
+        return "\n".join(lines)
+    except KylasAPIError as e:
+        return f"✗ Failed to get call logs: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("get_call_logs")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Call Log search logic
+# ---------------------------------------------------------------------------
+
+def _call_logs_search_api_page(page_zero_based: int) -> int:
+    """POST /call-logs/search expects 1-based page (matches Kylas web app); tools stay 0-based."""
+    return int(page_zero_based) + 1
+
+
+def _build_call_log_search_json_rule(
+    filters: List[Dict[str, Any]],
+    filterable_map: Dict[str, Dict[str, Any]],
+    default_timezone: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    Build jsonRule for POST /call-logs/search. Returns (jsonRule, error_message).
+    Uses CALL_LOG_PICKLIST_FIELDS_USE_INTERNAL_NAME for picklist rule_type.
+    """
+    tz_for_date = default_timezone or DEFAULT_TIMEZONE
+    rules = []
+    for i, f in enumerate(filters):
+        field_name = f.get("field")
+        operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        value = f.get("value")
+
+        if not field_name:
+            return {}, f"Filter #{i + 1}: missing 'field'."
+        if field_name not in filterable_map:
+            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only [FILTERABLE] fields from get_call_log_field_instructions."
+        meta = filterable_map[field_name]
+        api_type = meta.get("type", "TEXT_FIELD")
+        allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
+        if operator not in allowed:
+            return {}, f"Filter #{i + 1}: operator '{operator}' not allowed for field '{field_name}' (type {api_type}). Allowed: {', '.join(allowed)}."
+
+        # Call log picklist handling
+        if api_type in ("PICK_LIST", "MULTI_PICKLIST", "ENTITY_PICKLIST"):
+            rule_type = "string" if field_name in CALL_LOG_PICKLIST_FIELDS_USE_INTERNAL_NAME else "long"
+        else:
+            rule_type = _rule_type_for_value(api_type, field_name, value)
+        if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
+            try:
+                value = float(value) if rule_type == "double" else int(value)
+            except (TypeError, ValueError):
+                value = value
+
+        is_custom = not meta.get("standard", True)
+        rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
+
+        rule = {
+            "operator": operator,
+            "id": field_name,
+            "field": rule_field,
+            "type": rule_type,
+            "value": value,
+            "relatedFieldIds": None,
+        }
+        if rule_type == "date":
+            rule["timeZone"] = f.get("timeZone") or tz_for_date
+        rules.append(rule)
+
+    return {"rules": rules, "condition": "AND", "valid": True}, None
+
+
+def _format_call_log_search_result(log: Dict[str, Any]) -> str:
+    """Format a single call log search result."""
+    lid = log.get("id", "?")
+    call_type = log.get("callType", "—")
+    outcome = log.get("outcome", "—")
+    phone = log.get("phoneNumber", "—")
+    start = log.get("startTime", "—")
+    duration = log.get("duration", "—")
+    related = log.get("relatedTo") or {}
+    related_name = related.get("name", "—") if isinstance(related, dict) else "—"
+    related_entity = related.get("entity", "") if isinstance(related, dict) else ""
+    return f"• ID: {lid} | Type: {call_type} | Outcome: {outcome} | Phone: {phone} | Start: {start} | Duration: {duration}s | Related: {related_name} ({related_entity})"
+
+
+async def search_call_logs_logic(
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """Search call logs with jsonRule via POST /call-logs/search."""
+    fields_list = await _fetch_call_log_fields()
+    filterable_map = _get_filterable_fields_map(fields_list)
+    if not filterable_map:
+        return "No filterable call log fields found for this tenant."
+    default_tz = None
+    date_field_types = {"DATETIME_PICKER", "DATE", "DATE_PICKER"}
+    for f in filters:
+        fn = f.get("field")
+        if fn and fn in filterable_map and filterable_map[fn].get("type") in date_field_types and not f.get("timeZone"):
+            try:
+                user = await _fetch_current_user()
+                default_tz = user.get("timezone") or DEFAULT_TIMEZONE
+            except Exception:
+                default_tz = DEFAULT_TIMEZONE
+            break
+    json_rule, err = _build_call_log_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    if err:
+        return f"Invalid filters: {err}"
+    payload = {"jsonRule": json_rule}
+    params = {"page": _call_logs_search_api_page(page), "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching call logs with %d filter(s)", len(filters))
+    async with get_client() as client:
+        response = await client.post("/call-logs/search", params=params, json=payload)
+        data = await handle_api_response(response, "Search call logs")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No call logs found matching the filters. (Total in DB: {total})"
+    lines = [f"Found {len(results)} call log(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for log in results:
+        lines.append(_format_call_log_search_result(log))
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_call_logs(
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Search/filter call logs. Only fields marked [FILTERABLE] in get_call_log_field_instructions can be used.
+    Call get_call_log_field_instructions first.
+
+    filters: List of filter objects. Each must have:
+      - field (str): Field API name (e.g. outcome, callType, owner, createdAt, startTime, phoneNumber).
+      - operator (str): Operator for that field type (e.g. equal, contains, greater).
+      - value: Value to compare. For outcome use internal name (e.g. "connected", "busy").
+        For callType use "incoming" or "outgoing". For owner/createdBy use user ID (number).
+      - timeZone (str, optional): For date/datetime filters.
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "createdAt,desc" (default).
+    """
+    try:
+        _reset_api_call_count()
+        if not filters:
+            return "Error: filters list cannot be empty."
+        return await search_call_logs_logic(filters, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_call_logs")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def search_all_call_logs(
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Get all call logs (no filters). Use when user asks to see recent call logs or all call logs.
+
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "createdAt,desc" (default).
+    """
+    try:
+        _reset_api_call_count()
+        payload = {"jsonRule": None}
+        params = {"page": _call_logs_search_api_page(page), "size": min(size, 100)}
+        if sort:
+            params["sort"] = sort
+        logger.info("Fetching all call logs (page %d)", page)
+        async with get_client() as client:
+            response = await client.post("/call-logs/search", params=params, json=payload)
+            data = await handle_api_response(response, "Search all call logs")
+        results = data.get("content", data.get("data", []))
+        total = data.get("totalElements", data.get("total", len(results)))
+        total_pages = data.get("totalPages", 1)
+        if not results:
+            return "No call logs found."
+        lines = [f"Found {len(results)} call log(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+        for log in results:
+            lines.append(_format_call_log_search_result(log))
+        lines.append("-" * 60)
+        return "\n".join(lines)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_all_call_logs")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# NOTES: Add notes to Lead, Contact, Deal, Company, Meeting, Call Log
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 async def add_note(entity_type: str, entity_id: int, note_text: str) -> str:
     """
-    Add a note to a Lead, Contact, Deal, or Company.
+    Add a note to a Lead, Contact, Deal, Company, Meeting, or Call Log.
 
-    entity_type: The entity type ("LEAD", "CONTACT", "DEAL", or "COMPANY").
-    entity_id: The ID of the entity (e.g. lead ID, contact ID, deal ID, company ID).
+    entity_type: The entity type ("LEAD", "CONTACT", "DEAL", "COMPANY", "MEETING", or "CALL_LOG").
+    entity_id: The ID of the entity (e.g. lead ID, contact ID, deal ID, company ID, meeting ID, call log ID).
     note_text: The note text to add (supports basic HTML formatting).
 
     Returns the note details if successful.
@@ -3940,8 +5501,8 @@ async def add_note(entity_type: str, entity_id: int, note_text: str) -> str:
     try:
         _reset_api_call_count()
         entity_type_upper = entity_type.upper().strip()
-        if entity_type_upper not in ["LEAD", "CONTACT", "DEAL", "COMPANY"]:
-            return f"✗ Invalid entity type: '{entity_type}'. Must be one of: LEAD, CONTACT, DEAL, COMPANY"
+        if entity_type_upper not in ["LEAD", "CONTACT", "DEAL", "COMPANY", "MEETING", "CALL_LOG"]:
+            return f"✗ Invalid entity type: '{entity_type}'. Must be one of: LEAD, CONTACT, DEAL, COMPANY, MEETING, CALL_LOG"
 
         entity_id = int(entity_id)
         if not note_text or not note_text.strip():
@@ -3987,7 +5548,7 @@ async def add_note(entity_type: str, entity_id: int, note_text: str) -> str:
 
 def run() -> None:
     """Entry point for console script (e.g. kylas-crm-mcp)."""
-    logger.info("Starting Kylas CRM MCP Server (Lead + Contact + Deal + Task + Company support)...")
+    logger.info("Starting Kylas CRM MCP Server (Lead + Contact + Deal + Task + Company + Meeting support)...")
     mcp.run()
 
 
