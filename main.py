@@ -5575,7 +5575,8 @@ def run() -> None:
 
     if transport == "streamable-http":
         logger.info(f"Running Streamable HTTP on {host}:{port}/mcp")
-        mcp.run(transport="streamable-http", host=host, port=port)
+        mcp.run(transport="streamable-http", host=host, port=port, stateless_http=True)
+
     elif transport == "sse":
         logger.info(f"Running SSE on {host}:{port}/sse")
         mcp.run(transport="sse", host=host, port=port)
