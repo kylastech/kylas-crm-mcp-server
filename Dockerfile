@@ -1,7 +1,5 @@
-# Kylas CRM MCP Server - Lead & Deal Management
-# MCP Registry: set io.modelcontextprotocol.server.name to your server name (e.g. io.github.USERNAME/kylas-crm)
+# Kylas CRM MCP Server - Streamable HTTP Deployment
 FROM python:3.11-slim
-LABEL io.modelcontextprotocol.server.name="io.github.akshaykylas94/kylas-crm"
 
 WORKDIR /app
 
@@ -12,8 +10,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application
 COPY main.py .
 
-# MCP servers typically run in stdio mode
 ENV PYTHONUNBUFFERED=1
+ENV MCP_TRANSPORT=streamable-http
+ENV MCP_HOST=0.0.0.0
+ENV MCP_PORT=8000
 
-# Run the MCP server (stdio transport)
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import httpx; httpx.get('http://localhost:8000/mcp', timeout=5)" || exit 1
+
 CMD ["python", "-u", "main.py"]
