@@ -449,13 +449,69 @@ Before creating or updating a deal, you MUST call `get_deal_field_instructions` 
 - "Idle" or "stagnant" means no activity on the deal for at least N days.
 - Use **last activity** = the **later** of `updatedAt` and `latestActivityCreatedAt`.
 - Use the **search_idle_deals** tool when the user asks for idle/stagnant/inactive deals.
+
+### Adding products to a deal
+- When the user wants to add a product to a deal, you MUST ask for the following details before calling update_deal or create_deal:
+  1. **Product name** — use `lookup_products` to resolve the product ID. If multiple matches, ask the user which one.
+  2. **Quantity** — how many units (e.g. 10). Ask: "How many units?"
+  3. **Price per unit** — the unit price (e.g. 100). Ask: "What is the price per unit?"
+  4. **Currency** — which currency for the price (e.g. INR, USD). Ask: "Which currency?" (use the currencyId from deal or tenant).
+  5. **Discount** (optional) — discount value and type. Ask: "Any discount? If yes, is it a percentage or flat amount?"
+- Do NOT add a product without confirming price, quantity, and currency with the user first.
+- Product payload format: `{"products": [{"id": <product_id>, "quantity": <qty>, "price": {"currencyId": <currency_id>, "value": <price>}, "discount": {"value": <disc>, "type": "PERCENTAGE"|"FLAT"}}]}`
+- Existing products on the deal are preserved; new products are merged (duplicates by ID are skipped).
+"""
+
+# ---------------------------------------------------------------------------
+# Company System Instructions
+# ---------------------------------------------------------------------------
+
+COMPANY_SYSTEM_INSTRUCTIONS = """
+# Kylas CRM MCP Server - Company Operations
+
+## CRITICAL: Workflow for Companies
+
+### Step 1: ALWAYS call `get_company_field_instructions` FIRST
+Before creating or updating a company, you MUST call `get_company_field_instructions` to get:
+- All available company fields (standard and custom)
+- API names for standard fields (e.g. name, website, employees)
+- Field IDs for custom fields
+- Picklist option IDs for dropdowns
+
+### Step 2: Create/Update company from user context only
+- Do NOT use a fixed list of fields. Infer from the user's message what they want to create or update.
+- Build `field_values` with ONLY the fields the user provided or implied.
+- For **update_company**: pass the company ID (e.g. from search results) and the fields to update; same field_values format as create_company. For owner/ownerId use user ID from lookup_users.
+- Keys: use API Name for standard fields (from cheat sheet), or Field ID string for custom fields.
+- Values: use the exact format expected by Kylas (see below).
+- **Companies do NOT have:** pipeline, pipelineStage, associatedContacts, products fields.
+
+### Field value formats
+- **Standard fields** (name, website, employees, etc.): use API name as key at top level.
+- **emails**: array of objects (types OFFICE, PERSONAL only; exactly one must be primary). Or pass "email": "user@example.com" to normalize (OFFICE, primary).
+- **phoneNumbers**: array of objects (types MOBILE, WORK, HOME, PERSONAL only; exactly one must be primary; "code" = 2-letter country e.g. IN, US). Or pass "phone": "5551234567". You MUST also pass "phone_country_code": "IN" or "+91" at the top level whenever any phone is included. **If the user gave phone number(s) but did NOT specify country or dial code:** Reply asking for country/dial code first.
+- **Picklist fields**: use the **Option ID** (number) from the cheat sheet.
+- **Custom fields**: MUST go in "customFieldValues" with **internal name** as key.
+
+### NEVER guess IDs
+- Always use the cheat sheet from `get_company_field_instructions` for API names and IDs.
+- Omit any field the user did not mention; do not add static/default fields.
+
+### Search/Filter companies
+- **By term across multiple fields:** Use **search_companies_by_term** with that term.
+- **By specific field:** Use **search_companies** with the appropriate filter(s).
+- Call `get_company_field_instructions` first to see which fields are **filterable**.
+- For PICK_LIST/MULTI_PICKLIST: use **Option ID** (number), except for country — use **internal name** (string).
+
+### Idle / Stagnant companies (no activity for N days)
+- Use the **search_idle_companies** tool when the user asks for idle/stagnant/inactive companies.
 """
 
 # ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("Kylas CRM (Lead + Deal)", instructions=SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS)
+mcp = FastMCP("Kylas CRM (Lead + Deal + Company)", instructions=SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" + COMPANY_SYSTEM_INSTRUCTIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +593,7 @@ def _rule_type_for_value(field_type: str, field_name: str, value: Any) -> str:
     if field_type in ("PICK_LIST", "MULTI_PICKLIST"):
         return "string" if field_name in PICKLIST_FIELDS_USE_INTERNAL_NAME else "long"
     if field_type == "NUMBER":
-        return "long"
+        return "double"
     # User look-up fields: createdBy, updatedBy, convertedBy, ownerId, importedBy — value is user ID (long)
     if field_type in ("LOOK_UP", "ENTITY_FIELDS"):
         return "long"
@@ -576,9 +632,9 @@ def _build_search_json_rule(
             return {}, f"Filter #{i + 1}: operator '{operator}' not allowed for field '{field_name}' (type {api_type}). Allowed: {', '.join(allowed)}."
 
         rule_type = _rule_type_for_value(api_type, field_name, value)
-        if rule_type == "long" and value is not None and not isinstance(value, (int, float)):
+        if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
             try:
-                value = int(value)
+                value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
         # Date rules: value left as-is (user's timezone); API uses timeZone for interpretation — do not convert to UTC
@@ -2677,6 +2733,9 @@ async def search_tasks_for_company(
 # Picklist fields that use internal name (string) in search; all others use Option ID (long)
 DEAL_PICKLIST_FIELDS_USE_INTERNAL_NAME = {"currency", "country", "dealSource"}
 
+# Picklist fields that use internal name (string) in company search
+COMPANY_PICKLIST_FIELDS_USE_INTERNAL_NAME = {"country"}
+
 # ---------------------------------------------------------------------------
 # Deal field metadata helpers
 # ---------------------------------------------------------------------------
@@ -2782,9 +2841,9 @@ def _build_deal_search_json_rule(
             rule_type = "string" if field_name in DEAL_PICKLIST_FIELDS_USE_INTERNAL_NAME else "long"
         else:
             rule_type = _rule_type_for_value(api_type, field_name, value)
-        if rule_type == "long" and value is not None and not isinstance(value, (int, float)):
+        if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
             try:
-                value = int(value)
+                value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
 
@@ -2844,6 +2903,8 @@ async def create_deal(field_values: Dict[str, Any]) -> str:
     - For a single email use "email": "user@example.com". For phones use "phone": "5551234567" (or "phoneNumbers" array) and you MUST include "phone_country_code": "IN" or "+91" at top level.
     - For picklists use the Option ID (number) from the cheat sheet.
     - For date/datetime fields: call get_current_user, then parse_datetime_to_utc_iso_tool and put the UTC ISO string in field_values.
+    - For products: use "products" with a list of product objects, e.g. [{"id": 245208, "quantity": 10, "price": {"currencyId": 431, "value": 100}}].
+      Use lookup_products to find product IDs first.
     """
     try:
         _reset_api_call_count()
@@ -2914,6 +2975,51 @@ async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[
                     if contact.get("id") not in existing_ids:
                         existing_contacts.append(contact)
                 merged["associatedContacts"] = existing_contacts
+            elif key == "products" and isinstance(value, list):
+                # Handle products: merge with existing products on the deal
+                new_products = []
+                for product in value:
+                    if isinstance(product, dict) and product.get("id"):
+                        # Build product object with defaults for missing fields
+                        prod = {
+                            "id": product["id"],
+                            "name": product.get("name", ""),
+                            "quantity": product.get("quantity", 1),
+                            "discount": product.get("discount", {"value": 0, "type": "PERCENTAGE"}),
+                            "price": product.get("price", {}),
+                            "units": product.get("units"),
+                            "category": product.get("category"),
+                            "hsnSacCode": product.get("hsnSacCode"),
+                            "countryOfOrigin": product.get("countryOfOrigin"),
+                            "customFieldValues": product.get("customFieldValues", {}),
+                        }
+                        new_products.append(prod)
+                    elif isinstance(product, (int, str)):
+                        # Just a product ID — add with quantity 1
+                        try:
+                            prod_id = int(product)
+                            new_products.append({
+                                "id": prod_id,
+                                "name": "",
+                                "quantity": 1,
+                                "discount": {"value": 0, "type": "PERCENTAGE"},
+                                "price": {},
+                                "units": None,
+                                "category": None,
+                                "hsnSacCode": None,
+                                "countryOfOrigin": None,
+                                "customFieldValues": {},
+                            })
+                        except (TypeError, ValueError):
+                            logger.warning(f"Invalid product ID: {product}")
+
+                # Merge with existing products (avoid duplicates by ID)
+                existing_products = merged.get("products", []) or []
+                existing_product_ids = {p.get("id") for p in existing_products if isinstance(p, dict)}
+                for prod in new_products:
+                    if prod.get("id") not in existing_product_ids:
+                        existing_products.append(prod)
+                merged["products"] = existing_products
             elif key == "pipelineStage" and isinstance(value, (int, str)):
                 # Special handling: pipelineStage should update the existing pipeline's stage ID
                 # Also update forecastingType to match the stage's forecastingType
@@ -2969,6 +3075,13 @@ async def update_deal(deal_id: int, field_values: Dict[str, Any]) -> str:
     **Link contacts (Kylas deal PUT):** use `associatedContacts` with `{id, name}` per contact, e.g.
     `{"associatedContacts": [{"id": 4942095, "name": "aditya tambe"}]}`. Existing rows are kept; duplicates by id are skipped.
     You may also use `contacts` as an alias (same merge into `associatedContacts`). If `name` is omitted, it is loaded from GET /contacts/{id}.
+
+    **Add products:** use `products` with a list of product objects. Each product needs at minimum `id` (product ID from lookup_products).
+    Optional fields: `quantity` (default 1), `name`, `price` ({"currencyId": id, "value": amount}),
+    `discount` ({"value": 0, "type": "PERCENTAGE"|"FLAT"}), `category` ({"id": id, "name": name}),
+    `hsnSacCode`, `countryOfOrigin` ({"id": id, "name": name}), `customFieldValues`.
+    Example: `{"products": [{"id": 245208, "quantity": 10, "price": {"currencyId": 431, "value": 100}}]}`.
+    Existing products are kept; new products are merged (duplicates by id are skipped).
     """
     try:
         _reset_api_call_count()
@@ -3290,6 +3403,525 @@ async def search_idle_deals(
         return f"✗ Unexpected error: {str(e)}"
 
 
+# ===========================================================================
+# COMPANY ENTITY
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Company field metadata helpers
+# ---------------------------------------------------------------------------
+
+async def _fetch_company_fields() -> List[Dict[str, Any]]:
+    """Fetch company field metadata from Kylas API. Returns list of field dicts."""
+    async with get_client() as client:
+        response = await client.get(
+            "/companies/fields",
+            params={"page": 0, "size": 100}
+        )
+        data = await handle_api_response(response, "Fetch company fields")
+        if isinstance(data, list):
+            fields = data
+        elif isinstance(data, dict):
+            fields = data.get("data", data.get("content", []))
+        else:
+            fields = []
+        return [f for f in fields if f.get("active", True)]
+
+
+async def _get_company_custom_field_id_to_name() -> Dict[str, str]:
+    """Return mapping of custom field ID (string) -> internal name."""
+    fields = await _fetch_company_fields()
+    custom = [f for f in fields if not f.get("standard", False)]
+    return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
+
+
+async def get_company_field_instructions_logic() -> str:
+    fields = await _fetch_company_fields()
+    standard = [f for f in fields if f.get("standard", False)]
+    custom = [f for f in fields if not f.get("standard", False)]
+    lines = [
+        "=" * 60,
+        "KYLAS CRM - COMPANY FIELDS CHEAT SHEET",
+        "=" * 60,
+        "",
+        "## STANDARD FIELDS",
+        "-" * 40,
+    ]
+    for f in standard:
+        lines.extend(_format_field(f, include_filterable=True))
+    if custom:
+        lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
+        for f in custom:
+            lines.extend(_format_field(f, include_filterable=True))
+    lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_company_field_instructions() -> str:
+    """
+    Get all company fields for the current tenant. CALL THIS FIRST before creating or updating a company.
+    Returns a cheat sheet with API names (standard fields), Field IDs (custom fields), and Picklist Option IDs.
+    Use this to build field_values for create_company based on what the user wants—do not use static fields.
+    """
+    try:
+        _reset_api_call_count()
+        logger.info("Fetching company field instructions")
+        result = await get_company_field_instructions_logic()
+        return result
+    except KylasAPIError as e:
+        return f"Error: {e.message}"
+    except Exception as e:
+        logger.exception("get_company_field_instructions")
+        return f"Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Company search rule builder
+# ---------------------------------------------------------------------------
+
+def _build_company_search_json_rule(
+    filters: List[Dict[str, Any]],
+    filterable_map: Dict[str, Dict[str, Any]],
+    default_timezone: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    Build jsonRule for POST /search/company. Returns (jsonRule, error_message).
+    Uses COMPANY_PICKLIST_FIELDS_USE_INTERNAL_NAME for picklist rule_type.
+    """
+    tz_for_date = default_timezone or DEFAULT_TIMEZONE
+    rules = []
+    for i, f in enumerate(filters):
+        field_name = f.get("field")
+        operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        value = f.get("value")
+        field_type_key = (f.get("type") or "TEXT_FIELD").strip().upper().replace(" ", "_")
+
+        if not field_name:
+            return {}, f"Filter #{i + 1}: missing 'field'."
+        if field_name not in filterable_map:
+            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only [FILTERABLE] fields from get_company_field_instructions."
+        meta = filterable_map[field_name]
+        api_type = meta.get("type", "TEXT_FIELD")
+        allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
+        if operator not in allowed:
+            return {}, f"Filter #{i + 1}: operator '{operator}' not allowed for field '{field_name}' (type {api_type}). Allowed: {', '.join(allowed)}."
+
+        # Company-specific picklist handling
+        if api_type in ("PICK_LIST", "MULTI_PICKLIST"):
+            rule_type = "string" if field_name in COMPANY_PICKLIST_FIELDS_USE_INTERNAL_NAME else "long"
+        else:
+            rule_type = _rule_type_for_value(api_type, field_name, value)
+        if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
+            try:
+                value = float(value) if rule_type == "double" else int(value)
+            except (TypeError, ValueError):
+                value = value
+
+        is_custom = not meta.get("standard", True)
+        rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
+
+        rule = {
+            "operator": operator,
+            "id": field_name,
+            "field": rule_field,
+            "type": rule_type,
+            "value": value,
+            "relatedFieldIds": None,
+        }
+        if rule_type == "date":
+            rule["timeZone"] = f.get("timeZone") or tz_for_date
+        rules.append(rule)
+
+    return {"rules": rules, "condition": "AND", "valid": True}, None
+
+
+# ---------------------------------------------------------------------------
+# Company create/update/get logic
+# ---------------------------------------------------------------------------
+
+async def create_company_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a company with the given dynamic field_values."""
+    fv = dict(field_values)
+    has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
+    id_to_name = await _get_company_custom_field_id_to_name() if has_custom_by_id else {}
+    payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    if not payload:
+        raise KylasAPIError("field_values cannot be empty")
+    logger.info("Creating company with fields: %s", list(payload.keys()))
+    async with get_client() as client:
+        response = await client.post("/companies", json=payload)
+        result = await handle_api_response(response, "Create company")
+        logger.info("Company created with ID: %s", result.get("id"))
+        return result
+
+
+@mcp.tool()
+async def create_company(field_values: Dict[str, Any]) -> str:
+    """
+    Create a company in Kylas CRM with only the fields the user wants (no static field list).
+
+    You MUST call get_company_field_instructions FIRST to get valid API names and Field IDs.
+    Infer from user context which fields to send; include only those in field_values.
+
+    field_values: Map of field identifier to value.
+    - Standard fields: use API name as key at top level (e.g. name, website, employees).
+    - Custom fields: MUST be under "customFieldValues" with **internal name** as key (e.g. "customFieldValues": {"cfCompanyType": "Enterprise"}). Do not use field ID as key.
+    - For a single email use "email": "user@example.com". For phones use "phone": "5551234567" (or "phoneNumbers" array) and you MUST include "phone_country_code": "IN" or "+91" at top level.
+    - For picklists use the Option ID (number) from the cheat sheet.
+    - For date/datetime fields: call get_current_user, then parse_datetime_to_utc_iso_tool and put the UTC ISO string in field_values.
+    """
+    try:
+        _reset_api_call_count()
+        result = await create_company_logic(field_values)
+        company_id = result.get("id", "?")
+        name = result.get("name", "Company")
+        return f"✓ Company created successfully.\n  ID: {company_id}\n  Name: {name}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to create company: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("create_company")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def update_company_logic(company_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """GET the company first, merge field_values into it, then PUT the full body. No partial update."""
+    company_id = int(company_id)
+    fv = dict(field_values)
+    if not fv:
+        raise KylasAPIError("field_values cannot be empty for update.")
+    has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
+    id_to_name = await _get_company_custom_field_id_to_name() if has_custom_by_id else {}
+    payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    if not payload:
+        raise KylasAPIError("field_values produced an empty payload.")
+    logger.info("Updating company %s with fields: %s", company_id, list(payload.keys()))
+    async with get_client() as client:
+        get_response = await client.get(f"/companies/{company_id}")
+        existing = await handle_api_response(get_response, "Get company")
+        merged = dict(existing)
+        for key, value in payload.items():
+            if key == "customFieldValues" and isinstance(value, dict):
+                merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
+            else:
+                merged[key] = value
+        response = await client.put(f"/companies/{company_id}", json=merged)
+        result = await handle_api_response(response, "Update company")
+        logger.info("Company %s updated", company_id)
+        return result
+
+
+@mcp.tool()
+async def update_company(company_id: int, field_values: Dict[str, Any]) -> str:
+    """
+    Update a company in Kylas CRM. Fetches the company first, merges your field_values into it, then PUTs the full body.
+    Same field_values format as create_company. Call get_company_field_instructions first for API names.
+
+    company_id: The company ID to update (e.g. from search_companies or search_companies_by_term results).
+    field_values: Map of field identifier to value (same as create_company).
+    """
+    try:
+        _reset_api_call_count()
+        result = await update_company_logic(company_id, field_values)
+        cid = result.get("id", company_id)
+        name = result.get("name", "Company")
+        return f"✓ Company updated successfully.\n  ID: {cid}\n  Name: {name}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to update company: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("update_company")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def get_company_logic(company_id: int) -> Dict[str, Any]:
+    """Fetch a single company by ID (GET /companies/{id}). Returns full company object."""
+    company_id = int(company_id)
+    async with get_client() as client:
+        response = await client.get(f"/companies/{company_id}")
+        return await handle_api_response(response, "Get company")
+
+
+def _format_company_for_display(company: Dict[str, Any]) -> str:
+    """Format a company object into a readable multi-line string."""
+    lines = ["=" * 60, "COMPANY DETAILS", "=" * 60]
+    lines.append(f"ID: {company.get('id', '—')}")
+    lines.append(f"Name: {company.get('name', '—')}")
+    lines.append(f"Website: {company.get('website', '—')}")
+    # Emails
+    emails = company.get("emails") or []
+    if emails:
+        for e in emails:
+            val = e.get("value", "")
+            typ = e.get("type", "")
+            prim = " (primary)" if e.get("primary") else ""
+            lines.append(f"Email ({typ}): {val}{prim}")
+    else:
+        lines.append("Email: —")
+    # Phones
+    phones = company.get("phoneNumbers") or []
+    if phones:
+        for p in phones:
+            code = p.get("code", "")
+            val = p.get("value", "")
+            typ = p.get("type", "")
+            prim = " (primary)" if p.get("primary") else ""
+            lines.append(f"Phone ({typ}): +{code} {val}{prim}")
+    else:
+        lines.append("Phone: —")
+    lines.append(f"Owner ID: {company.get('ownerId', '—')}")
+    lines.append(f"Created At: {company.get('createdAt', '—')}")
+    lines.append(f"Updated At: {company.get('updatedAt', '—')}")
+    # Custom fields
+    custom = company.get("customFieldValues") or {}
+    if custom:
+        lines.append("")
+        lines.append("Custom fields:")
+        for k, v in custom.items():
+            lines.append(f"  {k}: {v}")
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_company(company_id: int) -> str:
+    """
+    Get full details of a company by ID (GET /companies/{id}). Use when the user asks for complete company info.
+    company_id: The company ID (e.g. from search_companies or search_companies_by_term results).
+    """
+    try:
+        _reset_api_call_count()
+        company = await get_company_logic(company_id)
+        return _format_company_for_display(company)
+    except KylasAPIError as e:
+        return f"✗ Failed to get company: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("get_company")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Company search logic
+# ---------------------------------------------------------------------------
+
+async def search_companies_logic(
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """Search companies with jsonRule; only filterable fields allowed."""
+    fields_list = await _fetch_company_fields()
+    filterable_map = _get_filterable_fields_map(fields_list)
+    if not filterable_map:
+        return "No filterable company fields found for this tenant."
+    default_tz = None
+    date_field_types = {"DATETIME_PICKER", "DATE", "DATE_PICKER"}
+    for f in filters:
+        fn = f.get("field")
+        if fn and fn in filterable_map and filterable_map[fn].get("type") in date_field_types and not f.get("timeZone"):
+            try:
+                user = await _fetch_current_user()
+                default_tz = user.get("timezone") or DEFAULT_TIMEZONE
+            except Exception:
+                default_tz = DEFAULT_TIMEZONE
+            break
+    json_rule, err = _build_company_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    if err:
+        return f"Invalid filters: {err}"
+    payload = {
+        "fields": ["id", "name", "website", "emails", "phoneNumbers", "ownerId", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching companies with %d filter(s)", len(filters))
+    async with get_client() as client:
+        response = await client.post("/search/company", params=params, json=payload)
+        data = await handle_api_response(response, "Search companies")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No companies found matching the filters. (Total in DB: {total})"
+    lines = [f"Found {len(results)} company(ies) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for company in results:
+        cid = company.get("id", "?")
+        name = company.get("name", "—")
+        website = company.get("website", "—") or "—"
+        email = _extract_primary_email(company.get("emails"))
+        phone = _extract_primary_phone(company.get("phoneNumbers"))
+        lines.append(f"• ID: {cid} | Name: {name} | Website: {website} | Email: {email} | Phone: {phone}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_companies(
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Search/filter companies. Only fields marked [FILTERABLE] in get_company_field_instructions can be used.
+    Call get_company_field_instructions first to get filterable fields and their types.
+
+    filters: List of filter objects. Each must have:
+      - field (str): Field internal/API name (e.g. name, website, country, createdAt).
+      - operator (str): One of the allowed operators for that field type (e.g. equal, contains, greater).
+      - value: Value to compare. For PICK_LIST/MULTI_PICKLIST use Option ID (number), except
+        country — use internal name (string).
+      - timeZone (str, optional): For date/datetime filters only.
+      - type (str, optional): Field type from cheat sheet.
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "createdAt,desc" (default).
+    """
+    try:
+        _reset_api_call_count()
+        if not filters:
+            return "Error: filters list cannot be empty. Provide at least one filter with field, operator, and value."
+        return await search_companies_logic(filters, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_companies")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def search_companies_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """Search companies by a single term across multiple fields via POST /search/company."""
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    json_rule = _multi_field_json_rule(term)
+    payload = {
+        "fields": ["id", "name", "website", "emails", "phoneNumbers", "ownerId", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching companies by term: %r", term)
+    async with get_client() as client:
+        response = await client.post("/search/company", params=params, json=payload)
+        data = await handle_api_response(response, "Search companies by term")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No companies found matching '{term}'. (Total in DB: {total})"
+    lines = [f"Found {len(results)} company(ies) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for company in results:
+        cid = company.get("id", "?")
+        name = company.get("name", "—")
+        website = company.get("website", "—") or "—"
+        email = _extract_primary_email(company.get("emails"))
+        phone = _extract_primary_phone(company.get("phoneNumbers"))
+        lines.append(f"• ID: {cid} | Name: {name} | Website: {website} | Email: {email} | Phone: {phone}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_companies_by_term(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """
+    Search companies by a single term across multiple fields (name, website, etc.).
+    Use this when the user asks for "companies with X", "companies named Y" without specifying which field to filter on.
+    For filtering by a specific field, use search_companies instead.
+
+    search_term: The term to search for (e.g. "acme", "tech corp").
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "updatedAt,desc" (default).
+    """
+    try:
+        _reset_api_call_count()
+        return await search_companies_by_term_logic(search_term, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_companies_by_term")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def search_idle_companies_logic(
+    days: int,
+    time_zone: Optional[str] = None,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Find companies with no activity for at least `days` days.
+    Uses last-activity = max(updatedAt, latestActivityCreatedAt).
+    """
+    if time_zone:
+        tz = time_zone
+    else:
+        try:
+            user = await _fetch_current_user()
+            tz = user.get("timezone") or DEFAULT_TIMEZONE
+        except Exception:
+            tz = DEFAULT_TIMEZONE
+    threshold_iso = _threshold_iso_days_ago(days, tz)
+    base = {"operator": "less_or_equal", "value": threshold_iso, "timeZone": tz}
+    fields_list = await _fetch_company_fields()
+    filterable_map = _get_filterable_fields_map(fields_list)
+    filters = []
+    for name in ("updatedAt", "latestActivityCreatedAt"):
+        if name in filterable_map:
+            filters.append({"field": name, **base})
+    if not filters:
+        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_company_field_instructions."
+    return await search_companies_logic(filters, page=page, size=size, sort=sort)
+
+
+@mcp.tool()
+async def search_idle_companies(
+    days: int,
+    time_zone: Optional[str] = None,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Search for idle/stagnant companies: no activity for at least the given number of days.
+    Uses both updatedAt and latestActivityCreatedAt.
+
+    days: Minimum days with no activity (e.g. 10 for "no activity since 10 days").
+    time_zone: IANA timezone for threshold (e.g. America/New_York). Default: Asia/Calcutta.
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "createdAt,desc" (default).
+    """
+    try:
+        _reset_api_call_count()
+        if days < 0:
+            return "Error: days must be non-negative."
+        return await search_idle_companies_logic(days, time_zone, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search idle companies failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_idle_companies")
+        return f"✗ Unexpected error: {str(e)}"
+
+
 # ---------------------------------------------------------------------------
 # NOTES: Add notes to Lead, Contact, Deal, Company
 # ---------------------------------------------------------------------------
@@ -3355,8 +3987,7 @@ async def add_note(entity_type: str, entity_id: int, note_text: str) -> str:
 
 def run() -> None:
     """Entry point for console script (e.g. kylas-crm-mcp)."""
-    logger.info("Starting Kylas CRM MCP Server (Lead + Deal)...")
-    logger.info("Starting Kylas CRM MCP Server (Lead + Contact + Task support)...")
+    logger.info("Starting Kylas CRM MCP Server (Lead + Contact + Deal + Task + Company support)...")
     mcp.run()
 
 
