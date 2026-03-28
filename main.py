@@ -84,7 +84,7 @@ def _threshold_iso_days_ago(days: int, time_zone: str) -> str:
 
 
 if not API_KEY:
-    logger.warning("KYLAS_API_KEY environment variable not set. API calls will fail.")
+    logger.info("KYLAS_API_KEY not set. Server will rely on per-request 'x-api-key' header.")
 
 # ---------------------------------------------------------------------------
 # System Instructions: ALWAYS get fields first, then create from user context
@@ -336,18 +336,37 @@ def _get_mcp_client_name() -> str:
     return "unknown"
 
 
+def _resolve_api_key() -> str:
+    """Resolve API key: try per-request HTTP header first, then fall back to env var."""
+    # 1. Try per-request header (multi-user HTTP mode)
+    try:
+        req = get_http_request()
+        if req and getattr(req, "headers", None):
+            header_key = req.headers.get("x-api-key")
+            if header_key:
+                return header_key
+    except Exception:
+        pass
+    # 2. Fall back to env var (single-user / stdio mode)
+    if API_KEY:
+        return API_KEY
+    raise KylasAPIError(
+        "API key not provided. Pass 'x-api-key' header in your MCP client config "
+        "or set KYLAS_API_KEY environment variable."
+    )
+
+
 class _ThrottledClientContext:
     """Async context manager: wraps httpx.AsyncClient and yields _ThrottledClient for 100–500 ms delay between calls."""
 
     def __init__(self) -> None:
-        if not API_KEY:
-            raise KylasAPIError("KYLAS_API_KEY environment variable is not set")
+        api_key = _resolve_api_key()
         client_name = _get_mcp_client_name()
         user_agent = f"kylas_mcp_server/{client_name}"
         self._raw = httpx.AsyncClient(
             base_url=BASE_URL,
             headers={
-                "api-key": API_KEY,
+                "api-key": api_key,
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "User-Agent": user_agent,
@@ -5548,8 +5567,21 @@ async def add_note(entity_type: str, entity_id: int, note_text: str) -> str:
 
 def run() -> None:
     """Entry point for console script (e.g. kylas-crm-mcp)."""
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    host = os.getenv("MCP_HOST", "0.0.0.0")
+    port = int(os.getenv("MCP_PORT", "8000"))
+
     logger.info("Starting Kylas CRM MCP Server (Lead + Contact + Deal + Task + Company + Meeting support)...")
-    mcp.run()
+
+    if transport == "streamable-http":
+        logger.info(f"Running Streamable HTTP on {host}:{port}/mcp")
+        mcp.run(transport="streamable-http", host=host, port=port)
+    elif transport == "sse":
+        logger.info(f"Running SSE on {host}:{port}/sse")
+        mcp.run(transport="sse", host=host, port=port)
+    else:
+        logger.info("Running stdio transport")
+        mcp.run()
 
 
 if __name__ == "__main__":
