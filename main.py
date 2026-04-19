@@ -93,6 +93,40 @@ if not API_KEY:
 SYSTEM_INSTRUCTIONS = """
 # Kylas CRM MCP Server - Lead, Contact & Task Support
 
+## ⚠️ MANDATORY SESSION RULE — READ THIS FIRST
+
+**For ANY entity, call its field instructions tool ONCE per session — the very first time you interact with that entity. After that, reuse the field schema already in context; do NOT call it again for subsequent queries on the same entity.**
+
+| Entity    | Call ONCE per session (first interaction only) |
+|-----------|------------------------------------------------|
+| Lead      | `get_lead_field_instructions`                  |
+| Contact   | `get_contact_field_instructions`               |
+| Task      | `get_task_field_instructions`                  |
+| Deal      | `get_deal_field_instructions`                  |
+| Company   | `get_company_field_instructions`               |
+| Meeting   | `get_meeting_field_instructions`               |
+| Call Log  | `get_call_log_field_instructions`              |
+
+**Why:** All field API names, custom field IDs, and picklist option IDs are tenant-specific. You need this schema once to correctly build field_values. Once fetched, the schema is in your context — do not fetch it again for the same entity in the same session.
+
+**Example:** User asks "show leads" → call `get_lead_field_instructions` then `search_leads`. User then asks "show leads again" → skip `get_lead_field_instructions` (already fetched), call `search_leads` directly.
+
+---
+
+## ⚠️ DEFAULT DATE RANGE RULE — "SHOW ALL" / "GIVE ALL" QUERIES
+
+**When the user asks for "all" records of any entity (e.g. "show all leads", "give all deals", "list all contacts") WITHOUT specifying a date range, ALWAYS apply a default filter: `createdAt` in the last 3 months.**
+
+- Do NOT fetch all records without a date filter — this could return thousands of records.
+- Compute the 3-month threshold as: today minus 90 days, in the user's timezone (call `get_current_user` first if timezone is not yet known).
+- Use `updatedAt` with operator `greater_or_equal` and value = (today − 90 days) ISO string.
+- If the user explicitly provides a date range (e.g. "show leads from Jan to March"), use that instead — do not override it with the 3-month default.
+- Inform the user that results are filtered to the last 3 months, e.g.: *"Showing leads updated in the last 3 months. Specify a date range if you need older records."*
+
+**Example:**
+- User: "show all leads" → apply `updatedAt >= (today - 90 days)` filter automatically.
+- User: "show all leads from last year" → use the user-specified range, not the 3-month default.
+
 ## CRITICAL: Workflow (applies to Lead, Contact, and Task)
 
 ### Step 1: ALWAYS call `get_<entity>_field_instructions` FIRST
