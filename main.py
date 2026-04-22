@@ -7,7 +7,6 @@ LEAD OPERATIONS:
 - get_lead_field_instructions (call FIRST to get schema)
 - create_lead, update_lead, get_lead
 - search_leads (filter by criteria)
-- search_leads_by_term (multi-field search)
 - search_idle_leads (no activity for N days)
 - lookup_pipelines, get_pipeline_stages, get_pipeline_details
 
@@ -15,13 +14,11 @@ CONTACT OPERATIONS:
 - get_contact_field_instructions (call FIRST to get schema)
 - create_contact, update_contact, get_contact
 - search_contacts (filter by criteria - NO PIPELINE)
-- search_contacts_by_term (multi-field search)
 
 TASK OPERATIONS:
 - get_task_field_instructions (call FIRST to get schema)
 - create_task, update_task, get_task
 - search_tasks (filter by criteria - NO PIPELINE)
-- search_tasks_by_term (multi-field search)
 - search_tasks_for_lead, search_tasks_for_contact, search_tasks_for_deal, search_tasks_for_company (find tasks associated with entity)
 
 SHARED TOOLS (for all Lead, Contact, Task):
@@ -93,6 +90,40 @@ if not API_KEY:
 SYSTEM_INSTRUCTIONS = """
 # Kylas CRM MCP Server - Lead, Contact & Task Support
 
+## ⚠️ MANDATORY SESSION RULE — READ THIS FIRST
+
+**For ANY entity, call its field instructions tool ONCE per session — the very first time you interact with that entity. After that, reuse the field schema already in context; do NOT call it again for subsequent queries on the same entity.**
+
+| Entity    | Call ONCE per session (first interaction only) |
+|-----------|------------------------------------------------|
+| Lead      | `get_lead_field_instructions`                  |
+| Contact   | `get_contact_field_instructions`               |
+| Task      | `get_task_field_instructions`                  |
+| Deal      | `get_deal_field_instructions`                  |
+| Company   | `get_company_field_instructions`               |
+| Meeting   | `get_meeting_field_instructions`               |
+| Call Log  | `get_call_log_field_instructions`              |
+
+**Why:** All field API names, custom field IDs, and picklist option IDs are tenant-specific. You need this schema once to correctly build field_values. Once fetched, the schema is in your context — do not fetch it again for the same entity in the same session.
+
+**Example:** User asks "show leads" → call `get_lead_field_instructions` then `search_leads`. User then asks "show leads again" → skip `get_lead_field_instructions` (already fetched), call `search_leads` directly.
+
+---
+
+## ⚠️ DEFAULT DATE RANGE RULE — "SHOW ALL" / "GIVE ALL" QUERIES
+
+**When the user asks for "all" records of any entity (e.g. "show all leads", "give all deals", "list all contacts") WITHOUT specifying a date range, ALWAYS apply a default filter: `createdAt` in the last 3 months.**
+
+- Do NOT fetch all records without a date filter — this could return thousands of records.
+- Compute the 3-month threshold as: today minus 90 days, in the user's timezone (call `get_current_user` first if timezone is not yet known).
+- Use `updatedAt` with operator `greater_or_equal` and value = (today − 90 days) ISO string.
+- If the user explicitly provides a date range (e.g. "show leads from Jan to March"), use that instead — do not override it with the 3-month default.
+- Inform the user that results are filtered to the last 3 months, e.g.: *"Showing leads updated in the last 3 months. Specify a date range if you need older records."*
+
+**Example:**
+- User: "show all leads" → apply `updatedAt >= (today - 90 days)` filter automatically.
+- User: "show all leads from last year" → use the user-specified range, not the 3-month default.
+
 ## CRITICAL: Workflow (applies to Lead, Contact, and Task)
 
 ### Step 1: ALWAYS call `get_<entity>_field_instructions` FIRST
@@ -130,7 +161,6 @@ This provides:
 - Omit any field the user did not mention; do not add static/default fields.
 
 ### Search/Filter leads
-- **By term across multiple fields:** When the user asks for "leads with X", "leads containing Y", or "leads named Z" without specifying a field (e.g. "leads with akshay"), use **search_leads_by_term** with that term. The API will search across firstName, lastName, companyName, phoneNumbers, emails, etc.
 - **By specific field:** When the user specifies a field (e.g. "leads where phone number is X", "leads where first name is John"), use **search_leads** with the appropriate filter(s).
 - Call `get_lead_field_instructions` first to see which fields are **filterable** (marked in cheat sheet) when using search_leads.
 - Only fields with filterable=true can be used in search_leads filters.
@@ -177,7 +207,7 @@ This provides:
 - Prefer the **search_idle_leads** tool when the user asks for idle/stagnant/inactive leads (e.g. "no activity since 10 days"). Otherwise build search_leads filters as above with operator "less_or_equal" and value = ISO date string for (now − N days).
 
 ### Contact-Specific Operations (NO PIPELINE/STAGE)
-- **Search Contacts:** Use `search_contacts` with filters or `search_contacts_by_term` for multi-field search. **IMPORTANT:** Contacts do NOT support pipeline or pipelineStage filters.
+- **Search Contacts:** Use `search_contacts` with filters. **IMPORTANT:** Contacts do NOT support pipeline or pipelineStage filters.
 - **Update Contact:** Use `update_contact` with contact ID and field_values. Same field format as create_contact.
 - **Fields available:** firstName, lastName, emails, phoneNumbers, department, designation, company, ownerId, custom fields, etc.
 - **Fields NOT available:** pipeline, pipelineStage (these are Lead-specific).
@@ -191,7 +221,7 @@ This provides:
   ]
   ```
   Example: `create_task({"name": "Follow up", "relation": [{"targetEntityId": 45089710, "targetEntityType": "LEAD", "targetEntityName": "John Doe"}]})`
-- **Search Tasks:** Use `search_tasks` with filters or `search_tasks_by_term` for multi-field search. **IMPORTANT:** Tasks do NOT support pipeline or pipelineStage filters.
+- **Search Tasks:** Use `search_tasks` with filters. **IMPORTANT:** Tasks do NOT support pipeline or pipelineStage filters.
 - **Update Task:** Use `update_task` with task ID and field_values. Same field format as create_task (including relation if updating associations).
 - **Fields available:** name, description, status, priority, dueDate, assignedTo, reminder, relation, custom fields, etc.
 - **Fields NOT available:** pipeline, pipelineStage (these are Lead-specific), emails, phoneNumbers (Contact-specific).
@@ -440,7 +470,6 @@ Before creating or updating a deal, you MUST call `get_deal_field_instructions` 
 - Omit any field the user did not mention; do not add static/default fields.
 
 ### Search/Filter deals
-- **By term across multiple fields:** When the user asks for "deals with X", "deals containing Y", or "deals named Z" without specifying a field, use **search_deals_by_term** with that term.
 - **By specific field:** When the user specifies a field (e.g. "deals where value is > 10000", "deals where status is Won"), use **search_deals** with the appropriate filter(s).
 - Call `get_deal_field_instructions` first to see which fields are **filterable** (marked in cheat sheet).
 - Only fields with filterable=true can be used in search_deals filters.
@@ -468,7 +497,7 @@ Before creating or updating a deal, you MUST call `get_deal_field_instructions` 
 ### Idle / Stagnant deals (no activity for N days)
 - "Idle" or "stagnant" means no activity on the deal for at least N days.
 - Use **last activity** = the **later** of `updatedAt` and `latestActivityCreatedAt`.
-- Use the **search_idle_deals** tool when the user asks for idle/stagnant/inactive deals.
+- Use **search_deals** with filters: `updatedAt` ≤ threshold **and** `latestActivityCreatedAt` ≤ threshold (threshold = now − N days in ISO).
 
 ### Adding products to a deal
 - When the user wants to add a product to a deal, you MUST ask for the following details before calling update_deal or create_deal:
@@ -518,13 +547,12 @@ Before creating or updating a company, you MUST call `get_company_field_instruct
 - Omit any field the user did not mention; do not add static/default fields.
 
 ### Search/Filter companies
-- **By term across multiple fields:** Use **search_companies_by_term** with that term.
 - **By specific field:** Use **search_companies** with the appropriate filter(s).
 - Call `get_company_field_instructions` first to see which fields are **filterable**.
 - For PICK_LIST/MULTI_PICKLIST: use **Option ID** (number), except for country — use **internal name** (string).
 
 ### Idle / Stagnant companies (no activity for N days)
-- Use the **search_idle_companies** tool when the user asks for idle/stagnant/inactive companies.
+- Use **search_companies** with filters: `updatedAt` ≤ threshold **and** `latestActivityCreatedAt` ≤ threshold (threshold = now − N days in ISO).
 """
 
 # ---------------------------------------------------------------------------
@@ -581,8 +609,7 @@ Before creating a meeting, ask for:
   - Combine multiple rules in one jsonRule with **AND** (same as web).
 - **Presence only:** `associatedLeads` / `associatedContacts` / `associatedDeals` / `associatedCompanies` with `is_not_null` or `is_null` and value null.
 - **By organizer:** Call **lookup_meeting_invitees** first, then `search_meetings` with filter `{"field": "organizer", "operator": "equal", "value": <user_id>}` using the **user** row's id (if the API accepts the rule).
-- **By title:** Use `search_meetings_by_term` with the search term.
-- **By specific field (status, date range, etc.):** Use `search_meetings` with filters.
+- **By specific field (status, date range, title, etc.):** Use `search_meetings` with filters.
   - Status filter: use internal name — "scheduled", "conducted", "missed", "cancelled"
   - Date filters: use from/to fields with operators like "greater", "less", "between"
 - Call `get_meeting_field_instructions` first to see filterable fields.
@@ -1803,73 +1830,6 @@ def _multi_field_json_rule(search_term: str) -> Dict[str, Any]:
     }
 
 
-async def search_leads_by_term_logic(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "updatedAt,desc",
-) -> str:
-    """Search leads by a single term across multiple fields (firstName, lastName, companyName, phoneNumbers, emails, etc.) via POST /search/lead with multi_field jsonRule."""
-    term = (search_term or "").strip()
-    if not term:
-        return "Error: search_term cannot be empty."
-    json_rule = _multi_field_json_rule(term)
-    payload = {
-        "fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "companyName", "createdAt"],
-        "jsonRule": json_rule,
-    }
-    params = {"page": page, "size": min(size, 100)}
-    if sort:
-        params["sort"] = sort
-    logger.info("Searching leads by term: %r", term)
-    async with get_client() as client:
-        response = await client.post("/search/lead", params=params, json=payload)
-        data = await handle_api_response(response, "Search leads by term")
-    results = data.get("content", data.get("data", []))
-    total = data.get("totalElements", data.get("total", len(results)))
-    total_pages = data.get("totalPages", 1)
-    if not results:
-        return f"No leads found matching '{term}'. (Total in DB: {total})"
-    lines = [f"Found {len(results)} lead(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
-    for lead in results:
-        lid = lead.get("id", "?")
-        fn = lead.get("firstName") or ""
-        ln = lead.get("lastName") or ""
-        name = f"{fn} {ln}".strip() or "—"
-        email = _extract_primary_email(lead.get("emails"))
-        phone = _extract_primary_phone(lead.get("phoneNumbers"))
-        lines.append(f"• ID: {lid} | Name: {name} | Email: {email} | Phone: {phone}")
-    lines.append("-" * 60)
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def search_leads_by_term(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "updatedAt,desc",
-) -> str:
-    """
-    Search leads by a single term across multiple fields (firstName, lastName, companyName, phoneNumbers, emails, etc.).
-    Use this when the user asks for "leads with X", "leads containing Y", or "leads named Z" without specifying which field to filter on.
-    For filtering by a specific field (e.g. "leads where phone number is X"), use search_leads instead.
-
-    search_term: The term to search for (e.g. "akshay", "acme").
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "updatedAt,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        return await search_leads_by_term_logic(search_term, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_leads_by_term")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 # ---------------------------------------------------------------------------
 # Tool 6: Search idle / stagnant leads (no activity for N days)
 # ---------------------------------------------------------------------------
@@ -2221,67 +2181,6 @@ async def search_contacts(
         return f"✗ Unexpected error: {str(e)}"
 
 
-async def search_contacts_by_term_logic(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "updatedAt,desc",
-) -> str:
-    """Search contacts by a single term across multiple fields."""
-    term = (search_term or "").strip()
-    if not term:
-        return "Error: search_term cannot be empty."
-    json_rule = _multi_field_json_rule(term)
-    payload = {
-        "fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "department", "designation", "createdAt"],
-        "jsonRule": json_rule,
-    }
-    params = {"page": page, "size": min(size, 100)}
-    if sort:
-        params["sort"] = sort
-    logger.info("Searching contacts by term: %r", term)
-    async with get_client() as client:
-        response = await client.post("/search/contact", params=params, json=payload)
-        data = await handle_api_response(response, "Search contacts by term")
-    results = data.get("content", data.get("data", []))
-    total = data.get("totalElements", data.get("total", len(results)))
-    total_pages = data.get("totalPages", 1)
-    if not results:
-        return f"No contacts found matching '{term}'. (Total in DB: {total})"
-    lines = [f"Found {len(results)} contact(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
-    for contact in results:
-        cid = contact.get("id", "?")
-        fn = contact.get("firstName") or ""
-        ln = contact.get("lastName") or ""
-        name = f"{fn} {ln}".strip() or "—"
-        email = _extract_primary_email(contact.get("emails"))
-        phone = _extract_primary_phone(contact.get("phoneNumbers"))
-        lines.append(f"• ID: {cid} | Name: {name} | Email: {email} | Phone: {phone}")
-    lines.append("-" * 60)
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def search_contacts_by_term(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "updatedAt,desc",
-) -> str:
-    """
-    Search contacts by a single term across multiple fields (firstName, lastName, emails, phones, department, designation, etc.).
-    Use this when the user asks for "contacts with X", "contacts containing Y", or "contacts named Z" without specifying a field.
-    """
-    try:
-        _reset_api_call_count()
-        return await search_contacts_by_term_logic(search_term, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_contacts_by_term")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 # ---------------------------------------------------------------------------
 # Task Entity Support (same as Contact/Lead but task-specific fields)
 # ---------------------------------------------------------------------------
@@ -2593,65 +2492,6 @@ async def search_tasks(
         return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
     except Exception as e:
         logger.exception("search_tasks")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-async def search_tasks_by_term_logic(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "updatedAt,desc",
-) -> str:
-    """Search tasks by a single term across multiple fields."""
-    term = (search_term or "").strip()
-    if not term:
-        return "Error: search_term cannot be empty."
-    json_rule = _multi_field_json_rule(term)
-    payload = {
-        "fields": ["id", "name", "status", "priority", "dueDate", "assignedTo", "relation", "createdAt"],
-        "jsonRule": json_rule,
-    }
-    params = {"page": page, "size": min(size, 100)}
-    if sort:
-        params["sort"] = sort
-    logger.info("Searching tasks by term: %r", term)
-    async with get_client() as client:
-        response = await client.post("/tasks/search", params=params, json=payload)
-        data = await handle_api_response(response, "Search tasks by term")
-    results = data.get("content", data.get("data", []))
-    total = data.get("totalElements", data.get("total", len(results)))
-    total_pages = data.get("totalPages", 1)
-    if not results:
-        return f"No tasks found matching '{term}'. (Total in DB: {total})"
-    lines = [f"Found {len(results)} task(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
-    for task in results:
-        tid = task.get("id", "?")
-        name = task.get("name", "—")
-        status = task.get("status", "—")
-        priority = task.get("priority", "—")
-        lines.append(f"• ID: {tid} | Name: {name} | Status: {status} | Priority: {priority}")
-    lines.append("-" * 60)
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def search_tasks_by_term(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "updatedAt,desc",
-) -> str:
-    """
-    Search tasks by a single term across multiple fields (title, description, status, etc.).
-    Use this when the user asks for "tasks with X", "tasks containing Y", or "tasks titled Z" without specifying a field.
-    """
-    try:
-        _reset_api_call_count()
-        return await search_tasks_by_term_logic(search_term, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_tasks_by_term")
         return f"✗ Unexpected error: {str(e)}"
 
 
@@ -3416,135 +3256,6 @@ async def search_deals(
         return f"✗ Unexpected error: {str(e)}"
 
 
-async def search_deals_by_term_logic(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "updatedAt,desc",
-) -> str:
-    """Search deals by a single term across multiple fields via POST /search/deal with multi_field jsonRule."""
-    term = (search_term or "").strip()
-    if not term:
-        return "Error: search_term cannot be empty."
-    json_rule = _multi_field_json_rule(term)
-    payload = {
-        "fields": ["id", "name", "value", "emails", "phoneNumbers", "ownerId", "createdAt"],
-        "jsonRule": json_rule,
-    }
-    params = {"page": page, "size": min(size, 100)}
-    if sort:
-        params["sort"] = sort
-    logger.info("Searching deals by term: %r", term)
-    async with get_client() as client:
-        response = await client.post("/search/deal", params=params, json=payload)
-        data = await handle_api_response(response, "Search deals by term")
-    results = data.get("content", data.get("data", []))
-    total = data.get("totalElements", data.get("total", len(results)))
-    total_pages = data.get("totalPages", 1)
-    if not results:
-        return f"No deals found matching '{term}'. (Total in DB: {total})"
-    lines = [f"Found {len(results)} deal(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
-    for deal in results:
-        did = deal.get("id", "?")
-        name = deal.get("name", "—")
-        value = _extract_primary_deal_value(deal.get("value"))
-        email = _extract_primary_email(deal.get("emails"))
-        phone = _extract_primary_phone(deal.get("phoneNumbers"))
-        lines.append(f"• ID: {did} | Name: {name} | Value: {value} | Email: {email} | Phone: {phone}")
-    lines.append("-" * 60)
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def search_deals_by_term(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "updatedAt,desc",
-) -> str:
-    """
-    Search deals by a single term across multiple fields (name, value, etc.).
-    Use this when the user asks for "deals with X", "deals containing Y", or "deals named Z" without specifying which field to filter on.
-    For filtering by a specific field, use search_deals instead.
-
-    search_term: The term to search for (e.g. "acme", "contract").
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "updatedAt,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        return await search_deals_by_term_logic(search_term, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_deals_by_term")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-async def search_idle_deals_logic(
-    days: int,
-    time_zone: Optional[str] = None,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "createdAt,desc",
-) -> str:
-    """
-    Find deals with no activity for at least `days` days.
-    Uses last-activity = max(updatedAt, latestActivityCreatedAt).
-    If time_zone is not provided, uses current user's timezone.
-    """
-    if time_zone:
-        tz = time_zone
-    else:
-        try:
-            user = await _fetch_current_user()
-            tz = user.get("timezone") or DEFAULT_TIMEZONE
-        except Exception:
-            tz = DEFAULT_TIMEZONE
-    threshold_iso = _threshold_iso_days_ago(days, tz)
-    base = {"operator": "less_or_equal", "value": threshold_iso, "timeZone": tz}
-    fields_list = await _fetch_deal_fields()
-    filterable_map = _get_filterable_fields_map(fields_list)
-    filters = []
-    for name in ("updatedAt", "latestActivityCreatedAt"):
-        if name in filterable_map:
-            filters.append({"field": name, **base})
-    if not filters:
-        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_deal_field_instructions."
-    return await search_deals_logic(filters, page=page, size=size, sort=sort)
-
-
-@mcp.tool()
-async def search_idle_deals(
-    days: int,
-    time_zone: Optional[str] = None,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "createdAt,desc",
-) -> str:
-    """
-    Search for idle/stagnant deals: no activity for at least the given number of days.
-    Uses both updatedAt and latestActivityCreatedAt.
-
-    days: Minimum days with no activity (e.g. 10 for "no activity since 10 days").
-    time_zone: IANA timezone for threshold (e.g. America/New_York). Default: Asia/Calcutta.
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "createdAt,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        if days < 0:
-            return "Error: days must be non-negative."
-        return await search_idle_deals_logic(days, time_zone, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search idle deals failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_idle_deals")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 # ===========================================================================
 # COMPANY ENTITY
 # ===========================================================================
@@ -3933,134 +3644,6 @@ async def search_companies(
         return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
     except Exception as e:
         logger.exception("search_companies")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-async def search_companies_by_term_logic(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "updatedAt,desc",
-) -> str:
-    """Search companies by a single term across multiple fields via POST /search/company."""
-    term = (search_term or "").strip()
-    if not term:
-        return "Error: search_term cannot be empty."
-    json_rule = _multi_field_json_rule(term)
-    payload = {
-        "fields": ["id", "name", "website", "emails", "phoneNumbers", "ownerId", "createdAt"],
-        "jsonRule": json_rule,
-    }
-    params = {"page": page, "size": min(size, 100)}
-    if sort:
-        params["sort"] = sort
-    logger.info("Searching companies by term: %r", term)
-    async with get_client() as client:
-        response = await client.post("/search/company", params=params, json=payload)
-        data = await handle_api_response(response, "Search companies by term")
-    results = data.get("content", data.get("data", []))
-    total = data.get("totalElements", data.get("total", len(results)))
-    total_pages = data.get("totalPages", 1)
-    if not results:
-        return f"No companies found matching '{term}'. (Total in DB: {total})"
-    lines = [f"Found {len(results)} company(ies) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
-    for company in results:
-        cid = company.get("id", "?")
-        name = company.get("name", "—")
-        website = company.get("website", "—") or "—"
-        email = _extract_primary_email(company.get("emails"))
-        phone = _extract_primary_phone(company.get("phoneNumbers"))
-        lines.append(f"• ID: {cid} | Name: {name} | Website: {website} | Email: {email} | Phone: {phone}")
-    lines.append("-" * 60)
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def search_companies_by_term(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "updatedAt,desc",
-) -> str:
-    """
-    Search companies by a single term across multiple fields (name, website, etc.).
-    Use this when the user asks for "companies with X", "companies named Y" without specifying which field to filter on.
-    For filtering by a specific field, use search_companies instead.
-
-    search_term: The term to search for (e.g. "acme", "tech corp").
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "updatedAt,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        return await search_companies_by_term_logic(search_term, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_companies_by_term")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-async def search_idle_companies_logic(
-    days: int,
-    time_zone: Optional[str] = None,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "createdAt,desc",
-) -> str:
-    """
-    Find companies with no activity for at least `days` days.
-    Uses last-activity = max(updatedAt, latestActivityCreatedAt).
-    """
-    if time_zone:
-        tz = time_zone
-    else:
-        try:
-            user = await _fetch_current_user()
-            tz = user.get("timezone") or DEFAULT_TIMEZONE
-        except Exception:
-            tz = DEFAULT_TIMEZONE
-    threshold_iso = _threshold_iso_days_ago(days, tz)
-    base = {"operator": "less_or_equal", "value": threshold_iso, "timeZone": tz}
-    fields_list = await _fetch_company_fields()
-    filterable_map = _get_filterable_fields_map(fields_list)
-    filters = []
-    for name in ("updatedAt", "latestActivityCreatedAt"):
-        if name in filterable_map:
-            filters.append({"field": name, **base})
-    if not filters:
-        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_company_field_instructions."
-    return await search_companies_logic(filters, page=page, size=size, sort=sort)
-
-
-@mcp.tool()
-async def search_idle_companies(
-    days: int,
-    time_zone: Optional[str] = None,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "createdAt,desc",
-) -> str:
-    """
-    Search for idle/stagnant companies: no activity for at least the given number of days.
-    Uses both updatedAt and latestActivityCreatedAt.
-
-    days: Minimum days with no activity (e.g. 10 for "no activity since 10 days").
-    time_zone: IANA timezone for threshold (e.g. America/New_York). Default: Asia/Calcutta.
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "createdAt,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        if days < 0:
-            return "Error: days must be non-negative."
-        return await search_idle_companies_logic(days, time_zone, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search idle companies failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_idle_companies")
         return f"✗ Unexpected error: {str(e)}"
 
 
@@ -4871,83 +4454,6 @@ async def search_meetings(
         return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
     except Exception as e:
         logger.exception("search_meetings")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-async def search_meetings_by_term_logic(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "from,desc",
-) -> str:
-    """Search meetings by title term via POST /meetings/search."""
-    term = (search_term or "").strip()
-    if not term:
-        return "Error: search_term cannot be empty."
-    # Search by title field
-    json_rule = {
-        "rules": [
-            {
-                "operator": "contains",
-                "id": "title",
-                "field": "title",
-                "type": "string",
-                "value": term,
-                "relatedFieldIds": None,
-            }
-        ],
-        "condition": "AND",
-        "valid": True,
-    }
-    payload = {"jsonRule": json_rule}
-    params = {"page": _meetings_search_api_page(page), "size": min(size, 100)}
-    if sort:
-        params["sort"] = sort
-    logger.info("Searching meetings by term: %r", term)
-    async with get_client() as client:
-        response = await client.post("/meetings/search", params=params, json=payload)
-        data = await handle_api_response(response, "Search meetings by term")
-    results = data.get("content", data.get("data", []))
-    total = data.get("totalElements", data.get("total", len(results)))
-    total_pages = data.get("totalPages", 1)
-    if not results:
-        return f"No meetings found matching '{term}'. (Total in DB: {total})"
-    lines = [f"Found {len(results)} meeting(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
-    for m in results:
-        mid = m.get("id", "?")
-        title = m.get("title", "—")
-        status = m.get("status", "—")
-        from_dt = m.get("from", "—")
-        to_dt = m.get("to", "—")
-        location = m.get("location", "—") or "—"
-        lines.append(f"• ID: {mid} | Title: {title} | Status: {status} | From: {from_dt} | To: {to_dt} | Location: {location}")
-    lines.append("-" * 60)
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def search_meetings_by_term(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "from,desc",
-) -> str:
-    """
-    Search meetings by title. Use when the user asks for "meetings with X" or "meetings about Y".
-    For filtering by specific fields (status, date range, etc.), use search_meetings instead.
-
-    search_term: The term to search for in meeting titles (e.g. "demo", "call with John").
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "from,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        return await search_meetings_by_term_logic(search_term, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_meetings_by_term")
         return f"✗ Unexpected error: {str(e)}"
 
 
