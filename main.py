@@ -247,6 +247,7 @@ OPERATOR_MAPPING = {
     "TEXT_FIELD": ["equal", "not_equal", "contains", "not_contains", "in", "not_in", "is_empty", "is_not_empty", "begins_with"],
     "PARAGRAPH_TEXT": ["equal", "not_equal", "contains", "not_contains", "in", "not_in", "is_empty", "is_not_empty", "begins_with"],
     "NUMBER": ["equal", "not_equal", "greater", "greater_or_equal", "less", "less_or_equal", "between", "not_between", "in", "not_in", "is_null", "is_not_null"],
+    "MONEY": ["equal", "not_equal", "greater", "greater_or_equal", "less", "less_or_equal", "between", "not_between", "in", "not_in", "is_null", "is_not_null"],
     "URL": ["equal", "not_equal", "contains", "not_contains", "in", "not_in", "is_empty", "is_not_empty", "begins_with"],
     "CHECKBOX": ["equal", "not_equal"],
     "PICK_LIST": ["equal", "not_equal", "is_not_null", "is_null", "in", "not_in"],
@@ -263,6 +264,17 @@ OPERATOR_MAPPING = {
     "MEETING_ORGANIZER": ["equal", "not_equal", "is_not_null", "is_null", "in", "not_in"],
     "PIPELINE_STAGE": ["equal", "not_equal", "in", "not_in"],
     "PIPELINE": ["equal", "not_equal", "is_not_null", "is_null", "in", "not_in"],
+}
+
+# Operator symbol → name mapping (normalize user input like ">" to "greater")
+OPERATOR_SYMBOL_MAP = {
+    ">": "greater",
+    "<": "less",
+    ">=": "greater_or_equal",
+    "<=": "less_or_equal",
+    "!=": "not_equal",
+    "==": "equal",
+    "=": "equal",
 }
 
 # Picklist fields that use internal name (string) in search; all others use Option ID (long)
@@ -758,6 +770,8 @@ def _build_search_json_rule(
     for i, f in enumerate(filters):
         field_name = f.get("field")
         operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        # Convert operator symbols (>, <, >=, <=, !=, ==) to operator names
+        operator = OPERATOR_SYMBOL_MAP.get(operator, operator)
         value = f.get("value")
         field_type_key = (f.get("type") or "TEXT_FIELD").strip().upper().replace(" ", "_")
 
