@@ -5870,5 +5870,15 @@ def run() -> None:
         mcp.run()
 
 
+async def _server_startup():
+    """Initialize labels before MCP server starts."""
+    await _load_entity_labels()
+    # Start background refresh loop (fire-and-forget async task)
+    asyncio.create_task(_label_refresh_loop(interval_seconds=1800))
+
+
 if __name__ == "__main__":
+    # Load labels before starting server
+    asyncio.run(_server_startup())
+    # Run MCP server
     run()
