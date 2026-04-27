@@ -39,7 +39,6 @@ from zoneinfo import ZoneInfo
 import httpx
 from dateutil import parser as dateutil_parser
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import get_context, get_http_request
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -343,46 +342,18 @@ def _get_mcp_client_name() -> str:
     Resolve the MCP client name (e.g. cursor, claude) from request context or HTTP User-Agent.
     Used for the outbound User-Agent to Kylas: kylas_mcp_server/{clientName}.
     """
-    try:
-        ctx = get_context()
-        if ctx and getattr(ctx, "client_id", None):
-            cid = (ctx.client_id or "").lower()
-            if "cursor" in cid:
-                return "cursor"
-            if "claude" in cid:
-                return "claude"
-    except Exception:
-        pass
-    try:
-        req = get_http_request()
-        if req and getattr(req, "headers", None):
-            ua = (req.headers.get("user-agent") or req.headers.get("User-Agent") or "").lower()
-            if "cursor" in ua:
-                return "cursor"
-            if "claude" in ua:
-                return "claude"
-    except Exception:
-        pass
+    # Note: get_context() and get_http_request() not available in fastmcp 2.0
+    # Gracefully fall back to "unknown"
     return "unknown"
 
 
 def _resolve_api_key() -> str:
     """Resolve API key: try per-request HTTP header first, then fall back to env var."""
-    # 1. Try per-request header (multi-user HTTP mode)
-    try:
-        req = get_http_request()
-        if req and getattr(req, "headers", None):
-            header_key = req.headers.get("x-api-key")
-            if header_key:
-                return header_key
-    except Exception:
-        pass
-    # 2. Fall back to env var (single-user / stdio mode)
+    # Note: get_http_request() not available in fastmcp 2.0, use env var only
     if API_KEY:
         return API_KEY
     raise KylasAPIError(
-        "API key not provided. Pass 'x-api-key' header in your MCP client config "
-        "or set KYLAS_API_KEY environment variable."
+        "API key not provided. Set KYLAS_API_KEY environment variable."
     )
 
 
@@ -3195,7 +3166,7 @@ async def search_deals_logic(
     if err:
         return f"Invalid filters: {err}"
     payload = {
-        "fields": ["id", "name", "value", "emails", "phoneNumbers", "ownerId", "createdAt"],
+        "fields": ["id", "name", "value", "currency", "closingDate", "ownerId", "createdAt", "actualValue", "estimatedValue"],
         "jsonRule": json_rule,
     }
     params = {"page": page, "size": min(size, 100)}
@@ -3215,9 +3186,9 @@ async def search_deals_logic(
         did = deal.get("id", "?")
         name = deal.get("name", "—")
         value = _extract_primary_deal_value(deal.get("value"))
-        email = _extract_primary_email(deal.get("emails"))
-        phone = _extract_primary_phone(deal.get("phoneNumbers"))
-        lines.append(f"• ID: {did} | Name: {name} | Value: {value} | Email: {email} | Phone: {phone}")
+        actual_val = _extract_primary_deal_value(deal.get("actualValue"))
+        estimated_val = _extract_primary_deal_value(deal.get("estimatedValue"))
+        lines.append(f"• ID: {did} | Name: {name} | Value: {value} | Actual: {actual_val} | Estimated: {estimated_val}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -3230,7 +3201,12 @@ async def search_deals(
     sort: Optional[str] = "createdAt,desc",
 ) -> str:
     """
-    Search/filter deals. Only fields marked [FILTERABLE] in get_deal_field_instructions can be used.
+    Search/filter deals by specific field criteria. Use this to:
+    - Get ALL deals: filters=[{"field":"id","operator":"is_not_null"}]
+    - Get deals by field criteria (e.g., value > 50000, status = "Won")
+    - Filter by any [FILTERABLE] field from get_deal_field_instructions
+
+    DO NOT use this for keyword/text searches - use search_deals_by_term instead.
     Call get_deal_field_instructions first to get filterable fields and their types.
 
     filters: List of filter objects. Each must have:
@@ -3253,6 +3229,140 @@ async def search_deals(
         return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
     except Exception as e:
         logger.exception("search_deals")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def search_deals_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """Search deals by a single term across multiple fields via POST /search/deal with multi_field jsonRule."""
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    json_rule = _multi_field_json_rule(term)
+    payload = {
+        "fields": ["id", "name", "value", "currency", "closingDate", "ownerId", "createdAt", "actualValue", "estimatedValue"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching deals by term: %r", term)
+    async with get_client() as client:
+        response = await client.post("/search/deal", params=params, json=payload)
+        data = await handle_api_response(response, "Search deals by term")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No deals found matching '{term}'. (Total in DB: {total})"
+    lines = [f"Found {len(results)} deal(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for deal in results:
+        did = deal.get("id", "?")
+        name = deal.get("name", "—")
+        value = _extract_primary_deal_value(deal.get("value"))
+        actual_val = _extract_primary_deal_value(deal.get("actualValue"))
+        estimated_val = _extract_primary_deal_value(deal.get("estimatedValue"))
+        lines.append(f"• ID: {did} | Name: {name} | Value: {value} | Actual: {actual_val} | Estimated: {estimated_val}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_deals_by_term(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """
+    Search deals by KEYWORD/TEXT TERM only (name, description, etc.).
+    Use ONLY when the user asks for "deals with X", "deals containing Y", or "deals named Z" WITH A SPECIFIC SEARCH TERM.
+
+    DO NOT use for:
+    - Getting all deals → use search_deals with filters=[{"field":"id","operator":"is_not_null"}]
+    - Filtering by field value → use search_deals instead
+
+    Requires a non-empty search_term.
+
+    search_term: The term to search for (e.g. "acme", "contract").
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "updatedAt,desc" (default).
+    """
+    try:
+        _reset_api_call_count()
+        return await search_deals_by_term_logic(search_term, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_deals_by_term")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def search_idle_deals_logic(
+    days: int,
+    time_zone: Optional[str] = None,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Find deals with no activity for at least `days` days.
+    Uses last-activity = max(updatedAt, latestActivityCreatedAt).
+    If time_zone is not provided, uses current user's timezone.
+    """
+    if time_zone:
+        tz = time_zone
+    else:
+        try:
+            user = await _fetch_current_user()
+            tz = user.get("timezone") or DEFAULT_TIMEZONE
+        except Exception:
+            tz = DEFAULT_TIMEZONE
+    threshold_iso = _threshold_iso_days_ago(days, tz)
+    base = {"operator": "less_or_equal", "value": threshold_iso, "timeZone": tz}
+    fields_list = await _fetch_deal_fields()
+    filterable_map = _get_filterable_fields_map(fields_list)
+    filters = []
+    for name in ("updatedAt", "latestActivityCreatedAt"):
+        if name in filterable_map:
+            filters.append({"field": name, **base})
+    if not filters:
+        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_deal_field_instructions."
+    return await search_deals_logic(filters, page=page, size=size, sort=sort)
+
+
+@mcp.tool()
+async def search_idle_deals(
+    days: int,
+    time_zone: Optional[str] = None,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Search for idle/stagnant deals: no activity for at least the given number of days.
+    Uses both updatedAt and latestActivityCreatedAt.
+
+    days: Minimum days with no activity (e.g. 10 for "no activity since 10 days").
+    time_zone: IANA timezone for threshold (e.g. America/New_York). Default: Asia/Calcutta.
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "createdAt,desc" (default).
+    """
+    try:
+        _reset_api_call_count()
+        if days < 0:
+            return "Error: days must be non-negative."
+        return await search_idle_deals_logic(days, time_zone, page, size, sort)
+    except KylasAPIError as e:
+        return f"✗ Search idle deals failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_idle_deals")
         return f"✗ Unexpected error: {str(e)}"
 
 
@@ -4756,7 +4866,7 @@ def _format_call_log_for_display(log: Dict[str, Any]) -> str:
 @mcp.tool()
 async def get_call_logs(entity_id: int, entity_type: str, page: int = 0, size: int = 20) -> str:
     """
-    Get call logs for a specific lead, contact, or deal.
+    Get call logs for a specific lead, contact, or deal. Includes associated entity details.
 
     entity_id: The ID of the lead, contact, or deal.
     entity_type: "lead", "contact", or "deal".
@@ -4770,6 +4880,22 @@ async def get_call_logs(entity_id: int, entity_type: str, page: int = 0, size: i
             return f"✗ Invalid entity type: '{entity_type}'. Must be one of: lead, contact, deal"
         entity_id = int(entity_id)
         logger.info("Fetching call logs for %s %s", entity_type_lower, entity_id)
+
+        # Fetch entity details to provide context
+        entity_details_str = ""
+        try:
+            if entity_type_lower == "lead":
+                entity = await get_lead_logic(entity_id)
+                entity_details_str = _format_lead_for_display(entity)
+            elif entity_type_lower == "contact":
+                entity = await get_contact_logic(entity_id)
+                entity_details_str = _format_contact_for_display(entity)
+            elif entity_type_lower == "deal":
+                entity = await get_deal_logic(entity_id)
+                entity_details_str = _format_deal_for_display(entity)
+        except Exception as e:
+            logger.warning("Failed to fetch %s details for ID %s: %s", entity_type_lower, entity_id, str(e))
+
         async with get_client() as client:
             response = await client.get(
                 f"/call-logs/{entity_id}",
@@ -4794,7 +4920,20 @@ async def get_call_logs(entity_id: int, entity_type: str, page: int = 0, size: i
         if not results:
             return f"No call logs found for {entity_type_lower} {entity_id}."
 
-        lines = [f"Found {len(results)} call log(s) for {entity_type_lower} {entity_id} (total {total})", "-" * 60]
+        lines = []
+        # Include entity details if available
+        if entity_details_str:
+            lines.append("=" * 60)
+            lines.append("ENTITY DETAILS")
+            lines.append("=" * 60)
+            lines.extend(entity_details_str.split("\n"))
+            lines.append("")
+
+        lines.append("=" * 60)
+        lines.append("CALL LOGS")
+        lines.append("=" * 60)
+        lines.append(f"Found {len(results)} call log(s) (total {total})")
+        lines.append("-" * 60)
         for log in results:
             lid = log.get("id", "?")
             call_type = log.get("callType", "—")
@@ -4876,18 +5015,79 @@ def _build_call_log_search_json_rule(
     return {"rules": rules, "condition": "AND", "valid": True}, None
 
 
-def _format_call_log_search_result(log: Dict[str, Any]) -> str:
-    """Format a single call log search result."""
-    lid = log.get("id", "?")
+def _extract_call_log_data(log: Dict[str, Any]) -> dict:
+    """Extract data from a call log record."""
+    lid = str(log.get("id", "?"))
     call_type = log.get("callType", "—")
     outcome = log.get("outcome", "—")
     phone = log.get("phoneNumber", "—")
     start = log.get("startTime", "—")
     duration = log.get("duration", "—")
-    related = log.get("relatedTo") or {}
-    related_name = related.get("name", "—") if isinstance(related, dict) else "—"
-    related_entity = related.get("entity", "") if isinstance(related, dict) else ""
-    return f"• ID: {lid} | Type: {call_type} | Outcome: {outcome} | Phone: {phone} | Start: {start} | Duration: {duration}s | Related: {related_name} ({related_entity})"
+
+    # Extract sentiment: overallSentiment + customerEmotion (first one)
+    overall_sentiment = log.get("overallSentiment", "—")
+    customer_emotions = log.get("customerEmotion") or []
+    emotion_name = "—"
+    if isinstance(customer_emotions, list) and len(customer_emotions) > 0:
+        emotion = customer_emotions[0]
+        if isinstance(emotion, dict):
+            emotion_name = emotion.get("name", "—")
+    sentiment = f"{overall_sentiment}/{emotion_name}" if overall_sentiment != "—" else emotion_name
+
+    # Extract entity info from relatedTo (it's an array)
+    related_list = log.get("relatedTo") or []
+    related_name = "—"
+    if isinstance(related_list, list) and len(related_list) > 0:
+        related = related_list[0]
+        if isinstance(related, dict):
+            name = related.get("name", "—")
+            entity = related.get("entity", "—")
+            eid = related.get("id", "?")
+            related_name = f"{name} ({entity}#{eid})"
+
+    return {
+        "ID": lid,
+        "Type": call_type,
+        "Outcome": outcome,
+        "Sentiment": sentiment,
+        "Phone": phone,
+        "Start Time": start,
+        "Duration": duration,
+        "Related To": related_name,
+    }
+
+
+def _format_call_logs_table(logs: List[Dict[str, Any]]) -> str:
+    """Format call logs as a table."""
+    if not logs:
+        return "No call logs found."
+
+    # Extract data for all logs
+    rows = [_extract_call_log_data(log) for log in logs]
+
+    # Get column headers
+    headers = ["ID", "Type", "Outcome", "Sentiment", "Phone", "Start Time", "Duration", "Related To"]
+
+    # Calculate column widths
+    col_widths = {h: len(h) for h in headers}
+    for row in rows:
+        for h in headers:
+            col_widths[h] = max(col_widths[h], len(str(row.get(h, "—"))))
+
+    # Build table
+    lines = []
+
+    # Header
+    header_line = " | ".join(f"{h:<{col_widths[h]}}" for h in headers)
+    lines.append(header_line)
+    lines.append("-" * len(header_line))
+
+    # Rows
+    for row in rows:
+        row_line = " | ".join(f"{str(row.get(h, '—')):<{col_widths[h]}}" for h in headers)
+        lines.append(row_line)
+
+    return "\n".join(lines)
 
 
 async def search_call_logs_logic(
@@ -4928,10 +5128,11 @@ async def search_call_logs_logic(
     total_pages = data.get("totalPages", 1)
     if not results:
         return f"No call logs found matching the filters. (Total in DB: {total})"
-    lines = [f"Found {len(results)} call log(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
-    for log in results:
-        lines.append(_format_call_log_search_result(log))
-    lines.append("-" * 60)
+    lines = [f"Found {len(results)} call log(s) (page {page + 1} of {total_pages}, total {total})", ""]
+    lines.append(_format_call_logs_table(results))
+    lines.append("")
+    lines.append("💡 HINT: For call logs showing 'Related: contact#123' or 'lead#456', use:")
+    lines.append("  • get_call_logs(entity_id=123, entity_type='contact') to see full contact details with their call logs")
     return "\n".join(lines)
 
 
@@ -4996,10 +5197,11 @@ async def search_all_call_logs(
         total_pages = data.get("totalPages", 1)
         if not results:
             return "No call logs found."
-        lines = [f"Found {len(results)} call log(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
-        for log in results:
-            lines.append(_format_call_log_search_result(log))
-        lines.append("-" * 60)
+        lines = [f"Found {len(results)} call log(s) (page {page + 1} of {total_pages}, total {total})", ""]
+        lines.append(_format_call_logs_table(results))
+        lines.append("")
+        lines.append("💡 HINT: For call logs showing 'Related: contact#123' or 'lead#456', use:")
+        lines.append("  • get_call_logs(entity_id=123, entity_type='contact') to see full contact details with their call logs")
         return "\n".join(lines)
     except KylasAPIError as e:
         return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
@@ -5065,6 +5267,91 @@ async def add_note(entity_type: str, entity_id: int, note_text: str) -> str:
     except Exception as e:
         logger.exception("add_note")
         return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Entity Configuration Dictionary for Generic Search Tool Dispatch
+# ---------------------------------------------------------------------------
+
+_ENTITY_CONFIG = {
+    "lead": {
+        "search_fn": search_leads_logic,
+        "by_term_fn": None,
+        "idle_fn": search_idle_leads_logic,
+        "search_fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "companyName", "createdAt"],
+        "search_endpoint": "/search/lead",
+        "search_page_offset": 0,
+        "search_rule_builder": _build_search_json_rule,
+        "normalize": True,
+        "field_fmt": "standard",
+    },
+    "contact": {
+        "search_fn": search_contacts_logic,
+        "by_term_fn": None,
+        "idle_fn": None,
+        "search_fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "department", "designation", "createdAt"],
+        "search_endpoint": "/search/contact",
+        "search_page_offset": 0,
+        "search_rule_builder": _build_search_json_rule,
+        "normalize": True,
+        "field_fmt": "standard",
+    },
+    "task": {
+        "search_fn": search_tasks_logic,
+        "by_term_fn": None,
+        "idle_fn": None,
+        "search_fields": ["id", "name", "status", "priority", "dueDate", "assignedTo", "relation", "createdAt"],
+        "search_endpoint": "/tasks/search",
+        "search_page_offset": 0,
+        "search_rule_builder": _build_search_json_rule,
+        "normalize": True,
+        "field_fmt": "standard",
+    },
+    "deal": {
+        "search_fn": search_deals_logic,
+        "by_term_fn": search_deals_by_term_logic,
+        "idle_fn": search_idle_deals_logic,
+        "search_fields": ["id", "name", "value", "currency", "closingDate", "ownerId", "createdAt", "actualValue", "estimatedValue"],
+        "search_endpoint": "/search/deal",
+        "search_page_offset": 0,
+        "search_rule_builder": _build_deal_search_json_rule,
+        "normalize": True,
+        "field_fmt": "standard",
+    },
+    "company": {
+        "search_fn": search_companies_logic,
+        "by_term_fn": None,
+        "idle_fn": None,
+        "search_fields": ["id", "name", "website", "emails", "phoneNumbers", "ownerId", "createdAt"],
+        "search_endpoint": "/search/company",
+        "search_page_offset": 0,
+        "search_rule_builder": _build_company_search_json_rule,
+        "normalize": True,
+        "field_fmt": "standard",
+    },
+    "meeting": {
+        "search_fn": search_meetings_logic,
+        "by_term_fn": None,
+        "idle_fn": None,
+        "search_fields": None,
+        "search_endpoint": "/meetings/search",
+        "search_page_offset": 1,
+        "search_rule_builder": _build_meeting_search_json_rule,
+        "normalize": False,
+        "field_fmt": "meeting",
+    },
+    "call_log": {
+        "search_fn": search_call_logs_logic,
+        "by_term_fn": None,
+        "idle_fn": None,
+        "search_fields": None,
+        "search_endpoint": "/call-logs/search",
+        "search_page_offset": 1,
+        "search_rule_builder": _build_call_log_search_json_rule,
+        "normalize": False,
+        "field_fmt": "meeting",
+    },
+}
 
 
 # ---------------------------------------------------------------------------
