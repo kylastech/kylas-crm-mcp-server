@@ -730,7 +730,8 @@ Same as lead but `"entity": "deal"` in relatedTo. Optionally add `associatedTo` 
 # MCP Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("Kylas CRM", instructions=SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" + COMPANY_SYSTEM_INSTRUCTIONS + "\n\n" + MEETING_SYSTEM_INSTRUCTIONS + "\n\n" + CALL_LOG_SYSTEM_INSTRUCTIONS)
+_final_instructions = SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" + COMPANY_SYSTEM_INSTRUCTIONS + "\n\n" + MEETING_SYSTEM_INSTRUCTIONS + "\n\n" + CALL_LOG_SYSTEM_INSTRUCTIONS + _format_entity_labels_for_instructions(_ENTITY_LABELS)
+mcp = FastMCP("Kylas CRM", instructions=_final_instructions)
 
 
 # ---------------------------------------------------------------------------
