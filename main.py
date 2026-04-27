@@ -90,16 +90,18 @@ def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) ->
     if not labels:
         return ""
 
-    lines = ["\n## Entity Label Mapping (Tenant-Customized Names)\n"]
-    lines.append("When user mentions entity names, map to the standard type:\n")
+    lines = ["\n## Entity Label Mapping (Tenant-Customized Names → Standard Entity Types)\n"]
+    lines.append("This tenant has customized entity display names. When user mentions custom names, map to standard entity types:\n")
 
     for entity_type in sorted(labels.keys()):
         label_data = labels[entity_type]
         display_name = label_data.get("displayName", entity_type)
         display_plural = label_data.get("displayNamePlural", entity_type)
-        lines.append(f"- **{entity_type}**: displays as \"{display_name}\" (plural: \"{display_plural}\")")
+        lines.append(f"- **\"{display_name}\"** (user's term) = **\"{entity_type}\"** (standard type for tools)")
 
-    lines.append("\nWhen user queries mention custom names (e.g., \"deeeels\"), map them to standard entity types (e.g., DEAL) before calling tools.\n")
+    lines.append("\n**CRITICAL for tool calls:** When calling any tool with an entity_type parameter, use the STANDARD TYPE (e.g., \"deal\", \"contact\"), NOT the display name.")
+    lines.append("Example: User says \"fetch Cars with Animals\" → you map \"Cars\" to \"deal\" and \"Animals\" to \"contact\" → call search_entity(\"deal\", ...) and search_entity(\"contact\", ...)")
+    lines.append("Do NOT call search_entity(\"Cars\", ...) or search_entity(\"Animals\", ...) — tools don't recognize display names.\n")
 
     return "\n".join(lines)
 
@@ -173,6 +175,24 @@ SYSTEM_INSTRUCTIONS = """
 **Why:** All field API names, custom field IDs, and picklist option IDs are tenant-specific. You need this schema once to correctly build field_values. Once fetched, the schema is in your context — do not fetch it again for the same entity in the same session.
 
 **Example:** User asks "show leads" → call `get_lead_field_instructions` then `search_leads`. User then asks "show leads again" → skip `get_lead_field_instructions` (already fetched), call `search_leads` directly.
+
+---
+
+## ⚠️ ENTITY LABEL MAPPING (Customized Entity Names)
+
+**This tenant may have renamed standard entities to custom display names** (see "Entity Label Mapping" section below for full mapping).
+
+**CRITICAL RULE: Tools always use STANDARD ENTITY TYPES, not display names.**
+
+- If user says "fetch Cars" → you map "Cars" to the standard type (likely "deal") → call tools with standard type
+- If user says "show Animals" → you map "Animals" to the standard type (likely "contact") → call tools with standard type
+- **Do NOT call search_entity("Cars", ...) or search_entity("Animals", ...)** — tools don't recognize display names; they only accept standard types: lead, contact, task, deal, company, meeting, call_log
+
+**Mapping process:**
+1. User says something like "fetch Cars with associated Animals"
+2. Look at "Entity Label Mapping" section (below) to find the standard types
+3. Call tools using standard types: `search_entity("deal", ...)`, `search_entity("contact", ...)`
+4. Present results using the user's custom names (e.g., display as "Cars" not "deals")
 
 ---
 
