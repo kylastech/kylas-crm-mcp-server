@@ -3172,7 +3172,7 @@ async def search_deals_logic(
     if err:
         return f"Invalid filters: {err}"
     payload = {
-        "fields": ["id", "name", "value", "currency", "closingDate", "ownerId", "createdAt", "actualValue", "estimatedValue"],
+        "fields": ["id", "name", "value", "currency", "closingDate", "ownedBy", "createdAt", "actualValue", "estimatedValue"],
         "jsonRule": json_rule,
     }
     params = {"page": page, "size": min(size, 100)}
@@ -3194,7 +3194,9 @@ async def search_deals_logic(
         value = _extract_primary_deal_value(deal.get("value"))
         actual_val = _extract_primary_deal_value(deal.get("actualValue"))
         estimated_val = _extract_primary_deal_value(deal.get("estimatedValue"))
-        lines.append(f"• ID: {did} | Name: {name} | Value: {value} | Actual: {actual_val} | Estimated: {estimated_val}")
+        owner_obj = deal.get("ownedBy", {})
+        owner_name = owner_obj.get("name", "—") if isinstance(owner_obj, dict) else "—"
+        lines.append(f"• ID: {did} | Name: {name} | Owner: {owner_name} | Value: {value} | Actual: {actual_val} | Estimated: {estimated_val}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -3249,7 +3251,7 @@ async def search_deals_by_term_logic(
         return "Error: search_term cannot be empty."
     json_rule = _multi_field_json_rule(term)
     payload = {
-        "fields": ["id", "name", "value", "currency", "closingDate", "ownerId", "createdAt", "actualValue", "estimatedValue"],
+        "fields": ["id", "name", "value", "currency", "closingDate", "ownedBy", "createdAt", "actualValue", "estimatedValue"],
         "jsonRule": json_rule,
     }
     params = {"page": page, "size": min(size, 100)}
@@ -3271,7 +3273,9 @@ async def search_deals_by_term_logic(
         value = _extract_primary_deal_value(deal.get("value"))
         actual_val = _extract_primary_deal_value(deal.get("actualValue"))
         estimated_val = _extract_primary_deal_value(deal.get("estimatedValue"))
-        lines.append(f"• ID: {did} | Name: {name} | Value: {value} | Actual: {actual_val} | Estimated: {estimated_val}")
+        owner_obj = deal.get("ownedBy", {})
+        owner_name = owner_obj.get("name", "—") if isinstance(owner_obj, dict) else "—"
+        lines.append(f"• ID: {did} | Name: {name} | Owner: {owner_name} | Value: {value} | Actual: {actual_val} | Estimated: {estimated_val}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
