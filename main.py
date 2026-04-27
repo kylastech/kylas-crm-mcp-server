@@ -243,6 +243,16 @@ This provides:
 - When the user asks e.g. "leads with product X" or "leads that have product Y": (1) Call **lookup_products** with query e.g. "name:X" or "name:Y". (2) If **more than one** product is returned, ask the user which product they mean and list the matches (id and name). (3) Once exactly one product is identified, call **search_leads** with filter {"field": "products", "operator": "equal", "value": <product_id>}.
 - Do not guess product IDs; always use lookup_products first when filtering by product name.
 
+### Associated entity filters (associatedLeads, associatedContacts, associatedDeals, associatedCompanies)
+- When searching with associated entity filters (e.g. "contacts with associated deals", "deals with associated contacts"), the filter value must be the **actual entity ID** (number), not the name.
+- **NEVER GUESS entity IDs** — this causes hallucinated results. Always look up the real ID first using search_entity or entity-specific lookup tools.
+- When the user asks e.g. "find contacts associated with deals from Acme":
+  1. Call **search_entity("deal", [{"field": "name", "operator": "contains", "value": "Acme"}])** to get real deal IDs
+  2. Ask the user which deal they mean if multiple are returned (list id and name)
+  3. Once you have the exact deal ID, call **search_entity("contact", [{"field": "associatedDeals", "operator": "equal", "value": <deal_id>}])**
+- Example: User says "get me contacts linked to our biggest deal" → Search deals first, identify the deal by name, get its ID, then search contacts by that deal ID.
+- Do not invent entity IDs; always resolve them first.
+
 ### Pipeline and pipeline stage (create, update, search)
 
 **Always resolve pipeline first when stage is involved.** Call **lookup_pipelines** (entityType=LEAD); do **not** call get_pipeline_stages until the user has confirmed which pipeline.
@@ -3261,7 +3271,7 @@ async def search_deals_logic(
     if err:
         return f"Invalid filters: {err}"
     payload = {
-        "fields": ["id", "name", "value", "currency", "closingDate", "ownedBy", "createdAt", "actualValue", "estimatedValue"],
+        "fields": ["id", "name", "value", "currency", "closingDate", "ownedBy", "createdAt", "actualValue", "estimatedValue", "associatedContacts", "associatedLeads", "associatedCompanies"],
         "jsonRule": json_rule,
     }
     params = {"page": page, "size": min(size, 100)}
@@ -3285,7 +3295,9 @@ async def search_deals_logic(
         estimated_val = _extract_primary_deal_value(deal.get("estimatedValue"))
         owner_obj = deal.get("ownedBy", {})
         owner_name = owner_obj.get("name", "—") if isinstance(owner_obj, dict) else "—"
-        lines.append(f"• ID: {did} | Name: {name} | Owner: {owner_name} | Value: {value} | Actual: {actual_val} | Estimated: {estimated_val}")
+        associated_contacts = deal.get("associatedContacts") or []
+        associated_contacts_str = ", ".join(str(cid) for cid in associated_contacts) if associated_contacts else "—"
+        lines.append(f"• ID: {did} | Name: {name} | Owner: {owner_name} | Value: {value} | Contacts: {associated_contacts_str}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -3304,6 +3316,12 @@ async def search_deals(
 
     DO NOT use this for keyword/text searches - use search_deals_by_term instead.
     Call get_deal_field_instructions first to get filterable fields and their types.
+
+    **Returned fields include associated entities:**
+    - associatedContacts (array of contact IDs)
+    - associatedLeads (array of lead IDs)
+    - associatedCompanies (array of company IDs)
+    These are real IDs that can be used directly in subsequent searches without needing to look them up separately.
 
     filters: List of filter objects. Each must have:
       - field (str): Field internal/API name (e.g. name, value, dealSource, createdAt).
