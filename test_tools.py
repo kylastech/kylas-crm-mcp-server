@@ -816,5 +816,20 @@ async def test_label_refresh_loop():
             pass
 
 
+@pytest.mark.asyncio
+async def test_load_entity_labels_api_error():
+    """Test graceful handling when label fetch fails."""
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = Exception("API connection failed")
+        mock_get_client.return_value.__aenter__.return_value = mock_client
+
+        # Should not raise, should return empty dict
+        result = await main._load_entity_labels()
+
+        assert result == {}
+        assert main._ENTITY_LABELS == {}
+
+
 if __name__ == "__main__":
     asyncio.run(run_manual_tests())
