@@ -27,6 +27,7 @@ from main import (
     _build_search_json_rule,
     search_entity,
     search_entity_by_term,
+    search_idle_entities,
     search_leads_by_term_logic,
     search_meetings_by_term_logic,
 )
@@ -725,6 +726,32 @@ async def test_search_entity_by_term_invalid_entity():
     from main import _ENTITY_CONFIG
     cfg = _ENTITY_CONFIG.get("invalid")
     assert cfg is None
+
+
+# ---------------------------------------------------------------------------
+# search_idle_entities Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_search_idle_entities_lead():
+    """search_idle_entities should search idle leads."""
+    result = await search_idle_entities("lead", days=30, page=0, size=20)
+    assert isinstance(result, str)
+    assert len(result) > 0
+
+
+@pytest.mark.asyncio
+async def test_search_idle_entities_contact_unsupported():
+    """search_idle_entities should error for contact (unsupported)."""
+    result = await search_idle_entities("contact", days=30, page=0, size=20)
+    assert "does not support" in result.lower() or "invalid" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_idle_entities_invalid_type():
+    """search_idle_entities should error on invalid entity."""
+    result = await search_idle_entities("invalid", days=30, page=0, size=20)
+    assert "Unknown entity_type" in result or "does not support" in result
 
 
 if __name__ == "__main__":

@@ -3371,6 +3371,47 @@ async def search_idle_deals(
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
+# Company idle search helper
+# ---------------------------------------------------------------------------
+
+async def search_idle_companies_logic(
+    days: int,
+    time_zone: Optional[str] = None,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Find companies with no activity for at least `days` days.
+    Uses last-activity = max(updatedAt, latestActivityCreatedAt).
+    If time_zone is not provided, uses current user's timezone.
+    """
+    if time_zone:
+        tz = time_zone
+    else:
+        try:
+            user = await _fetch_current_user()
+            tz = user.get("timezone") or DEFAULT_TIMEZONE
+        except Exception:
+            tz = DEFAULT_TIMEZONE
+    threshold_iso = _threshold_iso_days_ago(days, tz)
+    base = {"operator": "less_or_equal", "value": threshold_iso, "timeZone": tz}
+    fields_list = await _fetch_company_fields()
+    filterable_map = _get_filterable_fields_map(fields_list)
+    filters = []
+    for name in ("updatedAt", "latestActivityCreatedAt"):
+        if name in filterable_map:
+            filters.append({"field": name, **base})
+    if not filters:
+        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_company_field_instructions."
+    return await search_companies_logic(filters, page=page, size=size, sort=sort)
+
+
+# ---------------------------------------------------------------------------
+# Company field metadata helpers
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Company field metadata helpers
 # ---------------------------------------------------------------------------
 
@@ -5505,7 +5546,7 @@ _ENTITY_CONFIG = {
     "company": {
         "search_fn": search_companies_logic,
         "by_term_fn": search_companies_by_term_logic,
-        "idle_fn": None,
+        "idle_fn": search_idle_companies_logic,
         "search_fields": ["id", "name", "website", "emails", "phoneNumbers", "ownerId", "createdAt"],
         "search_endpoint": "/search/company",
         "search_page_offset": 0,
@@ -5650,6 +5691,54 @@ async def search_entity_by_term(
         return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
     except Exception as e:
         logger.exception("search_entity_by_term")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def search_idle_entities(
+    entity_type: str,
+    days: int,
+    time_zone: Optional[str] = None,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Search entities that have been idle (no recent activity) for N days.
+    Use this tool to find stale or neglected records.
+
+    Valid entity_type values: lead, deal, company
+
+    days: Number of days of inactivity (e.g., 30 = last updated >30 days ago).
+    time_zone: Timezone for date calculation (optional; defaults to current user's timezone or server default).
+    page: 0-based page (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "createdAt,desc" (default).
+    """
+    # Validate entity_type
+    cfg = _ENTITY_CONFIG.get(entity_type)
+    if not cfg:
+        valid_types = "lead, deal, company"
+        return f"Unknown entity_type '{entity_type}'. Valid: {valid_types}"
+
+    # Check if entity supports idle search
+    idle_fn = cfg.get("idle_fn")
+    if not idle_fn:
+        return f"Entity type '{entity_type}' does not support idle entity search. Valid types: lead, deal, company"
+
+    # Handle pagination offset
+    page_offset = cfg.get("search_page_offset", 0)
+    api_page = page + page_offset
+
+    # Call the entity-specific idle logic
+    try:
+        _reset_api_call_count()
+        result = await idle_fn(days, time_zone=time_zone, page=api_page, size=size, sort=sort)
+        return result
+    except KylasAPIError as e:
+        return f"✗ Search idle entities failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_idle_entities")
         return f"✗ Unexpected error: {str(e)}"
 
 
