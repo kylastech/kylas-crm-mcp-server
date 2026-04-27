@@ -851,5 +851,27 @@ def test_format_entity_labels_for_instructions():
     assert "CONTACT" in result
 
 
+@pytest.mark.asyncio
+async def test_system_instructions_include_labels():
+    """Test that system instructions contain formatted labels when labels are loaded."""
+    test_labels = {
+        "LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"},
+        "DEAL": {"displayName": "Deeeel", "displayNamePlural": "Deeeels"},
+    }
+
+    # Manually set labels
+    main._ENTITY_LABELS = test_labels
+
+    # Format labels
+    formatted = main._format_entity_labels_for_instructions(test_labels)
+
+    # Verify formatted output contains expected content
+    assert "Lid" in formatted
+    assert "Deeeel" in formatted
+    assert "LEAD" in formatted
+    assert "DEAL" in formatted
+    assert "Entity Label Mapping" in formatted
+
+
 if __name__ == "__main__":
     asyncio.run(run_manual_tests())
