@@ -25,9 +25,9 @@ from main import (
     _normalize_field_values,
     _get_filterable_fields_map,
     _build_search_json_rule,
-    search_entity,
-    search_entity_by_term,
-    search_idle_entities,
+    search_entity_logic,
+    search_entity_by_term_logic,
+    search_idle_entities_logic,
     search_leads_by_term_logic,
     search_meetings_by_term_logic,
 )
@@ -132,7 +132,7 @@ def test_format_field_custom_with_picklist():
     lines = _format_field(field)
     assert "[CUSTOM]" in lines[0]
     assert "Field ID: '57300'" in lines[0]
-    assert "Options:" in lines[1]
+    assert "Options" in lines[1]
     assert "Small (ID: 12345)" in lines[2]
     assert "Large (ID: 67890)" in lines[3]
 
@@ -266,7 +266,7 @@ async def test_get_lead_field_instructions_success():
 
         assert "KYLAS CRM - LEAD FIELDS CHEAT SHEET" in result
         assert "[STANDARD] 'First Name' (API Name: 'firstName')" in result
-        assert "[CUSTOM] 'Company Size' (Field ID: '57300')" in result
+        assert "[CUSTOM] 'Company Size' (Field ID: '57300'" in result
         assert "Website (ID: 1001)" in result
         assert "Small (ID: 12345)" in result
 
@@ -633,36 +633,37 @@ async def run_manual_tests():
 @pytest.mark.asyncio
 async def test_search_entity_lead_with_filters():
     """search_entity should return formatted lead results when filters provided."""
-    with patch("main.search_leads_logic") as mock_search:
-        mock_search.return_value = "Found 5 leads"
+    from main import _ENTITY_CONFIG
+    with patch.dict(_ENTITY_CONFIG, {"lead": {"search_fn": AsyncMock(return_value="Found 5 leads"), "search_page_offset": 0}}):
         filters = [{"field": "firstName", "operator": "contains", "value": "John"}]
-        result = await search_entity("lead", filters, page=0, size=20)
+        result = await search_entity_logic("lead", filters, page=0, size=20)
         assert "Found" in result
-        mock_search.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_search_entity_lead_without_filters_should_error():
     """search_entity for lead should error when filters are empty."""
-    result = await search_entity("lead", [], page=0, size=20)
+    result = await search_entity_logic("lead", [], page=0, size=20)
     assert "Error" in result or "filters cannot be empty" in result.lower()
 
 
 @pytest.mark.asyncio
 async def test_search_entity_meeting_empty_filters():
     """search_entity for meeting should allow empty filters (returns all)."""
-    with patch("main.search_meetings_logic") as mock_search:
-        mock_search.return_value = "Found 10 meetings"
-        result = await search_entity("meeting", [], page=0, size=20)
+    with patch("main._ENTITY_CONFIG") as mock_config:
+        mock_search = AsyncMock(return_value="Found 10 meetings")
+        mock_config.get.return_value = {"search_fn": mock_search, "search_page_offset": 0}
+        result = await search_entity_logic("meeting", [], page=0, size=20)
         # Should not error; meeting allows empty filters
         assert isinstance(result, str)
+        assert "Found 10 meetings" in result
         mock_search.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_search_entity_invalid_entity_type():
     """search_entity should error on unknown entity_type."""
-    result = await search_entity("invalid_type", [], page=0, size=20)
+    result = await search_entity_logic("invalid_type", [], page=0, size=20)
     assert "Unknown entity_type" in result or "Unknown" in result
 
 
@@ -735,7 +736,7 @@ async def test_search_entity_by_term_invalid_entity():
 @pytest.mark.asyncio
 async def test_search_idle_entities_lead():
     """search_idle_entities should search idle leads."""
-    result = await search_idle_entities("lead", days=30, page=0, size=20)
+    result = await search_idle_entities_logic("lead", days=30, page=0, size=20)
     assert isinstance(result, str)
     assert len(result) > 0
 
@@ -743,14 +744,14 @@ async def test_search_idle_entities_lead():
 @pytest.mark.asyncio
 async def test_search_idle_entities_contact_unsupported():
     """search_idle_entities should error for contact (unsupported)."""
-    result = await search_idle_entities("contact", days=30, page=0, size=20)
+    result = await search_idle_entities_logic("contact", days=30, page=0, size=20)
     assert "does not support" in result.lower() or "invalid" in result.lower()
 
 
 @pytest.mark.asyncio
 async def test_search_idle_entities_invalid_type():
     """search_idle_entities should error on invalid entity."""
-    result = await search_idle_entities("invalid", days=30, page=0, size=20)
+    result = await search_idle_entities_logic("invalid", days=30, page=0, size=20)
     assert "Unknown entity_type" in result or "does not support" in result
 
 

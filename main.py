@@ -5585,6 +5585,42 @@ _ENTITY_CONFIG = {
 # Generic Search Tool
 # ---------------------------------------------------------------------------
 
+async def search_entity_logic(
+    entity_type: str,
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """Logic for generic entity search."""
+    # Validate entity_type
+    cfg = _ENTITY_CONFIG.get(entity_type)
+    if not cfg:
+        valid_types = ", ".join(_ENTITY_CONFIG.keys())
+        return f"Unknown entity_type '{entity_type}'. Valid: {valid_types}"
+
+    # Check if entity has a search function
+    search_fn = cfg.get("search_fn")
+    if not search_fn:
+        return f"Entity type '{entity_type}' does not support search."
+
+    # Validate filters for entities that require them
+    if entity_type not in ("meeting", "call_log"):
+        if not filters:
+            return "Error: filters cannot be empty for this entity type. Provide at least one filter."
+
+    # Handle pagination offset (meeting/call_log are 1-based)
+    page_offset = cfg.get("search_page_offset", 0)
+    api_page = page + page_offset
+
+    # Call the entity-specific search logic
+    try:
+        result = await search_fn(filters, page=api_page, size=size, sort=sort)
+        return result
+    except Exception as e:
+        return f"Error searching {entity_type}: {str(e)}"
+
+
 @mcp.tool()
 async def search_entity(
     entity_type: str,
@@ -5619,32 +5655,42 @@ async def search_entity(
       - search_entity("task", [{"field": "associatedDeals", "operator": "equal", "value": deal_id}])
       - search_entity("task", [{"field": "associatedCompanies", "operator": "equal", "value": company_id}])
     """
+    return await search_entity_logic(entity_type, filters, page, size, sort)
+
+
+async def search_entity_by_term_logic(
+    entity_type: str,
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """Logic for generic entity search by term."""
     # Validate entity_type
     cfg = _ENTITY_CONFIG.get(entity_type)
     if not cfg:
-        valid_types = ", ".join(_ENTITY_CONFIG.keys())
+        valid_types = ", ".join([k for k, v in _ENTITY_CONFIG.items() if v.get("by_term_fn")])
         return f"Unknown entity_type '{entity_type}'. Valid: {valid_types}"
 
-    # Check if entity has a search function
-    search_fn = cfg.get("search_fn")
-    if not search_fn:
-        return f"Entity type '{entity_type}' does not support search."
+    # Check if entity supports by_term search
+    by_term_fn = cfg.get("by_term_fn")
+    if not by_term_fn:
+        return f"Entity type '{entity_type}' does not support search by term."
 
-    # Validate filters for entities that require them
-    if entity_type not in ("meeting", "call_log"):
-        if not filters:
-            return "Error: filters cannot be empty for this entity type. Provide at least one filter."
-
-    # Handle pagination offset (meeting/call_log are 1-based)
+    # Handle pagination offset (meeting is 1-based)
     page_offset = cfg.get("search_page_offset", 0)
     api_page = page + page_offset
 
-    # Call the entity-specific search logic
+    # Call the entity-specific by_term logic
     try:
-        result = await search_fn(filters, page=api_page, size=size, sort=sort)
+        _reset_api_call_count()
+        result = await by_term_fn(search_term, page=api_page, size=size, sort=sort)
         return result
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
     except Exception as e:
-        return f"Error searching {entity_type}: {str(e)}"
+        logger.exception("search_entity_by_term_logic")
+        return f"✗ Unexpected error: {str(e)}"
 
 
 @mcp.tool()
@@ -5669,30 +5715,42 @@ async def search_entity_by_term(
     size: Page size, max 100 (default 20).
     sort: Sort e.g. "updatedAt,desc" (default).
     """
+    return await search_entity_by_term_logic(entity_type, search_term, page, size, sort)
+
+
+async def search_idle_entities_logic(
+    entity_type: str,
+    days: int,
+    time_zone: Optional[str] = None,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """Logic for searching idle entities."""
     # Validate entity_type
     cfg = _ENTITY_CONFIG.get(entity_type)
     if not cfg:
-        valid_types = ", ".join([k for k, v in _ENTITY_CONFIG.items() if v.get("by_term_fn")])
+        valid_types = "lead, deal, company"
         return f"Unknown entity_type '{entity_type}'. Valid: {valid_types}"
 
-    # Check if entity supports by_term search
-    by_term_fn = cfg.get("by_term_fn")
-    if not by_term_fn:
-        return f"Entity type '{entity_type}' does not support search by term."
+    # Check if entity supports idle search
+    idle_fn = cfg.get("idle_fn")
+    if not idle_fn:
+        return f"Entity type '{entity_type}' does not support idle entity search. Valid types: lead, deal, company"
 
-    # Handle pagination offset (meeting is 1-based)
+    # Handle pagination offset
     page_offset = cfg.get("search_page_offset", 0)
     api_page = page + page_offset
 
-    # Call the entity-specific by_term logic
+    # Call the entity-specific idle logic
     try:
         _reset_api_call_count()
-        result = await by_term_fn(search_term, page=api_page, size=size, sort=sort)
+        result = await idle_fn(days, time_zone=time_zone, page=api_page, size=size, sort=sort)
         return result
     except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+        return f"✗ Search idle entities failed: {e.message}\n  Details: {e.response_body}"
     except Exception as e:
-        logger.exception("search_entity_by_term")
+        logger.exception("search_idle_entities_logic")
         return f"✗ Unexpected error: {str(e)}"
 
 
@@ -5717,31 +5775,7 @@ async def search_idle_entities(
     size: Page size, max 100 (default 20).
     sort: Sort e.g. "createdAt,desc" (default).
     """
-    # Validate entity_type
-    cfg = _ENTITY_CONFIG.get(entity_type)
-    if not cfg:
-        valid_types = "lead, deal, company"
-        return f"Unknown entity_type '{entity_type}'. Valid: {valid_types}"
-
-    # Check if entity supports idle search
-    idle_fn = cfg.get("idle_fn")
-    if not idle_fn:
-        return f"Entity type '{entity_type}' does not support idle entity search. Valid types: lead, deal, company"
-
-    # Handle pagination offset
-    page_offset = cfg.get("search_page_offset", 0)
-    api_page = page + page_offset
-
-    # Call the entity-specific idle logic
-    try:
-        _reset_api_call_count()
-        result = await idle_fn(days, time_zone=time_zone, page=api_page, size=size, sort=sort)
-        return result
-    except KylasAPIError as e:
-        return f"✗ Search idle entities failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_idle_entities")
-        return f"✗ Unexpected error: {str(e)}"
+    return await search_idle_entities_logic(entity_type, days, time_zone, page, size, sort)
 
 
 # ---------------------------------------------------------------------------
