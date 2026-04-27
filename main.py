@@ -82,6 +82,28 @@ def _threshold_iso_days_ago(days: int, time_zone: str) -> str:
     return threshold.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) -> str:
+    """
+    Format entity labels into readable text for system instructions.
+    Returns empty string if no labels.
+    """
+    if not labels:
+        return ""
+
+    lines = ["\n## Entity Label Mapping (Tenant-Customized Names)\n"]
+    lines.append("When user mentions entity names, map to the standard type:\n")
+
+    for entity_type in sorted(labels.keys()):
+        label_data = labels[entity_type]
+        display_name = label_data.get("displayName", entity_type)
+        display_plural = label_data.get("displayNamePlural", entity_type)
+        lines.append(f"- **{entity_type}**: displays as \"{display_name}\" (plural: \"{display_plural}\")")
+
+    lines.append("\nWhen user queries mention custom names (e.g., \"deeeels\"), map them to standard entity types (e.g., DEAL) before calling tools.\n")
+
+    return "\n".join(lines)
+
+
 async def _load_entity_labels() -> Dict[str, Dict[str, str]]:
     """
     Fetch entity labels from /v1/entities/label endpoint.

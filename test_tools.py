@@ -32,6 +32,7 @@ from main import (
     search_idle_entities_logic,
     search_leads_by_term_logic,
     search_meetings_by_term_logic,
+    _format_entity_labels_for_instructions,
 )
 
 
@@ -829,6 +830,25 @@ async def test_load_entity_labels_api_error():
 
         assert result == {}
         assert main._ENTITY_LABELS == {}
+
+
+def test_format_entity_labels_for_instructions():
+    """Test formatting labels into readable system instructions text."""
+    labels = {
+        "LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"},
+        "DEAL": {"displayName": "Deeeel", "displayNamePlural": "Deeeels"},
+        "CONTACT": {"displayName": "Quontact", "displayNamePlural": "Quontacts"},
+    }
+
+    result = main._format_entity_labels_for_instructions(labels)
+
+    # Should contain the mapping
+    assert "Lid" in result
+    assert "Deeeel" in result
+    assert "Quontact" in result
+    assert "LEAD" in result
+    assert "DEAL" in result
+    assert "CONTACT" in result
 
 
 if __name__ == "__main__":
