@@ -188,17 +188,14 @@ SYSTEM_INSTRUCTIONS = """
 - If user says "show Animals" → you map "Animals" to the standard type (likely "contact") → call tools with standard type
 - **Do NOT call search_entity("Cars", ...) or search_entity("Animals", ...)** — tools don't recognize display names; they only accept standard types: lead, contact, task, deal, company, meeting, call_log
 
-**If you encounter an entity name you don't recognize:**
-1. Call **`get_entity_labels`** to fetch the current mapping from Kylas
-2. Use the returned mapping to translate user entity names to standard types
-3. Call tools with the standard types
-
 **Mapping process:**
 1. User says something like "fetch Cars with associated Animals"
-2. If you don't recognize "Cars" or "Animals", call get_entity_labels first
-3. Once you have the mapping, translate to standard types: Cars→deal, Animals→contact
+2. Refer to the "Entity Label Mapping" section (below) to find the standard types
+3. Translate: Cars→deal, Animals→contact
 4. Call tools using standard types: `search_entity("deal", ...)`, `search_entity("contact", ...)`
 5. Present results using the user's custom names (e.g., display as "Cars" not "deals")
+
+If the Entity Label Mapping section is empty or missing, that means the tenant is using standard entity type names (lead, contact, task, deal, company, meeting, call_log).
 
 ---
 
@@ -945,38 +942,21 @@ async def get_lead_field_instructions_logic() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
-async def get_entity_labels() -> str:
+async def _format_entity_labels_for_display(labels: Dict[str, Dict[str, str]]) -> str:
     """
-    Get current entity label mappings (custom display names for this tenant).
-    Use this if you encounter entity names that don't match standard types (lead, contact, deal, etc.).
-    This refreshes the labels from the Kylas API.
-
-    Returns a mapping like:
-    {
-      "LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"},
-      "DEAL": {"displayName": "Cars", "displayNamePlural": "Cars"},
-      "CONTACT": {"displayName": "Animals", "displayNamePlural": "Animals"},
-      ...
-    }
-
-    Use this mapping to understand how to translate user-provided entity names to standard types for tool calls.
+    Format entity labels for display (internal use, not exposed as a tool).
+    Returns a mapping like: LEAD→"Lid", DEAL→"Cars", CONTACT→"Animals", etc.
     """
-    try:
-        labels = await _load_entity_labels()
-        if not labels:
-            return "No custom entity labels found. Using standard entity types: lead, contact, task, deal, company, meeting, call_log"
-        lines = ["# Entity Label Mapping (Tenant-Customized Names)\n"]
-        for entity_type in sorted(labels.keys()):
-            label_data = labels[entity_type]
-            display_name = label_data.get("displayName", entity_type)
-            display_plural = label_data.get("displayNamePlural", entity_type)
-            lines.append(f"- **{entity_type}** (standard type) → **{display_name}** / **{display_plural}** (display names)")
-        lines.append("\n**Remember:** When calling tools, use the standard type (left side), not the display name (right side).")
-        return "\n".join(lines)
-    except Exception as e:
-        logger.exception("get_entity_labels")
-        return f"✗ Failed to fetch entity labels: {str(e)}"
+    if not labels:
+        return ""
+    lines = ["# Entity Label Mapping (Tenant-Customized Names)\n"]
+    for entity_type in sorted(labels.keys()):
+        label_data = labels[entity_type]
+        display_name = label_data.get("displayName", entity_type)
+        display_plural = label_data.get("displayNamePlural", entity_type)
+        lines.append(f"- **{entity_type}** (standard type) → **{display_name}** / **{display_plural}** (display names)")
+    lines.append("\n**Remember:** When calling tools, use the standard type (left side), not the display name (right side).")
+    return "\n".join(lines)
 
 
 @mcp.tool()
