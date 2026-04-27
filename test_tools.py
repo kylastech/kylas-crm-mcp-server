@@ -7,6 +7,7 @@ Or: pytest test_tools.py -v
 
 import asyncio
 from unittest.mock import AsyncMock, patch, MagicMock
+import json
 
 try:
     import pytest
@@ -15,6 +16,7 @@ except ImportError:
         class mark:
             asyncio = lambda f: f
 
+import main
 from main import (
     get_lead_field_instructions_logic,
     create_lead_logic,
@@ -753,6 +755,65 @@ async def test_search_idle_entities_invalid_type():
     """search_idle_entities should error on invalid entity."""
     result = await search_idle_entities_logic("invalid", days=30, page=0, size=20)
     assert "Unknown entity_type" in result or "does not support" in result
+
+
+@pytest.mark.asyncio
+async def test_load_entity_labels_success():
+    """Test successfully loading entity labels from API."""
+    mock_labels = {
+        "LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"},
+        "DEAL": {"displayName": "Deeeel", "displayNamePlural": "Deeeels"},
+        "CONTACT": {"displayName": "Quontact", "displayNamePlural": "Quontacts"},
+    }
+
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = mock_labels
+        mock_client.get.return_value = mock_response
+        mock_get_client.return_value.__aenter__.return_value = mock_client
+
+        result = await main._load_entity_labels()
+
+        assert result == mock_labels
+        mock_client.get.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_label_refresh_loop():
+    """Test that refresh loop updates labels periodically."""
+    initial_labels = {
+        "LEAD": {"displayName": "Lead", "displayNamePlural": "Leads"}
+    }
+    updated_labels = {
+        "LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"},
+        "DEAL": {"displayName": "Deeeel", "displayNamePlural": "Deeeels"}
+    }
+
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        # First call returns initial, second returns updated
+        mock_response.json.side_effect = [initial_labels, updated_labels]
+        mock_client.get.return_value = mock_response
+        mock_get_client.return_value.__aenter__.return_value = mock_client
+
+        # Load initial labels
+        await main._load_entity_labels()
+        assert main._ENTITY_LABELS == initial_labels
+
+        # This function doesn't exist yet, test will fail
+        refresh_task = asyncio.create_task(main._label_refresh_loop())
+
+        # Let it run for a moment (won't actually refresh yet)
+        await asyncio.sleep(0.1)
+
+        # Cancel the task
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":

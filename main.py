@@ -101,6 +101,29 @@ async def _load_entity_labels() -> Dict[str, Dict[str, str]]:
         return {}
 
 
+async def _label_refresh_loop(interval_seconds: int = 1800) -> None:
+    """
+    Background task: periodically refresh entity labels.
+    Default interval: 1800 seconds (30 minutes).
+    Runs forever until cancelled. Updates _ENTITY_LABELS in-place.
+    """
+    global _ENTITY_LABELS
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            logger.debug("Refreshing entity labels...")
+            async with get_client() as client:
+                resp = await client.get(f"{BASE_URL}/entities/label")
+                new_labels = resp.json()
+                _ENTITY_LABELS.update(new_labels)
+                logger.info(f"Refreshed entity labels: {list(_ENTITY_LABELS.keys())}")
+        except asyncio.CancelledError:
+            logger.info("Label refresh loop cancelled")
+            break
+        except Exception as e:
+            logger.warning(f"Label refresh failed: {e}. Keeping cached labels.")
+
+
 if not API_KEY:
     logger.info("KYLAS_API_KEY not set. Server will rely on per-request 'x-api-key' header.")
 
