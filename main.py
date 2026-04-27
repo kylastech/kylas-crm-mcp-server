@@ -2163,6 +2163,10 @@ async def search_contacts_logic(
     """Search contacts with jsonRule; only filterable fields allowed."""
     fields_list = await _fetch_contact_fields()
     filterable_map = _get_filterable_fields_map(fields_list)
+    # Add associated entity fields which are filterable but may not be marked as such in schema
+    for associated_field in ["associatedLeads", "associatedDeals", "associatedCompanies"]:
+        if associated_field not in filterable_map:
+            filterable_map[associated_field] = {"type": "LOOK_UP", "standard": False}
     if not filterable_map:
         return "No filterable contact fields found for this tenant."
     default_tz = None
@@ -2218,6 +2222,12 @@ async def search_contacts(
     Search/filter contacts by criteria. Only fields marked [FILTERABLE] can be used.
     Call get_contact_field_instructions first to see filterable fields and their types.
     Same filter format as search_leads (no pipeline/stage filters for contacts).
+
+    Additional filterable fields (always available):
+    - associatedLeads (long): Filter by lead IDs associated with contacts
+    - associatedDeals (long): Filter by deal IDs associated with contacts
+    - associatedCompanies (long): Filter by company IDs associated with contacts
+    Use operators: equal, is_null, is_not_null
     """
     try:
         _reset_api_call_count()
@@ -2477,6 +2487,10 @@ async def search_tasks_logic(
     """Search tasks with jsonRule; only filterable fields allowed."""
     fields_list = await _fetch_task_fields()
     filterable_map = _get_filterable_fields_map(fields_list)
+    # Add associated entity fields which are filterable but may not be marked as such in schema
+    for associated_field in ["associatedLeads", "associatedContacts", "associatedDeals", "associatedCompanies"]:
+        if associated_field not in filterable_map:
+            filterable_map[associated_field] = {"type": "LOOK_UP", "standard": False}
     if not filterable_map:
         return "No filterable task fields found for this tenant."
     default_tz = None
@@ -2531,6 +2545,13 @@ async def search_tasks(
     Search/filter tasks by criteria. Only fields marked [FILTERABLE] can be used.
     Call get_task_field_instructions first to see filterable fields and their types.
     Same filter format as search_leads/search_contacts (no pipeline filters for tasks).
+
+    Additional filterable fields (always available):
+    - associatedLeads (long): Filter by lead IDs associated with tasks
+    - associatedContacts (long): Filter by contact IDs associated with tasks
+    - associatedDeals (long): Filter by deal IDs associated with tasks
+    - associatedCompanies (long): Filter by company IDs associated with tasks
+    Use operators: equal, is_null, is_not_null
     """
     try:
         _reset_api_call_count()
