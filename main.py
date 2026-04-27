@@ -1738,7 +1738,6 @@ async def search_leads_logic(
     return "\n".join(lines)
 
 
-@mcp.tool()
 async def search_leads(
     filters: List[Dict[str, Any]],
     page: int = 0,
@@ -1839,7 +1838,6 @@ async def search_idle_leads_logic(
     return await search_leads_logic(filters, page=page, size=size, sort=sort)
 
 
-@mcp.tool()
 async def search_idle_leads(
     days: int,
     time_zone: Optional[str] = None,
@@ -2128,7 +2126,6 @@ async def search_contacts_logic(
     return "\n".join(lines)
 
 
-@mcp.tool()
 async def search_contacts(
     filters: List[Dict[str, Any]],
     page: int = 0,
@@ -2442,7 +2439,6 @@ async def search_tasks_logic(
     return "\n".join(lines)
 
 
-@mcp.tool()
 async def search_tasks(
     filters: List[Dict[str, Any]],
     page: int = 0,
@@ -2579,7 +2575,6 @@ async def lookup_companies_for_task_tool(search_term: str = "") -> str:
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def search_tasks_for_lead(
     lead_id: int,
     page: int = 0,
@@ -2604,7 +2599,6 @@ async def search_tasks_for_lead(
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def search_tasks_for_contact(
     contact_id: int,
     page: int = 0,
@@ -2629,7 +2623,6 @@ async def search_tasks_for_contact(
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def search_tasks_for_deal(
     deal_id: int,
     page: int = 0,
@@ -2654,7 +2647,6 @@ async def search_tasks_for_deal(
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def search_tasks_for_company(
     company_id: int,
     page: int = 0,
@@ -3193,7 +3185,6 @@ async def search_deals_logic(
     return "\n".join(lines)
 
 
-@mcp.tool()
 async def search_deals(
     filters: List[Dict[str, Any]],
     page: int = 0,
@@ -3271,7 +3262,6 @@ async def search_deals_by_term_logic(
     return "\n".join(lines)
 
 
-@mcp.tool()
 async def search_deals_by_term(
     search_term: str,
     page: int = 0,
@@ -3336,7 +3326,6 @@ async def search_idle_deals_logic(
     return await search_deals_logic(filters, page=page, size=size, sort=sort)
 
 
-@mcp.tool()
 async def search_idle_deals(
     days: int,
     time_zone: Optional[str] = None,
@@ -3764,7 +3753,6 @@ async def search_companies_logic(
     return "\n".join(lines)
 
 
-@mcp.tool()
 async def search_companies(
     filters: List[Dict[str, Any]],
     page: int = 0,
@@ -4574,7 +4562,6 @@ async def search_meetings_logic(
     return "\n".join(lines)
 
 
-@mcp.tool()
 async def search_meetings(
     filters: List[Dict[str, Any]],
     page: int = 0,
@@ -4608,7 +4595,6 @@ async def search_meetings(
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def search_all_meetings(
     page: int = 0,
     size: int = 20,
@@ -5177,7 +5163,6 @@ async def search_call_logs_logic(
     return "\n".join(lines)
 
 
-@mcp.tool()
 async def search_call_logs(
     filters: List[Dict[str, Any]],
     page: int = 0,
@@ -5210,7 +5195,6 @@ async def search_call_logs(
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def search_all_call_logs(
     page: int = 0,
     size: int = 20,
