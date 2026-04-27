@@ -25,6 +25,7 @@ from main import (
     _normalize_field_values,
     _get_filterable_fields_map,
     _build_search_json_rule,
+    search_entity,
 )
 
 
@@ -619,6 +620,46 @@ async def run_manual_tests():
     print("\n" + "=" * 60)
     print("ALL TESTS PASSED")
     print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# search_entity Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_search_entity_lead_with_filters():
+    """search_entity should return formatted lead results when filters provided."""
+    with patch("main.search_leads_logic") as mock_search:
+        mock_search.return_value = "Found 5 leads"
+        filters = [{"field": "firstName", "operator": "contains", "value": "John"}]
+        result = await search_entity("lead", filters, page=0, size=20)
+        assert "Found" in result
+        mock_search.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_search_entity_lead_without_filters_should_error():
+    """search_entity for lead should error when filters are empty."""
+    result = await search_entity("lead", [], page=0, size=20)
+    assert "Error" in result or "filters cannot be empty" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_entity_meeting_empty_filters():
+    """search_entity for meeting should allow empty filters (returns all)."""
+    with patch("main.search_meetings_logic") as mock_search:
+        mock_search.return_value = "Found 10 meetings"
+        result = await search_entity("meeting", [], page=0, size=20)
+        # Should not error; meeting allows empty filters
+        assert isinstance(result, str)
+        mock_search.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_search_entity_invalid_entity_type():
+    """search_entity should error on unknown entity_type."""
+    result = await search_entity("invalid_type", [], page=0, size=20)
+    assert "Unknown entity_type" in result or "Unknown" in result
 
 
 if __name__ == "__main__":

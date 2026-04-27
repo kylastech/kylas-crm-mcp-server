@@ -5355,6 +5355,72 @@ _ENTITY_CONFIG = {
 
 
 # ---------------------------------------------------------------------------
+# Generic Search Tool
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def search_entity(
+    entity_type: str,
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Search/filter any entity type (lead, contact, task, deal, company, meeting, call_log).
+    Use this tool instead of entity-specific search tools.
+
+    Valid entity_type values: lead, contact, task, deal, company, meeting, call_log
+
+    filters: List of filter objects. Each must have:
+      - field (str): Field internal/API name (e.g. firstName, country, source, createdAt).
+      - operator (str): One of the allowed operators for that field type.
+      - value: Value to compare (type depends on field type).
+      - timeZone (str, optional): For date/datetime filters.
+      - type (str, optional): Field type. If omitted, inferred from schema.
+
+    For lead/contact/task/deal/company: Filters are REQUIRED (non-empty).
+    For meeting/call_log: Filters are OPTIONAL (empty = all records).
+
+    page: 0-based page for lead/contact/task/deal/company; 1-based for meeting/call_log (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "createdAt,desc" (default).
+
+    Task association examples (replaces search_tasks_for_* tools):
+      - search_entity("task", [{"field": "associatedLeads", "operator": "equal", "value": lead_id}])
+      - search_entity("task", [{"field": "associatedContacts", "operator": "equal", "value": contact_id}])
+      - search_entity("task", [{"field": "associatedDeals", "operator": "equal", "value": deal_id}])
+      - search_entity("task", [{"field": "associatedCompanies", "operator": "equal", "value": company_id}])
+    """
+    # Validate entity_type
+    cfg = _ENTITY_CONFIG.get(entity_type)
+    if not cfg:
+        valid_types = ", ".join(_ENTITY_CONFIG.keys())
+        return f"Unknown entity_type '{entity_type}'. Valid: {valid_types}"
+
+    # Check if entity has a search function
+    search_fn = cfg.get("search_fn")
+    if not search_fn:
+        return f"Entity type '{entity_type}' does not support search."
+
+    # Validate filters for entities that require them
+    if entity_type not in ("meeting", "call_log"):
+        if not filters:
+            return "Error: filters cannot be empty for this entity type. Provide at least one filter."
+
+    # Handle pagination offset (meeting/call_log are 1-based)
+    page_offset = cfg.get("search_page_offset", 0)
+    api_page = page + page_offset
+
+    # Call the entity-specific search logic
+    try:
+        result = await search_fn(filters, page=api_page, size=size, sort=sort)
+        return result
+    except Exception as e:
+        return f"Error searching {entity_type}: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
 
