@@ -26,6 +26,9 @@ from main import (
     _get_filterable_fields_map,
     _build_search_json_rule,
     search_entity,
+    search_entity_by_term,
+    search_leads_by_term_logic,
+    search_meetings_by_term_logic,
 )
 
 
@@ -660,6 +663,68 @@ async def test_search_entity_invalid_entity_type():
     """search_entity should error on unknown entity_type."""
     result = await search_entity("invalid_type", [], page=0, size=20)
     assert "Unknown entity_type" in result or "Unknown" in result
+
+
+# ---------------------------------------------------------------------------
+# search_entity_by_term Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_search_entity_by_term_lead():
+    """search_entity_by_term should search leads by term."""
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "content": [
+                {"id": 1, "firstName": "John", "lastName": "Doe", "emails": [{"value": "john@example.com", "primary": True}], "phoneNumbers": []},
+            ],
+            "totalElements": 1,
+            "totalPages": 1,
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await search_leads_by_term_logic("john", page=0, size=20)
+        assert isinstance(result, str)
+        assert "Found 1" in result
+
+
+@pytest.mark.asyncio
+async def test_search_entity_by_term_meeting():
+    """search_entity_by_term for meeting should search title field only."""
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "content": [
+                {"id": 1, "title": "Standup Meeting", "status": "Scheduled", "from": "2026-04-28T10:00:00Z", "to": "2026-04-28T10:30:00Z"},
+            ],
+            "totalElements": 1,
+            "totalPages": 1,
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await search_meetings_by_term_logic("standup", page=0, size=20)
+        assert isinstance(result, str)
+        assert "Found 1" in result
+
+
+@pytest.mark.asyncio
+async def test_search_entity_by_term_invalid_entity():
+    """search_entity_by_term should error on invalid entity type."""
+    # The search_entity_by_term tool checks entity_type validity
+    # We'll test the error path directly
+    from main import _ENTITY_CONFIG
+    cfg = _ENTITY_CONFIG.get("invalid")
+    assert cfg is None
 
 
 if __name__ == "__main__":

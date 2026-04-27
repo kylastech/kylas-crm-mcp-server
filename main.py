@@ -5270,13 +5270,197 @@ async def add_note(entity_type: str, entity_id: int, note_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# By-Term Search Logic Functions
+# ---------------------------------------------------------------------------
+
+async def search_leads_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """Search leads by a single term across multiple fields via POST /search/lead with multi_field jsonRule."""
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    json_rule = _multi_field_json_rule(term)
+    payload = {
+        "fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "companyName", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching leads by term: %r", term)
+    async with get_client() as client:
+        response = await client.post("/search/lead", params=params, json=payload)
+        data = await handle_api_response(response, "Search leads by term")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No leads found matching '{term}'. (Total in DB: {total})"
+    lines = [f"Found {len(results)} lead(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for lead in results:
+        lines.append(_format_lead_for_display(lead))
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+async def search_contacts_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """Search contacts by a single term across multiple fields via POST /search/contact with multi_field jsonRule."""
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    json_rule = _multi_field_json_rule(term)
+    payload = {
+        "fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "department", "designation", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching contacts by term: %r", term)
+    async with get_client() as client:
+        response = await client.post("/search/contact", params=params, json=payload)
+        data = await handle_api_response(response, "Search contacts by term")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No contacts found matching '{term}'. (Total in DB: {total})"
+    lines = [f"Found {len(results)} contact(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for contact in results:
+        lines.append(_format_contact_for_display(contact))
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+async def search_tasks_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """Search tasks by a single term across multiple fields via POST /tasks/search with multi_field jsonRule."""
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    json_rule = _multi_field_json_rule(term)
+    payload = {
+        "fields": ["id", "name", "status", "priority", "dueDate", "assignedTo", "relation", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching tasks by term: %r", term)
+    async with get_client() as client:
+        response = await client.post("/tasks/search", params=params, json=payload)
+        data = await handle_api_response(response, "Search tasks by term")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No tasks found matching '{term}'. (Total in DB: {total})"
+    lines = [f"Found {len(results)} task(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for task in results:
+        lines.append(_format_task_for_display(task))
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+async def search_companies_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """Search companies by a single term across multiple fields via POST /search/company with multi_field jsonRule."""
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    json_rule = _multi_field_json_rule(term)
+    payload = {
+        "fields": ["id", "name", "website", "emails", "phoneNumbers", "ownerId", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params = {"page": page, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching companies by term: %r", term)
+    async with get_client() as client:
+        response = await client.post("/search/company", params=params, json=payload)
+        data = await handle_api_response(response, "Search companies by term")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No companies found matching '{term}'. (Total in DB: {total})"
+    lines = [f"Found {len(results)} company/ies for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for company in results:
+        lines.append(_format_company_for_display(company))
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+async def search_meetings_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "from,desc",
+) -> str:
+    """Search meetings by title field only (meetings API does not support multi_field search)."""
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    json_rule = {
+        "rules": [
+            {
+                "id": "title",
+                "field": "title",
+                "type": "string",
+                "input": "text",
+                "operator": "contains",
+                "value": term,
+            }
+        ],
+        "condition": "AND",
+        "valid": True,
+    }
+    payload = {"jsonRule": json_rule}
+    params = {"page": _meetings_search_api_page(page), "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    logger.info("Searching meetings by term (title only): %r", term)
+    async with get_client() as client:
+        response = await client.post("/meetings/search", params=params, json=payload)
+        data = await handle_api_response(response, "Search meetings by term")
+    results = data.get("content", data.get("data", []))
+    total = data.get("totalElements", data.get("total", len(results)))
+    total_pages = data.get("totalPages", 1)
+    if not results:
+        return f"No meetings found matching '{term}' in title. (Total in DB: {total})"
+    lines = [f"Found {len(results)} meeting(s) with title matching '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for m in results:
+        lines.append(_format_meeting_for_display(m))
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Entity Configuration Dictionary for Generic Search Tool Dispatch
 # ---------------------------------------------------------------------------
 
 _ENTITY_CONFIG = {
     "lead": {
         "search_fn": search_leads_logic,
-        "by_term_fn": None,
+        "by_term_fn": search_leads_by_term_logic,
         "idle_fn": search_idle_leads_logic,
         "search_fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "companyName", "createdAt"],
         "search_endpoint": "/search/lead",
@@ -5287,7 +5471,7 @@ _ENTITY_CONFIG = {
     },
     "contact": {
         "search_fn": search_contacts_logic,
-        "by_term_fn": None,
+        "by_term_fn": search_contacts_by_term_logic,
         "idle_fn": None,
         "search_fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "department", "designation", "createdAt"],
         "search_endpoint": "/search/contact",
@@ -5298,7 +5482,7 @@ _ENTITY_CONFIG = {
     },
     "task": {
         "search_fn": search_tasks_logic,
-        "by_term_fn": None,
+        "by_term_fn": search_tasks_by_term_logic,
         "idle_fn": None,
         "search_fields": ["id", "name", "status", "priority", "dueDate", "assignedTo", "relation", "createdAt"],
         "search_endpoint": "/tasks/search",
@@ -5320,7 +5504,7 @@ _ENTITY_CONFIG = {
     },
     "company": {
         "search_fn": search_companies_logic,
-        "by_term_fn": None,
+        "by_term_fn": search_companies_by_term_logic,
         "idle_fn": None,
         "search_fields": ["id", "name", "website", "emails", "phoneNumbers", "ownerId", "createdAt"],
         "search_endpoint": "/search/company",
@@ -5331,7 +5515,7 @@ _ENTITY_CONFIG = {
     },
     "meeting": {
         "search_fn": search_meetings_logic,
-        "by_term_fn": None,
+        "by_term_fn": search_meetings_by_term_logic,
         "idle_fn": None,
         "search_fields": None,
         "search_endpoint": "/meetings/search",
@@ -5418,6 +5602,55 @@ async def search_entity(
         return result
     except Exception as e:
         return f"Error searching {entity_type}: {str(e)}"
+
+
+@mcp.tool()
+async def search_entity_by_term(
+    entity_type: str,
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """
+    Search/filter any entity type by a search term (lead, contact, task, deal, company, meeting).
+    Use this tool for free-text search instead of filter-based search.
+
+    Valid entity_type values: lead, contact, task, deal, company, meeting
+
+    search_term: Term to search across fields (exact behavior depends on entity type).
+      - For meeting: searches 'title' field only.
+      - For others: multi-field search (first name, last name, email, phone, etc.).
+
+    page: 0-based page for lead/contact/task/deal/company; 1-based for meeting (default 0).
+    size: Page size, max 100 (default 20).
+    sort: Sort e.g. "updatedAt,desc" (default).
+    """
+    # Validate entity_type
+    cfg = _ENTITY_CONFIG.get(entity_type)
+    if not cfg:
+        valid_types = ", ".join([k for k, v in _ENTITY_CONFIG.items() if v.get("by_term_fn")])
+        return f"Unknown entity_type '{entity_type}'. Valid: {valid_types}"
+
+    # Check if entity supports by_term search
+    by_term_fn = cfg.get("by_term_fn")
+    if not by_term_fn:
+        return f"Entity type '{entity_type}' does not support search by term."
+
+    # Handle pagination offset (meeting is 1-based)
+    page_offset = cfg.get("search_page_offset", 0)
+    api_page = page + page_offset
+
+    # Call the entity-specific by_term logic
+    try:
+        _reset_api_call_count()
+        result = await by_term_fn(search_term, page=api_page, size=size, sort=sort)
+        return result
+    except KylasAPIError as e:
+        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("search_entity_by_term")
+        return f"✗ Unexpected error: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
