@@ -67,6 +67,9 @@ def _get_default_timezone() -> str:
 
 DEFAULT_TIMEZONE = _get_default_timezone()
 
+# Entity label mapping (tenant-specific display names)
+_ENTITY_LABELS: Dict[str, Dict[str, str]] = {}
+
 
 def _threshold_iso_days_ago(days: int, time_zone: str) -> str:
     """Return (now - days) in the given timezone as ISO string (UTC with Z)."""
@@ -77,6 +80,25 @@ def _threshold_iso_days_ago(days: int, time_zone: str) -> str:
     now = datetime.now(tz)
     threshold = now - timedelta(days=days)
     return threshold.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+async def _load_entity_labels() -> Dict[str, Dict[str, str]]:
+    """
+    Fetch entity labels from /v1/entities/label endpoint.
+    Returns mapping like: {"LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"}, ...}
+    Returns empty dict if fetch fails.
+    """
+    global _ENTITY_LABELS
+    try:
+        async with get_client() as client:
+            resp = await client.get(f"{BASE_URL}/entities/label")
+            _ENTITY_LABELS = resp.json()
+            logger.info(f"Loaded entity labels: {list(_ENTITY_LABELS.keys())}")
+            return _ENTITY_LABELS
+    except Exception as e:
+        logger.warning(f"Failed to load entity labels: {e}")
+        _ENTITY_LABELS = {}
+        return {}
 
 
 if not API_KEY:
