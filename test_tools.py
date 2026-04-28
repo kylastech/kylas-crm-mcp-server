@@ -842,13 +842,13 @@ def test_format_entity_labels_for_instructions():
 
     result = main._format_entity_labels_for_instructions(labels)
 
-    # Should contain the mapping
+    # Should contain display names and lowercase standard types
     assert "Lid" in result
     assert "Deeeel" in result
     assert "Quontact" in result
-    assert "LEAD" in result
-    assert "DEAL" in result
-    assert "CONTACT" in result
+    assert "lead" in result
+    assert "deal" in result
+    assert "contact" in result
 
 
 @pytest.mark.asyncio
@@ -868,9 +868,73 @@ async def test_system_instructions_include_labels():
     # Verify formatted output contains expected content
     assert "Lid" in formatted
     assert "Deeeel" in formatted
-    assert "LEAD" in formatted
-    assert "DEAL" in formatted
-    assert "Entity Label Mapping" in formatted
+    assert "lead" in formatted
+    assert "deal" in formatted
+    assert "ENTITY NAME ROUTING" in formatted
+
+
+def test_normalize_deal_payload_ownedby_int():
+    """ownedBy as plain int should be wrapped as {"id": int}."""
+    payload = {"name": "Deal A", "ownedBy": 7236}
+    result = main._normalize_deal_payload(payload)
+    assert result["ownedBy"] == {"id": 7236}
+
+
+def test_normalize_deal_payload_ownedby_already_dict():
+    """ownedBy already a dict should be left unchanged."""
+    payload = {"name": "Deal A", "ownedBy": {"id": 7236}}
+    result = main._normalize_deal_payload(payload)
+    assert result["ownedBy"] == {"id": 7236}
+
+
+def test_normalize_deal_payload_ownedby_bool_not_touched():
+    """True/False must not be treated as int for ownedBy."""
+    payload = {"ownedBy": True}
+    result = main._normalize_deal_payload(payload)
+    assert result["ownedBy"] is True
+
+
+def test_normalize_deal_payload_monetary_with_existing():
+    """Monetary field as plain number wraps using currencyId from existing deal."""
+    existing = {"estimatedValue": {"currencyId": 431, "value": 1000}}
+    payload = {"estimatedValue": 32}
+    result = main._normalize_deal_payload(payload, existing=existing)
+    assert result["estimatedValue"] == {"currencyId": 431, "value": 32}
+
+
+def test_normalize_deal_payload_monetary_no_existing():
+    """Monetary field as plain number without existing deal is left as-is (no currencyId)."""
+    payload = {"value": 500}
+    result = main._normalize_deal_payload(payload)
+    assert result["value"] == 500
+
+
+def test_normalize_deal_payload_monetary_already_dict():
+    """Monetary field already a dict should be left unchanged."""
+    payload = {"estimatedValue": {"currencyId": 99, "value": 250}}
+    result = main._normalize_deal_payload(payload)
+    assert result["estimatedValue"] == {"currencyId": 99, "value": 250}
+
+
+def test_normalize_deal_payload_all_monetary_fields():
+    """All three monetary fields wrapped when existing provides currencyId."""
+    existing = {
+        "estimatedValue": {"currencyId": 1, "value": 0},
+        "actualValue": {"currencyId": 2, "value": 0},
+        "value": {"currencyId": 3, "value": 0},
+    }
+    payload = {"estimatedValue": 100, "actualValue": 200, "value": 300}
+    result = main._normalize_deal_payload(payload, existing=existing)
+    assert result["estimatedValue"] == {"currencyId": 1, "value": 100}
+    assert result["actualValue"] == {"currencyId": 2, "value": 200}
+    assert result["value"] == {"currencyId": 3, "value": 300}
+
+
+def test_normalize_deal_payload_no_relevant_fields():
+    """Payload with no ownedBy or monetary fields passes through unchanged."""
+    payload = {"name": "Test Deal", "closingDate": "2025-12-31"}
+    result = main._normalize_deal_payload(payload)
+    assert result == {"name": "Test Deal", "closingDate": "2025-12-31"}
 
 
 if __name__ == "__main__":

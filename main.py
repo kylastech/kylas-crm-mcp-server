@@ -18,8 +18,7 @@ CONTACT OPERATIONS:
 TASK OPERATIONS:
 - get_task_field_instructions (call FIRST to get schema)
 - create_task, update_task, get_task
-- search_tasks (filter by criteria - NO PIPELINE)
-- search_tasks_for_lead, search_tasks_for_contact, search_tasks_for_deal, search_tasks_for_company (find tasks associated with entity)
+- search_tasks (filter by criteria - NO PIPELINE; use associatedLeads/Contacts/Deals/Companies filter for entity-linked tasks)
 
 SHARED TOOLS (for all Lead, Contact, Task):
 - get_current_user (timezone, ID; use for date/datetime handling)
@@ -32,6 +31,7 @@ import asyncio
 import os
 import random
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo
@@ -84,24 +84,32 @@ def _threshold_iso_days_ago(days: int, time_zone: str) -> str:
 
 def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) -> str:
     """
-    Format entity labels into readable text for system instructions.
+    Format entity labels as action-oriented routing rules for system instructions.
     Returns empty string if no labels.
     """
     if not labels:
         return ""
 
-    lines = ["\n## Entity Label Mapping (Tenant-Customized Names → Standard Entity Types)\n"]
-    lines.append("This tenant has customized entity display names. When user mentions custom names, map to standard entity types:\n")
+    lines = [
+        "## ENTITY NAME ROUTING — CALL get_entity_labels() FIRST, THEN USE THESE RULES",
+        "",
+        "This tenant has renamed CRM entities. When the user mentions any of the names below,",
+        "call get_entity_labels() to confirm, then use the standard type for all tool calls:",
+        "",
+    ]
 
     for entity_type in sorted(labels.keys()):
         label_data = labels[entity_type]
         display_name = label_data.get("displayName", entity_type)
         display_plural = label_data.get("displayNamePlural", entity_type)
-        lines.append(f"- **\"{display_name}\"** (user's term) = **\"{entity_type}\"** (standard type for tools)")
+        std_type = entity_type.lower()
+        lines.append(
+            f'- If user says "{display_name}" or "{display_plural}" → call get_entity_labels(), '
+            f'then use standard type "{std_type}" in all tool calls'
+        )
 
-    lines.append("\n**CRITICAL for tool calls:** When calling any tool with an entity_type parameter, use the STANDARD TYPE (e.g., \"deal\", \"contact\"), NOT the display name.")
-    lines.append("Example: User says \"fetch Cars with Animals\" → you map \"Cars\" to \"deal\" and \"Animals\" to \"contact\" → call search_entity(\"deal\", ...) and search_entity(\"contact\", ...)")
-    lines.append("Do NOT call search_entity(\"Cars\", ...) or search_entity(\"Animals\", ...) — tools don't recognize display names.\n")
+    lines.append("")
+    lines.append('DO NOT tell the user an entity "doesn\'t exist" before calling get_entity_labels().')
 
     return "\n".join(lines)
 
@@ -117,7 +125,13 @@ async def _load_entity_labels() -> Dict[str, Dict[str, str]]:
         async with get_client() as client:
             resp = await client.get(f"{BASE_URL}/entities/label")
             _ENTITY_LABELS = resp.json()
-            logger.info(f"Loaded entity labels: {list(_ENTITY_LABELS.keys())}")
+            # Log with display names in clear format
+            logger.info("Loaded entity labels:")
+            for entity_type in sorted(_ENTITY_LABELS.keys()):
+                label_data = _ENTITY_LABELS[entity_type]
+                display_name = label_data.get("displayName", entity_type)
+                display_plural = label_data.get("displayNamePlural", entity_type)
+                logger.info(f"  {entity_type} => {display_name}, {display_plural}")
             return _ENTITY_LABELS
     except Exception as e:
         logger.warning(f"Failed to load entity labels: {e}")
@@ -129,7 +143,8 @@ async def _label_refresh_loop(interval_seconds: int = 1800) -> None:
     """
     Background task: periodically refresh entity labels.
     Default interval: 1800 seconds (30 minutes).
-    Runs forever until cancelled. Updates _ENTITY_LABELS in-place.
+    Runs forever until cancelled. Updates _ENTITY_LABELS in-place and
+    rebuilds MCP server instructions so new labels are picked up immediately.
     """
     global _ENTITY_LABELS
     while True:
@@ -139,8 +154,12 @@ async def _label_refresh_loop(interval_seconds: int = 1800) -> None:
             async with get_client() as client:
                 resp = await client.get(f"{BASE_URL}/entities/label")
                 new_labels = resp.json()
+                _ENTITY_LABELS.clear()
                 _ENTITY_LABELS.update(new_labels)
                 logger.info(f"Refreshed entity labels: {list(_ENTITY_LABELS.keys())}")
+                mcp._mcp_server.instructions = _build_instructions()
+                _update_tool_description(mcp)
+                _patch_entity_tool_descriptions(mcp)
         except asyncio.CancelledError:
             logger.info("Label refresh loop cancelled")
             break
@@ -158,8 +177,13 @@ if not API_KEY:
 SYSTEM_INSTRUCTIONS = """
 # Kylas CRM MCP Server - Lead, Contact & Task Support
 
-## ⚠️ MANDATORY SESSION RULE — READ THIS FIRST
+## ⚠️ MANDATORY SESSION RULES — READ THIS FIRST
 
+### Rule 0 — ALWAYS call first, every session
+**Call `get_entity_labels()` IMMEDIATELY at the start of every new session, before anything else.**
+This tenant uses custom names for CRM entities (e.g. "animals" instead of contacts, "cars" instead of deals). Without calling this, you will misidentify entity requests. Call it once; the result stays in context.
+
+### Rule 1 — Entity field schemas
 **For ANY entity, call its field instructions tool ONCE per session — the very first time you interact with that entity. After that, reuse the field schema already in context; do NOT call it again for subsequent queries on the same entity.**
 
 | Entity    | Call ONCE per session (first interaction only) |
@@ -178,24 +202,26 @@ SYSTEM_INSTRUCTIONS = """
 
 ---
 
-## ⚠️ ENTITY LABEL MAPPING (Customized Entity Names)
+## 🚨 MANDATORY: ENTITY LABEL MAPPING (Tenant-Customized Entity Names)
 
-**This tenant may have renamed standard entities to custom display names** (see "Entity Label Mapping" section below for full mapping).
+**BEFORE SAYING "Kylas doesn't have X entity", CHECK THIS SECTION FIRST.**
 
-**CRITICAL RULE: Tools always use STANDARD ENTITY TYPES, not display names.**
+**This tenant has customized entity display names.** Standard CRM entities (lead, contact, deal, etc.) have been renamed to custom names in this tenant.
 
-- If user says "fetch Cars" → you map "Cars" to the standard type (likely "deal") → call tools with standard type
-- If user says "show Animals" → you map "Animals" to the standard type (likely "contact") → call tools with standard type
-- **Do NOT call search_entity("Cars", ...) or search_entity("Animals", ...)** — tools don't recognize display names; they only accept standard types: lead, contact, task, deal, company, meeting, call_log
+**CRITICAL INSTRUCTIONS:**
+1. **When user asks for an entity by name** (e.g., "get animals", "show cars"), FIRST check the "Entity Label Mapping" section below
+2. **If you find the user's entity name in that mapping**, use the corresponding STANDARD TYPE for tool calls
+3. **ONLY say "entity not found"** if the user's requested name is NOT in the Entity Label Mapping section AND NOT in standard types (lead, contact, task, deal, company, meeting, call_log)
 
-**Mapping process:**
-1. User says something like "fetch Cars with associated Animals"
-2. Refer to the "Entity Label Mapping" section (below) to find the standard types
-3. Translate: Cars→deal, Animals→contact
-4. Call tools using standard types: `search_entity("deal", ...)`, `search_entity("contact", ...)`
-5. Present results using the user's custom names (e.g., display as "Cars" not "deals")
+**Example:**
+- User: "Get animals from Kylas"
+- You check Entity Label Mapping → find "Animal" = "contact"
+- You call: `search_entity("contact", ...)`
+- You present results as: "Found X animals..."
 
-If the Entity Label Mapping section is empty or missing, that means the tenant is using standard entity type names (lead, contact, task, deal, company, meeting, call_log).
+**DO NOT assume an entity doesn't exist just because you don't recognize the name. ALWAYS CHECK THE MAPPING FIRST.**
+
+{ENTITY_LABEL_MAPPING}
 
 ---
 
@@ -203,15 +229,28 @@ If the Entity Label Mapping section is empty or missing, that means the tenant i
 
 **When the user asks for "all" records of any entity (e.g. "show all leads", "give all deals", "list all contacts") WITHOUT specifying a date range, ALWAYS apply a default filter: `createdAt` in the last 3 months.**
 
+- **Use entity-specific search tools with a date filter — NEVER `search_entity_by_term` — for "all" / "list" queries.**
+- Do NOT use `search_entity_by_term` with `"*"`, `""`, or any wildcard/blank — it will return no results.
 - Do NOT fetch all records without a date filter — this could return thousands of records.
 - Compute the 3-month threshold as: today minus 90 days, in the user's timezone (call `get_current_user` first if timezone is not yet known).
 - Use `updatedAt` with operator `greater_or_equal` and value = (today − 90 days) ISO string.
 - If the user explicitly provides a date range (e.g. "show leads from Jan to March"), use that instead — do not override it with the 3-month default.
 - Inform the user that results are filtered to the last 3 months, e.g.: *"Showing leads updated in the last 3 months. Specify a date range if you need older records."*
 
+**Tool to use per entity type (prefer these over the generic `search_entity`):**
+| Entity    | Use this tool                                                                                |
+|-----------|----------------------------------------------------------------------------------------------|
+| Lead      | `search_leads([{"field": "updatedAt", "operator": "greater_or_equal", "value": "<ISO>"}])`  |
+| Contact   | `search_contacts([{"field": "updatedAt", "operator": "greater_or_equal", "value": "<ISO>"}])` |
+| Task      | `search_tasks([{"field": "updatedAt", "operator": "greater_or_equal", "value": "<ISO>"}])`  |
+| Deal      | `search_deals([{"field": "updatedAt", "operator": "greater_or_equal", "value": "<ISO>"}])`  |
+| Company   | `search_companies([{"field": "updatedAt", "operator": "greater_or_equal", "value": "<ISO>"}])` |
+| Meeting   | `search_meetings([{"field": "updatedAt", "operator": "greater_or_equal", "value": "<ISO>"}])` |
+
 **Example:**
-- User: "show all leads" → apply `updatedAt >= (today - 90 days)` filter automatically.
-- User: "show all leads from last year" → use the user-specified range, not the 3-month default.
+- User: "show all tasks" → call `search_tasks([{"field": "updatedAt", "operator": "greater_or_equal", "value": "<today-90d ISO>"}])`.
+- User: "show all leads from last year" → call `search_leads(...)` with the user-specified range.
+- User: "find leads named John" → use `search_entity_by_term("lead", "John")` — a real search term is provided.
 
 ## CRITICAL: Workflow (applies to Lead, Contact, and Task)
 
@@ -327,11 +366,11 @@ This provides:
 - All other instructions (timezone handling, lookup_users, lookup_products, custom fields) apply the same to tasks.
 
 ### Task Association Filters (finding tasks for a specific entity)
-- **Find tasks for a Lead:** Use `search_tasks_for_lead` with the lead ID. Internally filters by `associatedLeads` field.
-- **Find tasks for a Contact:** Use `search_tasks_for_contact` with the contact ID. Internally filters by `associatedContacts` field.
-- **Find tasks for a Deal:** Use `search_tasks_for_deal` with the deal ID. Internally filters by `associatedDeals` field.
-- **Find tasks for a Company:** Use `search_tasks_for_company` with the company ID. Internally filters by `associatedCompanies` field.
-- These are convenience tools; alternatively, use `search_tasks` with filters like `{"field": "associatedLeads", "operator": "equal", "value": <lead_id>}`.
+Use `search_tasks` with the appropriate filter:
+- **Tasks for a Lead:** `search_tasks([{"field": "associatedLeads", "operator": "equal", "value": <lead_id>}])`
+- **Tasks for a Contact:** `search_tasks([{"field": "associatedContacts", "operator": "equal", "value": <contact_id>}])`
+- **Tasks for a Deal:** `search_tasks([{"field": "associatedDeals", "operator": "equal", "value": <deal_id>}])`
+- **Tasks for a Company:** `search_tasks([{"field": "associatedCompanies", "operator": "equal", "value": <company_id>}])`
 
 ### Date and datetime fields — timezone from current user (GET /users/me)
 - Whenever a **date or datetime** is involved (create lead/contact with a date/datetime field, or filter by date/datetime), call **get_current_user** first to get the user's **timezone** (e.g. Asia/Calcutta).
@@ -541,7 +580,11 @@ Before creating or updating a deal, you MUST call `get_deal_field_instructions` 
 - Values: use the exact format expected by Kylas (see below).
 
 ### Field value formats
-- **Standard fields** (name, value, closingDate, dealSource, etc.): use API name as key at top level.
+- **Standard fields** (name, closingDate, dealSource, etc.): use API name as key at top level.
+- **Monetary fields** (`estimatedValue`, `actualValue`, `value`): MUST be passed as `{"currencyId": <id>, "value": <number>}`. The `currencyId` is the tenant's currency ID (visible in the deal field instructions cheat sheet or from an existing deal). NEVER pass a plain number — the API will reject it.
+  - Example: `"estimatedValue": {"currencyId": 431, "value": 32}`
+- **Owner field** (`ownedBy`): pass as `{"id": <user_id>}`. Use `lookup_users` to get the user ID.
+  - Example: `"ownedBy": {"id": 7236}`
 - **emails**: array of objects (types OFFICE, PERSONAL only; exactly one must be primary). Or pass "email": "user@example.com" to normalize (OFFICE, primary). First entry is primary by default.
 - **phoneNumbers**: array of objects (types MOBILE, WORK, HOME, PERSONAL only; exactly one must be primary; "code" = 2-letter country e.g. IN, US). Or pass "phone": "5551234567". You MUST also pass "phone_country_code": "IN" or "+91" at the top level whenever any phone is included. **If the user gave phone number(s) but did NOT specify country or dial code: do NOT call create_deal.** Reply asking for country/dial code. Only after the user provides it, call create_deal with that phone_country_code.
 - **Picklist fields** (e.g. dealSource, dealStatus): use the **Option ID** (number) from the cheat sheet.
@@ -763,8 +806,125 @@ Same as lead but `"entity": "deal"` in relatedTo. Optionally add `associatedTo` 
 # MCP Server
 # ---------------------------------------------------------------------------
 
-_final_instructions = SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" + COMPANY_SYSTEM_INSTRUCTIONS + "\n\n" + MEETING_SYSTEM_INSTRUCTIONS + "\n\n" + CALL_LOG_SYSTEM_INSTRUCTIONS + _format_entity_labels_for_instructions(_ENTITY_LABELS)
-mcp = FastMCP("Kylas CRM", instructions=_final_instructions)
+_base_instructions = (
+    SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" +
+    COMPANY_SYSTEM_INSTRUCTIONS + "\n\n" + MEETING_SYSTEM_INSTRUCTIONS + "\n\n" +
+    CALL_LOG_SYSTEM_INSTRUCTIONS
+)
+
+
+def _build_instructions() -> str:
+    """Build final instructions: mandatory call first, routing rules, then all other instructions."""
+    label_block = _format_entity_labels_for_instructions(_ENTITY_LABELS)
+    mandatory = (
+        "# MANDATORY FIRST STEP — NO EXCEPTIONS\n\n"
+        "Call `get_entity_labels()` at the start of EVERY session before responding to any user request.\n"
+        "This tenant uses custom names for CRM entities. Without this call you will misidentify entities and fail.\n\n"
+    )
+    return mandatory + label_block + "\n\n---\n\n" + _base_instructions.replace("{ENTITY_LABEL_MAPPING}", label_block)
+
+
+def _format_label_summary() -> str:
+    """One-line summary of entity labels for tool description."""
+    if not _ENTITY_LABELS:
+        return ""
+    parts = []
+    for entity_type in sorted(_ENTITY_LABELS.keys()):
+        label_data = _ENTITY_LABELS[entity_type]
+        display_name = label_data.get("displayName", entity_type)
+        display_plural = label_data.get("displayNamePlural", entity_type)
+        std_type = entity_type.lower()
+        parts.append(f'"{display_name}"/"{display_plural}"={std_type}')
+    return ", ".join(parts)
+
+
+def _update_tool_description(app: FastMCP) -> None:
+    """Patch get_entity_labels tool description with live label data so Claude sees it in the tool list."""
+    tool = app._tool_manager._tools.get("get_entity_labels")
+    if not tool:
+        return
+    summary = _format_label_summary()
+    if summary:
+        tool.description = (
+            f"REQUIRED: Call this ONCE per session before any other action.\n"
+            f"THIS TENANT'S ENTITY NAMES: {summary}\n"
+            f"Returns the full mapping. Use standard types (right of =) in all tool calls."
+        )
+        logger.info(f"Updated get_entity_labels tool description: {summary}")
+
+
+# Maps entity type keys to tool name substrings for description patching
+_ENTITY_TOOL_SUBSTRINGS: Dict[str, str] = {
+    "CONTACT": "contact",
+    "LEAD": "lead",
+    "DEAL": "deal",
+    "TASK": "task",
+    "COMPANY": "company",
+    "MEETING": "meeting",
+    "CALL_LOG": "call_log",
+}
+
+# Stores original tool descriptions so refreshes don't stack the prefix
+_ORIGINAL_TOOL_DESCRIPTIONS: Dict[str, str] = {}
+
+_ENTITY_LABELS_RESOURCE_URI = "kylas://entity-labels"
+
+
+def _patch_entity_tool_descriptions(app: FastMCP) -> None:
+    """
+    Prepend a one-line resource reference to each entity tool's description.
+    Claude reads tool descriptions before deciding which tool to call; seeing the
+    resource URI there prompts it to read kylas://entity-labels for name resolution.
+    """
+    if not _ENTITY_LABELS:
+        return
+    for entity_type, substring in _ENTITY_TOOL_SUBSTRINGS.items():
+        label_data = _ENTITY_LABELS.get(entity_type)
+        if not label_data:
+            continue
+        display_name = label_data.get("displayName", "")
+        display_plural = label_data.get("displayNamePlural", "")
+        std_type = entity_type.lower()
+        prefix = (
+            f'[Tenant entity name: "{display_name}" / "{display_plural}" = {std_type}. '
+            f"If user uses a custom name, read resource `{_ENTITY_LABELS_RESOURCE_URI}` to resolve it.]\n"
+        )
+        for tool_name, tool in app._tool_manager._tools.items():
+            if substring in tool_name.lower() and tool_name != "get_entity_labels":
+                if tool_name not in _ORIGINAL_TOOL_DESCRIPTIONS:
+                    _ORIGINAL_TOOL_DESCRIPTIONS[tool_name] = tool.description
+                tool.description = prefix + _ORIGINAL_TOOL_DESCRIPTIONS[tool_name]
+    logger.info("Patched entity tool descriptions with resource reference")
+
+
+@asynccontextmanager
+async def _app_lifespan(app: FastMCP):
+    """Load entity labels on startup, refresh them in background."""
+    await _load_entity_labels()
+    # Inject label data into server instructions
+    app._mcp_server.instructions = _build_instructions()
+    # Patch get_entity_labels tool description with live label summary
+    _update_tool_description(app)
+    # Embed resource reference in every entity tool's description
+    _patch_entity_tool_descriptions(app)
+    logger.info("Updated MCP server instructions with entity labels")
+    if "ENTITY NAME ROUTING" in (app._mcp_server.instructions or ""):
+        logger.info("✓ Entity Name Routing section found in instructions")
+    else:
+        logger.warning("✗ Entity Name Routing section NOT found in instructions")
+    # Start background refresh loop — runs in the server's own event loop
+    refresh_task = asyncio.create_task(_label_refresh_loop(interval_seconds=1800))
+    try:
+        yield {}
+    finally:
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
+
+
+mcp = FastMCP("Kylas CRM", instructions=_base_instructions, lifespan=_app_lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -956,6 +1116,62 @@ async def _format_entity_labels_for_display(labels: Dict[str, Dict[str, str]]) -
         display_plural = label_data.get("displayNamePlural", entity_type)
         lines.append(f"- **{entity_type}** (standard type) → **{display_name}** / **{display_plural}** (display names)")
     lines.append("\n**Remember:** When calling tools, use the standard type (left side), not the display name (right side).")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_entity_labels() -> str:
+    """
+    Returns the mapping of this tenant's custom entity display names to standard CRM entity types.
+    CALL THIS ONCE at the start of every session, before any other tool.
+    This tenant uses custom names (e.g. "animals" instead of contacts, "cars" instead of deals).
+    Without this, you will fail to recognize entity requests from users.
+    After calling this, when the user mentions a custom name, map it to the standard type for all tool calls.
+    """
+    if not _ENTITY_LABELS:
+        return "No custom entity labels configured for this tenant. Standard names apply: lead, contact, deal, task, company, meeting, call_log."
+    lines = ["# Entity Label Mapping — Custom Names for This Tenant\n"]
+    lines.append("When the user says one of the custom names below, use the corresponding STANDARD TYPE in all tool calls.\n")
+    for entity_type in sorted(_ENTITY_LABELS.keys()):
+        label_data = _ENTITY_LABELS[entity_type]
+        display_name = label_data.get("displayName", entity_type)
+        display_plural = label_data.get("displayNamePlural", entity_type)
+        std_type = entity_type.lower()
+        lines.append(f'- User says "{display_name}" or "{display_plural}" → use standard type: "{std_type}"')
+    lines.append('\n**Example:** User says "get animals" → map "animals" to "contact" → call search_contacts(...)')
+    lines.append('**Example:** User says "show cars" → map "cars" to "deal" → call search_deals(...)')
+    return "\n".join(lines)
+
+
+@mcp.resource(
+    "kylas://entity-labels",
+    name="Entity Label Mapping",
+    description=(
+        "Tenant-specific entity name mapping. Read this to resolve custom entity names to standard CRM types. "
+        "Example: 'animals' may map to 'contact', 'cars' may map to 'deal'. "
+        "Always read this resource when the user refers to an entity by an unfamiliar name."
+    ),
+    mime_type="text/plain",
+)
+def entity_labels_resource() -> str:
+    """Serve current entity label mapping as a readable resource."""
+    if not _ENTITY_LABELS:
+        return "No custom entity labels. Standard names apply: lead, contact, deal, task, company, meeting, call_log."
+    lines = ["# Entity Label Mapping — Tenant-Specific Custom Names", ""]
+    lines.append("When the user says a custom name, use the STANDARD TYPE (right of →) in all tool calls.")
+    lines.append("")
+    for entity_type in sorted(_ENTITY_LABELS.keys()):
+        label_data = _ENTITY_LABELS[entity_type]
+        display_name = label_data.get("displayName", entity_type)
+        display_plural = label_data.get("displayNamePlural", entity_type)
+        std_type = entity_type.lower()
+        lines.append(f'- "{display_name}" / "{display_plural}" → "{std_type}"')
+    lines.extend([
+        "",
+        "Examples:",
+        '  User says "get animals" → standard type is "contact" → call search_contacts(...)',
+        '  User says "show cars"   → standard type is "deal"    → call search_deals(...)',
+    ])
     return "\n".join(lines)
 
 
@@ -2564,7 +2780,7 @@ async def search_tasks_logic(
     params = {"page": page, "size": min(size, 100)}
     if sort:
         params["sort"] = sort
-    logger.info("Searching tasks with %d filter(s)", len(filters))
+    logger.info("Searching tasks with %d filter(s): jsonRule=%s", len(filters), json_rule)
     async with get_client() as client:
         response = await client.post("/tasks/search", params=params, json=payload)
         data = await handle_api_response(response, "Search tasks")
@@ -2572,7 +2788,8 @@ async def search_tasks_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No tasks found matching the filters. (Total in DB: {total})"
+        filter_summary = "; ".join([f"{f.get('field')}={f.get('value')}" for f in filters])
+        return f"No tasks found matching filters: {filter_summary}. (Total tasks in DB: {total})"
     lines = [f"Found {len(results)} task(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for task in results:
         tid = task.get("id", "?")
@@ -2585,6 +2802,7 @@ async def search_tasks_logic(
     return "\n".join(lines)
 
 
+@mcp.tool()
 async def search_tasks(
     filters: List[Dict[str, Any]],
     page: int = 0,
@@ -2615,7 +2833,6 @@ async def search_tasks(
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def lookup_leads_for_task_tool(search_term: str = "") -> str:
     """
     Look up leads to associate with a task.
@@ -2644,7 +2861,6 @@ async def lookup_leads_for_task_tool(search_term: str = "") -> str:
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def lookup_contacts_for_task_tool(search_term: str = "") -> str:
     """
     Look up contacts to associate with a task.
@@ -2672,7 +2888,6 @@ async def lookup_contacts_for_task_tool(search_term: str = "") -> str:
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def lookup_deals_for_task_tool(search_term: str = "") -> str:
     """
     Look up deals to associate with a task.
@@ -2700,7 +2915,6 @@ async def lookup_deals_for_task_tool(search_term: str = "") -> str:
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def lookup_companies_for_task_tool(search_term: str = "") -> str:
     """
     Look up companies to associate with a task.
@@ -2971,12 +3185,42 @@ def _build_deal_search_json_rule(
 # Deal create/update/get logic
 # ---------------------------------------------------------------------------
 
+def _normalize_deal_payload(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Apply deal-specific field normalization on top of generic _normalize_field_values output.
+    - ownedBy: int → {"id": int}
+    - estimatedValue / actualValue / value: number → {"currencyId": <id>, "value": number}
+      (currencyId taken from existing deal if available)
+    """
+    _MONETARY_FIELDS = ("estimatedValue", "actualValue", "value")
+
+    if "ownedBy" in payload and isinstance(payload["ownedBy"], (int, float)) and not isinstance(payload["ownedBy"], bool):
+        payload["ownedBy"] = {"id": int(payload["ownedBy"])}
+
+    for field in _MONETARY_FIELDS:
+        if field not in payload:
+            continue
+        v = payload[field]
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            # Try to get currencyId from existing deal object for this field
+            currency_id = None
+            if existing and isinstance(existing.get(field), dict):
+                currency_id = existing[field].get("currencyId")
+            if currency_id:
+                payload[field] = {"currencyId": currency_id, "value": v}
+            else:
+                # Can't wrap without a currencyId — leave as-is; system instructions tell Claude to pass full object
+                logger.warning("Deal field '%s' is a plain number but no currencyId available; sending as-is.", field)
+    return payload
+
+
 async def create_deal_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     """Create a deal with the given dynamic field_values (Kylas API payload shape)."""
     fv = dict(field_values)
     has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
     id_to_name = await _get_deal_custom_field_id_to_name() if has_custom_by_id else {}
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    payload = _normalize_deal_payload(payload)
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
     logger.info("Creating deal with fields: %s", list(payload.keys()))
@@ -2996,7 +3240,10 @@ async def create_deal(field_values: Dict[str, Any]) -> str:
     Infer from user context which fields to send; include only those in field_values.
 
     field_values: Map of field identifier to value.
-    - Standard fields: use API name as key at top level (e.g. name, value, closingDate, dealSource).
+    - Standard fields: use API name as key at top level (e.g. name, closingDate, dealSource).
+    - Monetary fields (estimatedValue, actualValue, value): MUST be objects: {"currencyId": <id>, "value": <number>}.
+      Get currencyId from get_deal_field_instructions. NEVER pass a plain number.
+    - Owner (ownedBy): pass as {"id": <user_id>}. Use lookup_users to get user ID.
     - Custom fields: MUST be under "customFieldValues" with **internal name** as key (e.g. "customFieldValues": {"cfDealStatus": "Active"}). Do not use field ID as key.
     - For a single email use "email": "user@example.com". For phones use "phone": "5551234567" (or "phoneNumbers" array) and you MUST include "phone_country_code": "IN" or "+91" at top level.
     - For picklists use the Option ID (number) from the cheat sheet.
@@ -3034,6 +3281,7 @@ async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[
     async with get_client() as client:
         get_response = await client.get(f"/deals/{deal_id}")
         existing = await handle_api_response(get_response, "Get deal")
+        payload = _normalize_deal_payload(payload, existing=existing)
         merged = dict(existing)
         for key, value in payload.items():
             if key == "customFieldValues" and isinstance(value, dict):
@@ -5849,12 +6097,16 @@ async def search_entity_by_term(
     sort: Optional[str] = "updatedAt,desc",
 ) -> str:
     """
-    Search/filter any entity type by a search term (lead, contact, task, deal, company, meeting).
-    Use this tool for free-text search instead of filter-based search.
+    Search/filter any entity type by a free-text search term (lead, contact, task, deal, company, meeting).
+    Use this tool ONLY when the user provides a specific search term (e.g. a name, email, or keyword).
+
+    ⚠️ NEVER use this tool with wildcard characters ("*"), empty strings, or blank terms.
+    ⚠️ NEVER use this tool when the user asks for "all" records (e.g. "show all leads", "list all contacts").
+       → For "all" / "list" queries, use `search_entity` with a date filter (e.g. updatedAt >= last 90 days).
 
     Valid entity_type values: lead, contact, task, deal, company, meeting
 
-    search_term: Term to search across fields (exact behavior depends on entity type).
+    search_term: A specific term to search across fields (e.g. "John", "acme@corp.com", "Acme Inc").
       - For meeting: searches 'title' field only.
       - For others: multi-field search (first name, last name, email, phone, etc.).
 
@@ -5949,15 +6201,5 @@ def run() -> None:
         mcp.run()
 
 
-async def _server_startup():
-    """Initialize labels before MCP server starts."""
-    await _load_entity_labels()
-    # Start background refresh loop (fire-and-forget async task)
-    asyncio.create_task(_label_refresh_loop(interval_seconds=1800))
-
-
 if __name__ == "__main__":
-    # Load labels before starting server
-    asyncio.run(_server_startup())
-    # Run MCP server
     run()
