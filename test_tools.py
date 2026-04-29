@@ -664,6 +664,58 @@ async def test_search_entity_meeting_empty_filters():
 
 
 @pytest.mark.asyncio
+async def test_create_meeting_logic_strips_deals():
+    from main import create_meeting_logic
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"id": 123, "title": "Test Meeting"}
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        # Payload with both a valid invitee (contact) and an invalid invitee (deal)
+        field_values = {
+            "title": "Test Meeting",
+            "from": "2026-04-28T10:00:00Z",
+            "to": "2026-04-28T10:30:00Z",
+            "participants": [
+                {"id": 1, "entity": "contact"},
+                {"id": 2, "entity": "deal"}
+            ]
+        }
+        
+        result = await create_meeting_logic(field_values)
+        assert result["id"] == 123
+        
+        # Verify that the deal was stripped before POSTing
+        call_args = mock_client.post.call_args
+        posted_payload = call_args.kwargs["json"]
+        assert len(posted_payload["participants"]) == 1
+        assert posted_payload["participants"][0]["entity"] == "contact"
+
+
+@pytest.mark.asyncio
+async def test_create_meeting_logic_rejects_only_deals():
+    from main import create_meeting_logic, KylasAPIError
+    
+    # Payload with ONLY an invalid invitee (deal)
+    field_values = {
+        "title": "Test Meeting",
+        "from": "2026-04-28T10:00:00Z",
+        "to": "2026-04-28T10:30:00Z",
+        "participants": [
+            {"id": 2, "entity": "deal"}
+        ]
+    }
+    
+    with pytest.raises(KylasAPIError, match="cannot be a deal"):
+        await create_meeting_logic(field_values)
+
+
+@pytest.mark.asyncio
 async def test_search_entity_invalid_entity_type():
     """search_entity should error on unknown entity_type."""
     result = await search_entity_logic("invalid_type", [], page=0, size=20)
@@ -935,6 +987,71 @@ def test_normalize_deal_payload_no_relevant_fields():
     payload = {"name": "Test Deal", "closingDate": "2025-12-31"}
     result = main._normalize_deal_payload(payload)
     assert result == {"name": "Test Deal", "closingDate": "2025-12-31"}
+
+
+# ---------------------------------------------------------------------------
+# search_tasks_with_any_relation Tests
+# ---------------------------------------------------------------------------
+
+def test_build_search_json_rule_associated_field_standard_true():
+    """associatedLeads with standard:True must NOT get customFieldValues prefix (the root bug fix)."""
+    filterable_map = {"associatedLeads": {"type": "LOOK_UP", "standard": True}}
+    rules, err = _build_search_json_rule(
+        [{"field": "associatedLeads", "operator": "is_not_null", "value": None}],
+        filterable_map,
+    )
+    assert err is None
+    rule = rules["rules"][0]
+    assert rule["field"] == "associatedLeads", (
+        "standard:True field must not get customFieldValues prefix"
+    )
+    assert rule["type"] == "long"
+    assert rule["operator"] == "is_not_null"
+    assert rule["value"] is None
+
+
+def test_build_search_json_rule_associated_field_custom_gets_prefix():
+    """standard:False LOOK_UP fields correctly get customFieldValues prefix."""
+    filterable_map = {"cfCustomLookup": {"type": "LOOK_UP", "standard": False}}
+    rules, err = _build_search_json_rule(
+        [{"field": "cfCustomLookup", "operator": "equal", "value": 123}],
+        filterable_map,
+    )
+    assert err is None
+    assert rules["rules"][0]["field"] == "customFieldValues.cfCustomLookup"
+
+
+def test_search_tasks_with_any_relation_post_merge_sort():
+    """After dedup, merged task list is sorted by sort_field before pagination."""
+    # Simulate what _search_tasks_with_any_relation_logic does post-gather
+    tasks_from_leads = [
+        {"id": 1, "createdAt": "2025-10-01T00:00:00Z"},
+        {"id": 2, "createdAt": "2025-08-01T00:00:00Z"},
+    ]
+    tasks_from_contacts = [
+        {"id": 2, "createdAt": "2025-08-01T00:00:00Z"},  # duplicate — should be deduped
+        {"id": 3, "createdAt": "2025-12-01T00:00:00Z"},
+    ]
+
+    seen_ids: set = set()
+    all_tasks = []
+    for result in [tasks_from_leads, tasks_from_contacts]:
+        for task in result:
+            tid = task.get("id")
+            if tid and tid not in seen_ids:
+                seen_ids.add(tid)
+                all_tasks.append(task)
+
+    # Apply the same sort logic as _search_tasks_with_any_relation_logic
+    sort = "createdAt,desc"
+    sort_field, _, sort_dir = sort.partition(",")
+    reverse = sort_dir.strip().lower() != "asc"
+    all_tasks.sort(key=lambda t: (t.get(sort_field) or ""), reverse=reverse)
+
+    assert len(all_tasks) == 3, "Duplicate id=2 must be deduped"
+    assert all_tasks[0]["id"] == 3, "Most recent (Dec) first"
+    assert all_tasks[1]["id"] == 1, "Oct second"
+    assert all_tasks[2]["id"] == 2, "Aug last"
 
 
 if __name__ == "__main__":

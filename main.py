@@ -287,11 +287,20 @@ No pipeline, pipelineStage, emails, or phoneNumbers fields.
 "relation": [{"targetEntityId": <id>, "targetEntityType": "LEAD|CONTACT|DEAL|COMPANY", "targetEntityName": "<name>"}]
 ```
 
-**Filter tasks by entity:**
-- Lead: `search_tasks([{"field": "associatedLeads", "operator": "equal", "value": <lead_id>}])`
-- Contact: `search_tasks([{"field": "associatedContacts", "operator": "equal", "value": <contact_id>}])`
-- Deal: `search_tasks([{"field": "associatedDeals", "operator": "equal", "value": <deal_id>}])`
-- Company: `search_tasks([{"field": "associatedCompanies", "operator": "equal", "value": <company_id>}])`
+**Resolve entity before creating/updating a task:**
+Use `lookup_entity_for_task(entity_type, search_term)` to find the entity ID by name.
+- entity_type: "lead", "contact", "deal", or "company" (internal type, not tenant display name)
+- Returns ID and name to use in the "relation" field above.
+
+**Filter tasks by a specific entity ID:**
+- Lead: `search_entity("task", [{"field": "associatedLeads", "operator": "equal", "value": <lead_id>}])`
+- Contact: `search_entity("task", [{"field": "associatedContacts", "operator": "equal", "value": <contact_id>}])`
+- Deal: `search_entity("task", [{"field": "associatedDeals", "operator": "equal", "value": <deal_id>}])`
+- Company: `search_entity("task", [{"field": "associatedCompanies", "operator": "equal", "value": <company_id>}])`
+
+**Tasks with ANY relation present (no specific entity):**
+Use `search_tasks_with_any_relation()` — makes 4 parallel `is_not_null` calls and deduplicates.
+Do NOT try to filter manually or post-process results for this case — use the dedicated tool.
 """
 
 # ---------------------------------------------------------------------------
@@ -319,6 +328,7 @@ OPERATOR_MAPPING = {
     "MEETING_ORGANIZER": ["equal", "not_equal", "is_not_null", "is_null", "in", "not_in"],
     "PIPELINE_STAGE": ["equal", "not_equal", "in", "not_in"],
     "PIPELINE": ["equal", "not_equal", "is_not_null", "is_null", "in", "not_in"],
+    "PARTICIPANTS_LOOKUP": ["in", "not_in"],
 }
 
 # Operator symbol → name mapping (normalize user input like ">" to "greater")
@@ -537,7 +547,10 @@ MEETING_SYSTEM_INSTRUCTIONS = """
 Before creating, ask for:
 1. **Title** (required)
 2. **Start/end datetime** (required) — convert to UTC via `get_current_user` + `parse_datetime_to_utc_iso_tool`
-3. **Participants** (required) — resolve via `lookup_meeting_invitees`; pick row with correct `entity` type
+3. **Participants** (required) — resolve via `lookup_meeting_related_entity` with `entity_type="invitee"`; pick row with correct `entity` type
+   - **CRITICAL RULES FOR INVITEES**: 
+     - Only leads/contacts with a VALID EMAIL can be added as invitees. Check the `emails` array from the lookup result.
+     - Deals CANNOT be added as invitees. If the user asks to add a deal as an invitee, DO NOT add it to the `participants` payload, and inform them of this restriction.
 4. **Related entities** (optional) — resolve IDs first via entity lookup tools
 5. **Location**, **allDay** (optional)
 
@@ -553,17 +566,17 @@ Before creating, ask for:
 ```
 
 ### Resolving Entity IDs
-- **Participants/organizer:** `lookup_meeting_invitees` (pick row with right `entity` — organizer is usually `user`)
-- **relatedTo leads:** `lookup_leads_for_meeting` → filter `associatedLeads`
-- **relatedTo contacts:** `lookup_contacts_for_meeting` → filter `associatedContacts`
-- **relatedTo deals:** `lookup_deals_for_meeting` → filter `associatedDeals`
-- **relatedTo companies:** `lookup_companies_for_meeting` → filter `associatedCompanies`
+- **Participants/organizer:** `lookup_meeting_related_entity` with `entity_type="invitee"` (pick row with right `entity` — organizer is usually `user`)
+- **relatedTo leads:** `lookup_meeting_related_entity` with `entity_type="lead"` → filter `associatedLeads`
+- **relatedTo contacts:** `lookup_meeting_related_entity` with `entity_type="contact"` → filter `associatedContacts`
+- **relatedTo deals:** `lookup_meeting_related_entity` with `entity_type="deal"` → filter `associatedDeals`
+- **relatedTo companies:** `lookup_meeting_related_entity` with `entity_type="company"` → filter `associatedCompanies`
 - Combine multiple rules with AND.
 
 ### Search / Filter
 - By associated entity: resolve ID first via lookup tool, then `search_entity("meeting", filters)` with association filter.
 - Presence check: `is_not_null` / `is_null` with value null.
-- By organizer: `lookup_meeting_invitees` → `{"field": "organizer", "operator": "equal", "value": <user_id>}`.
+- By organizer: `lookup_meeting_related_entity` with `entity_type="invitee"` → `{"field": "organizer", "operator": "equal", "value": <user_id>}`.
 - Status filter: use internal name — "scheduled", "conducted", "missed", "cancelled".
 
 ### Cancel vs Delete
@@ -816,6 +829,8 @@ def _rule_type_for_value(field_type: str, field_name: str, value: Any) -> str:
     # Date/datetime: standard and custom (e.g. cfDateField); value = single ISO string, [start,end], or null
     if field_type in ("DATETIME_PICKER", "DATE", "DATE_PICKER"):
         return "date"
+    if field_type == "PARTICIPANTS_LOOKUP":
+        return "participants_lookup"
     return "string"
 
 
@@ -2235,7 +2250,7 @@ async def search_contacts_logic(
     # Add associated entity fields which are filterable but may not be marked as such in schema
     for associated_field in ["associatedLeads", "associatedDeals", "associatedCompanies"]:
         if associated_field not in filterable_map:
-            filterable_map[associated_field] = {"type": "LOOK_UP", "standard": False}
+            filterable_map[associated_field] = {"type": "LOOK_UP", "standard": True}
     if not filterable_map:
         return "No filterable contact fields found for this tenant."
     default_tz = None
@@ -2559,7 +2574,7 @@ async def search_tasks_logic(
     # Add associated entity fields which are filterable but may not be marked as such in schema
     for associated_field in ["associatedLeads", "associatedContacts", "associatedDeals", "associatedCompanies"]:
         if associated_field not in filterable_map:
-            filterable_map[associated_field] = {"type": "LOOK_UP", "standard": False}
+            filterable_map[associated_field] = {"type": "LOOK_UP", "standard": True}
     if not filterable_map:
         return "No filterable task fields found for this tenant."
     default_tz = None
@@ -2636,208 +2651,220 @@ async def search_tasks(
         return f"✗ Unexpected error: {str(e)}"
 
 
-async def lookup_leads_for_task_tool(search_term: str = "") -> str:
+@mcp.tool()
+async def lookup_entity_for_task(entity_type: str, search_term: str = "") -> str:
     """
-    Look up leads to associate with a task.
-    Returns top 10 leads matching the search term (searches by firstName).
-    Use this when the user wants to create a task for a specific lead.
+    Look up a lead, contact, deal, or company to associate with a task.
+    Use this BEFORE create_task or update_task when the user specifies an entity by name.
+
+    entity_type: "lead", "contact", "deal", or "company" (use internal type, not tenant display name)
+    search_term: optional name to filter results (e.g. "John", "Acme")
+
+    Returns top matching entities with IDs. Use the returned id in task's "relation" field:
+    {"targetEntityId": <id>, "targetEntityType": "<LEAD|CONTACT|DEAL|COMPANY>", "targetEntityName": "<name>"}
     """
     try:
         _reset_api_call_count()
-        result = await lookup_leads_for_task(search_term)
-        leads = result if isinstance(result, list) else result.get("data", result.get("content", []))
-        if not leads:
-            return f"No leads found matching '{search_term}'."
-        lines = [f"Found {len(leads)} lead(s) matching '{search_term}':", "-" * 60]
-        for lead in leads[:10]:
-            lead_id = lead.get("id", "?")
-            first_name = lead.get("firstName", "—")
-            last_name = lead.get("lastName", "—")
-            company = lead.get("companyName", "—")
-            lines.append(f"• ID: {lead_id} | Name: {first_name} {last_name} | Company: {company}")
+        etype = entity_type.lower().strip()
+
+        lead_label = _ENTITY_LABELS.get("lead", {}).get("displayName", "Lead")
+        contact_label = _ENTITY_LABELS.get("contact", {}).get("displayName", "Contact")
+        deal_label = _ENTITY_LABELS.get("deal", {}).get("displayName", "Deal")
+        company_label = _ENTITY_LABELS.get("company", {}).get("displayName", "Company")
+
+        if etype == "lead":
+            result = await lookup_leads_for_task(search_term)
+            items = result if isinstance(result, list) else result.get("data", result.get("content", []))
+            if not items:
+                return f"No {lead_label}s found matching '{search_term}'."
+            lines = [f"Found {len(items)} {lead_label}(s) matching '{search_term}':", "-" * 60]
+            for item in items[:10]:
+                lines.append(
+                    f"• ID: {item.get('id', '?')} | Name: {item.get('firstName', '—')} {item.get('lastName', '')} | Company: {item.get('companyName', '—')}"
+                )
+        elif etype == "contact":
+            result = await lookup_contacts_for_task(search_term)
+            items = result if isinstance(result, list) else result.get("data", result.get("content", []))
+            if not items:
+                return f"No {contact_label}s found matching '{search_term}'."
+            lines = [f"Found {len(items)} {contact_label}(s) matching '{search_term}':", "-" * 60]
+            for item in items[:10]:
+                email = item.get("emails", [{}])[0].get("value", "—") if item.get("emails") else "—"
+                lines.append(f"• ID: {item.get('id', '?')} | Name: {item.get('name', '—')} | Email: {email}")
+        elif etype == "deal":
+            result = await lookup_deals_for_task(search_term)
+            items = result if isinstance(result, list) else result.get("data", result.get("content", []))
+            if not items:
+                return f"No {deal_label}s found matching '{search_term}'."
+            lines = [f"Found {len(items)} {deal_label}(s) matching '{search_term}':", "-" * 60]
+            for item in items[:10]:
+                lines.append(f"• ID: {item.get('id', '?')} | Name: {item.get('name', '—')} | Value: {item.get('value', '—')}")
+        elif etype == "company":
+            result = await lookup_companies_for_task(search_term)
+            items = result if isinstance(result, list) else result.get("data", result.get("content", []))
+            if not items:
+                return f"No {company_label}s found matching '{search_term}'."
+            lines = [f"Found {len(items)} {company_label}(s) matching '{search_term}':", "-" * 60]
+            for item in items[:10]:
+                lines.append(f"• ID: {item.get('id', '?')} | Name: {item.get('name', '—')} | Industry: {item.get('industry', '—')}")
+        else:
+            valid = f"{lead_label} (lead), {contact_label} (contact), {deal_label} (deal), {company_label} (company)"
+            return f"✗ Unknown entity_type '{entity_type}'. Valid types: {valid}"
+
         lines.append("-" * 60)
         return "\n".join(lines)
     except KylasAPIError as e:
         return f"✗ Lookup failed: {e.message}\n  Details: {e.response_body}"
     except Exception as e:
-        logger.exception("lookup_leads_for_task_tool")
+        logger.exception("lookup_entity_for_task")
         return f"✗ Unexpected error: {str(e)}"
 
 
-async def lookup_contacts_for_task_tool(search_term: str = "") -> str:
-    """
-    Look up contacts to associate with a task.
-    Returns top 10 contacts matching the search term (searches by name).
-    Use this when the user wants to create a task for a specific contact.
-    """
-    try:
-        _reset_api_call_count()
-        result = await lookup_contacts_for_task(search_term)
-        contacts = result if isinstance(result, list) else result.get("data", result.get("content", []))
-        if not contacts:
-            return f"No contacts found matching '{search_term}'."
-        lines = [f"Found {len(contacts)} contact(s) matching '{search_term}':", "-" * 60]
-        for contact in contacts[:10]:
-            contact_id = contact.get("id", "?")
-            name = contact.get("name", "—")
-            email = contact.get("emails", [{}])[0].get("value", "—") if contact.get("emails") else "—"
-            lines.append(f"• ID: {contact_id} | Name: {name} | Email: {email}")
-        lines.append("-" * 60)
-        return "\n".join(lines)
-    except KylasAPIError as e:
-        return f"✗ Lookup failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("lookup_contacts_for_task_tool")
-        return f"✗ Unexpected error: {str(e)}"
+async def _fetch_raw_tasks_for_relation(
+    relation_field: str,
+    filterable_map: Dict[str, Any],
+    size: int,
+    sort: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Fetch tasks where the given relation field is not null. Returns raw task list."""
+    json_rule, err = _build_search_json_rule(
+        [{"field": relation_field, "operator": "is_not_null", "value": None}],
+        filterable_map,
+    )
+    if err:
+        logger.warning("_fetch_raw_tasks_for_relation(%s): rule error: %s", relation_field, err)
+        return []
+    payload = {
+        "fields": ["id", "name", "status", "priority", "dueDate", "assignedTo", "relation", "createdAt"],
+        "jsonRule": json_rule,
+    }
+    params: Dict[str, Any] = {"page": 0, "size": min(size, 100)}
+    if sort:
+        params["sort"] = sort
+    async with get_client() as client:
+        response = await client.post("/tasks/search", params=params, json=payload)
+        data = await handle_api_response(response, f"Search tasks ({relation_field} is_not_null)")
+    return data.get("content", data.get("data", []))
 
 
-async def lookup_deals_for_task_tool(search_term: str = "") -> str:
-    """
-    Look up deals to associate with a task.
-    Returns top 10 deals matching the search term (searches by name).
-    Use this when the user wants to create a task for a specific deal.
-    """
-    try:
-        _reset_api_call_count()
-        result = await lookup_deals_for_task(search_term)
-        deals = result if isinstance(result, list) else result.get("data", result.get("content", []))
-        if not deals:
-            return f"No deals found matching '{search_term}'."
-        lines = [f"Found {len(deals)} deal(s) matching '{search_term}':", "-" * 60]
-        for deal in deals[:10]:
-            deal_id = deal.get("id", "?")
-            name = deal.get("name", "—")
-            value = deal.get("value", "—")
-            lines.append(f"• ID: {deal_id} | Name: {name} | Value: {value}")
-        lines.append("-" * 60)
-        return "\n".join(lines)
-    except KylasAPIError as e:
-        return f"✗ Lookup failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("lookup_deals_for_task_tool")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-async def lookup_companies_for_task_tool(search_term: str = "") -> str:
-    """
-    Look up companies to associate with a task.
-    Returns top 10 companies matching the search term (searches by name).
-    Use this when the user wants to create a task for a specific company.
-    """
-    try:
-        _reset_api_call_count()
-        result = await lookup_companies_for_task(search_term)
-        companies = result if isinstance(result, list) else result.get("data", result.get("content", []))
-        if not companies:
-            return f"No companies found matching '{search_term}'."
-        lines = [f"Found {len(companies)} compan(ies) matching '{search_term}':", "-" * 60]
-        for company in companies[:10]:
-            company_id = company.get("id", "?")
-            name = company.get("name", "—")
-            industry = company.get("industry", "—")
-            lines.append(f"• ID: {company_id} | Name: {name} | Industry: {industry}")
-        lines.append("-" * 60)
-        return "\n".join(lines)
-    except KylasAPIError as e:
-        return f"✗ Lookup failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("lookup_companies_for_task_tool")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-async def search_tasks_for_lead(
-    lead_id: int,
+async def _search_tasks_with_any_relation_logic(
     page: int = 0,
     size: int = 20,
-    sort: Optional[str] = "dueDate,asc",
+    sort: Optional[str] = "createdAt,desc",
 ) -> str:
     """
-    Find tasks associated with a specific lead.
-    Pass the lead ID to get all tasks linked to that lead.
-    Internally filters by associatedLeads field.
+    Find tasks that have at least one relation present.
+    Makes 4 concurrent API calls (one per association field with is_not_null) and unions results by ID.
+    After merging, re-sorts the full list so pagination is consistent regardless of sub-query order.
+    """
+    fields_list = await _fetch_task_fields()
+    filterable_map = _get_filterable_fields_map(fields_list)
+    for f in ["associatedLeads", "associatedContacts", "associatedDeals", "associatedCompanies"]:
+        if f not in filterable_map:
+            filterable_map[f] = {"type": "LOOK_UP", "standard": True}
+
+    # Fetch more than needed per sub-query to account for cross-relation overlap after dedup
+    fetch_size = min(max(size * 4, 50), 100)
+
+    raw_results = await asyncio.gather(
+        _fetch_raw_tasks_for_relation("associatedLeads", filterable_map, fetch_size, sort),
+        _fetch_raw_tasks_for_relation("associatedContacts", filterable_map, fetch_size, sort),
+        _fetch_raw_tasks_for_relation("associatedDeals", filterable_map, fetch_size, sort),
+        _fetch_raw_tasks_for_relation("associatedCompanies", filterable_map, fetch_size, sort),
+        return_exceptions=True,
+    )
+
+    seen_ids: set = set()
+    all_tasks: List[Dict[str, Any]] = []
+    for result in raw_results:
+        if isinstance(result, Exception):
+            logger.warning("Relation search partial failure: %s", result)
+            continue
+        for task in result:
+            tid = task.get("id")
+            if tid and tid not in seen_ids:
+                seen_ids.add(tid)
+                all_tasks.append(task)
+
+    if not all_tasks:
+        return "No tasks with any relation found."
+
+    # Re-sort merged list so page boundaries are deterministic
+    sort_field, _, sort_dir = (sort or "createdAt,desc").partition(",")
+    reverse = sort_dir.strip().lower() != "asc"
+    all_tasks.sort(key=lambda t: (t.get(sort_field) or ""), reverse=reverse)
+
+    start = page * size
+    paginated = all_tasks[start:start + size]
+    if not paginated:
+        return f"No tasks on page {page + 1} (total found: {len(all_tasks)})."
+
+    lead_label = _ENTITY_LABELS.get("lead", {}).get("displayName", "Lead")
+    contact_label = _ENTITY_LABELS.get("contact", {}).get("displayName", "Contact")
+    deal_label = _ENTITY_LABELS.get("deal", {}).get("displayName", "Deal")
+    company_label = _ENTITY_LABELS.get("company", {}).get("displayName", "Company")
+    entity_type_label_map = {
+        "LEAD": lead_label,
+        "CONTACT": contact_label,
+        "DEAL": deal_label,
+        "COMPANY": company_label,
+    }
+
+    lines = [
+        f"Found {len(all_tasks)} task(s) with relation(s) (showing {len(paginated)}, page {page + 1})",
+        "-" * 60,
+    ]
+    for task in paginated:
+        tid = task.get("id", "?")
+        name = task.get("name", "—")
+        status = task.get("status", "—")
+        priority = task.get("priority", "—")
+        due = task.get("dueDate", "—")
+        relation = task.get("relation") or []
+        rel_parts = []
+        for r in relation:
+            etype = r.get("targetEntityType", "")
+            ename = r.get("targetEntityName", "")
+            eid = r.get("targetEntityId", "")
+            elabel = entity_type_label_map.get(etype, etype)
+            rel_parts.append(f"{elabel}: {ename} (ID: {eid})")
+        rel_str = " | ".join(rel_parts) if rel_parts else "—"
+        lines.append(f"• ID: {tid} | {name} | {status} | {priority} | Due: {due}")
+        if rel_str != "—":
+            lines.append(f"  Relations: {rel_str}")
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_tasks_with_any_relation(
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "createdAt,desc",
+) -> str:
+    """
+    Find tasks that have at least one relation present (linked to a lead, contact, deal, or company).
+
+    The API cannot filter across multiple association fields in a single request. This tool makes
+    4 parallel calls (associatedLeads is_not_null, associatedContacts is_not_null,
+    associatedDeals is_not_null, associatedCompanies is_not_null) and returns a unified,
+    deduplicated list sorted by the requested field.
+
+    Default sort is createdAt,desc (most recently created first).
+    Other useful sorts: dueDate,asc, dueDate,desc, createdAt,asc.
+
+    Use this when the user asks for tasks that "have a relation", "are linked to an entity",
+    or "have an associated lead/contact/deal/company" without specifying a particular entity ID.
+
+    Each result shows task details and its relation(s) using tenant-specific display names.
     """
     try:
         _reset_api_call_count()
-        filters = [{"field": "associatedLeads", "operator": "equal", "value": int(lead_id)}]
-        return await search_tasks_logic(filters, page, size, sort)
-    except ValueError as e:
-        return f"✗ Invalid lead ID: {e}"
+        return await _search_tasks_with_any_relation_logic(page, size, sort)
     except KylasAPIError as e:
         return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
     except Exception as e:
-        logger.exception("search_tasks_for_lead")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-async def search_tasks_for_contact(
-    contact_id: int,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "dueDate,asc",
-) -> str:
-    """
-    Find tasks associated with a specific contact.
-    Pass the contact ID to get all tasks linked to that contact.
-    Internally filters by associatedContacts field.
-    """
-    try:
-        _reset_api_call_count()
-        filters = [{"field": "associatedContacts", "operator": "equal", "value": int(contact_id)}]
-        return await search_tasks_logic(filters, page, size, sort)
-    except ValueError as e:
-        return f"✗ Invalid contact ID: {e}"
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_tasks_for_contact")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-async def search_tasks_for_deal(
-    deal_id: int,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "dueDate,asc",
-) -> str:
-    """
-    Find tasks associated with a specific deal.
-    Pass the deal ID to get all tasks linked to that deal.
-    Internally filters by associatedDeals field.
-    """
-    try:
-        _reset_api_call_count()
-        filters = [{"field": "associatedDeals", "operator": "equal", "value": int(deal_id)}]
-        return await search_tasks_logic(filters, page, size, sort)
-    except ValueError as e:
-        return f"✗ Invalid deal ID: {e}"
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_tasks_for_deal")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-async def search_tasks_for_company(
-    company_id: int,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "dueDate,asc",
-) -> str:
-    """
-    Find tasks associated with a specific company.
-    Pass the company ID to get all tasks linked to that company.
-    Internally filters by associatedCompanies field.
-    """
-    try:
-        _reset_api_call_count()
-        filters = [{"field": "associatedCompanies", "operator": "equal", "value": int(company_id)}]
-        return await search_tasks_logic(filters, page, size, sort)
-    except ValueError as e:
-        return f"✗ Invalid company ID: {e}"
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_tasks_for_company")
+        logger.exception("search_tasks_with_any_relation")
         return f"✗ Unexpected error: {str(e)}"
 
 
@@ -4094,12 +4121,13 @@ async def get_meeting_field_instructions_logic() -> str:
         "Required fields: title, from, to, participants (at least one user)",
         "",
         "participants: [{\"id\": <user_id>, \"entity\": \"user\"}]",
-        "  - Use lookup_users for users only; use lookup_meeting_invitees to resolve users/leads/contacts/external for meetings",
-        "organizer / invitee by name: call lookup_meeting_invitees first (GET /search/meeting-invitee/lookup), then use the matching id + entity",
+        "  - Use lookup_users for users only; use lookup_meeting_related_entity with entity_type='invitee' to resolve users/leads/contacts/external for meetings",
+        "  - RULES: Leads/contacts must have a valid email to be an invitee. Deals CANNOT be invitees. If user asks for a deal as invitee, omit it and inform them.",
+        "organizer / invitee by name: call lookup_meeting_related_entity with entity_type='invitee' first, then use the matching id + entity",
         "",
         "relatedTo: [{\"id\": <entity_id>, \"entity\": \"lead|contact|deal|company\"}]",
         "  - Links meeting to leads, contacts, deals, or companies",
-        "Meeting search: associatedLeads, associatedContacts, associatedDeals, associatedCompanies — is_null / is_not_null or equal <id> (type long). Resolve ids via lookup_leads_for_meeting, lookup_contacts_for_meeting, lookup_deals_for_meeting, lookup_companies_for_meeting first.",
+        "Meeting search: associatedLeads, associatedContacts, associatedDeals, associatedCompanies — is_null / is_not_null or equal <id> (type long). Resolve ids via lookup_meeting_related_entity first.",
         "",
         "timezone: {\"id\": <tz_picklist_id>, \"name\": \"Asia/Calcutta\"}",
         "  - Use timezone picklist ID from field instructions above",
@@ -4196,7 +4224,6 @@ async def lookup_meeting_invitees_logic(query: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
 async def lookup_meeting_invitees(query: str) -> str:
     """
     Look up meeting invitees and organizer candidates (users, leads, contacts, external).
@@ -4296,7 +4323,6 @@ async def lookup_companies_for_meeting_logic(query: str) -> str:
     return _format_meeting_entity_lookup_result("compan(y/ies)", q, rows)
 
 
-@mcp.tool()
 async def lookup_leads_for_meeting(query: str = "firstName:") -> str:
     """
     Look up leads for meeting association / search filters. GET /search/lead/lookup (Kylas web).
@@ -4316,7 +4342,6 @@ async def lookup_leads_for_meeting(query: str = "firstName:") -> str:
         return f"Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def lookup_contacts_for_meeting(query: str = "firstName:") -> str:
     """
     Look up contacts for meeting association / search filters. GET /search/contact/lookup.
@@ -4335,7 +4360,6 @@ async def lookup_contacts_for_meeting(query: str = "firstName:") -> str:
         return f"Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def lookup_deals_for_meeting(query: str = "name:") -> str:
     """
     Look up deals for meeting association / search filters. GET /search/deal/lookup.
@@ -4354,7 +4378,6 @@ async def lookup_deals_for_meeting(query: str = "name:") -> str:
         return f"Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def lookup_companies_for_meeting(query: str = "comp:") -> str:
     """
     Look up companies for meeting association / search filters. GET /companies/lookup?view=meeting.
@@ -4383,6 +4406,7 @@ _MEETING_SEARCH_SYNTHETIC_FILTERABLE: Dict[str, Dict[str, Any]] = {
     "associatedContacts": {"type": "LOOK_UP", "standard": True},
     "associatedDeals": {"type": "LOOK_UP", "standard": True},
     "associatedCompanies": {"type": "LOOK_UP", "standard": True},
+    "participants": {"type": "PARTICIPANTS_LOOKUP", "standard": True},
 }
 
 
@@ -4466,6 +4490,13 @@ async def create_meeting_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
         raise KylasAPIError("'to' datetime is required for creating a meeting")
     if not payload.get("participants"):
         raise KylasAPIError("participants is required (at least one user). Use [{\"id\": <user_id>, \"entity\": \"user\"}]")
+        
+    # Strip deals from participants
+    if "participants" in payload and isinstance(payload["participants"], list):
+        filtered_participants = [p for p in payload["participants"] if p.get("entity") != "deal"]
+        if not filtered_participants:
+            raise KylasAPIError("participants is required and cannot be a deal. Deals cannot be invitees.")
+        payload["participants"] = filtered_participants
 
     logger.info("Creating meeting: %s", payload.get("title", ""))
     async with get_client() as client:
@@ -4488,7 +4519,8 @@ async def create_meeting(field_values: Dict[str, Any]) -> str:
     - to (str, REQUIRED): End datetime in UTC ISO format
     - allDay (bool): Whether it's an all-day meeting (default false)
     - participants (list, REQUIRED): List of invitees, e.g. [{"id": 2530, "entity": "user"}]
-      Use lookup_users to find user IDs.
+      Use lookup_meeting_related_entity with entity_type='invitee' to find participant details.
+      RULES: Leads/contacts MUST have a valid email. Deals CANNOT be added. Inform the user if they asked to add a deal.
     - relatedTo (list): Related entities, e.g. [{"id": 150, "entity": "contact"}, {"id": 169, "entity": "deal"}]
       Entity can be: "lead", "contact", "deal", "company"
     - timezone (dict): e.g. {"id": 372, "name": "Asia/Calcutta"} — get ID from get_meeting_field_instructions
@@ -4529,7 +4561,7 @@ async def update_meeting_logic(meeting_id: int, field_values: Dict[str, Any]) ->
                 existing_participants = merged.get("participants", []) or []
                 existing_keys = {(p.get("id"), p.get("entity")) for p in existing_participants if isinstance(p, dict)}
                 for p in value:
-                    if isinstance(p, dict) and (p.get("id"), p.get("entity")) not in existing_keys:
+                    if isinstance(p, dict) and p.get("entity") != "deal" and (p.get("id"), p.get("entity")) not in existing_keys:
                         existing_participants.append(p)
                 merged["participants"] = existing_participants
             elif key == "relatedTo" and isinstance(value, list):
@@ -4778,6 +4810,42 @@ async def search_meetings_logic(
     return "\n".join(lines)
 
 
+@mcp.tool()
+async def lookup_meeting_related_entity(entity_type: str, query: str = "") -> str:
+    """
+    Look up related entities or invitees for meeting association / search filters.
+    
+    Call this FIRST when the user wants meetings linked to a specific entity or person by name.
+    
+    entity_type (str): One of "lead", "contact", "deal", "company", or "invitee".
+      - For lead/contact/deal/company, use the returned ID with search_meetings on field:
+        associatedLeads, associatedContacts, associatedDeals, associatedCompanies.
+      - For invitee, use the FULL RETURNED OBJECT (e.g., {"id": 123, "entity": "lead", "name": "...", "emails": [...]})
+        with search_meetings on the `participants` field with operator `in`.
+    
+    query (str): Lookup search string (e.g., "firstName:John" or "comp:Acme"). Leave empty for default.
+    """
+    try:
+        _reset_api_call_count()
+        entity_type = entity_type.strip().lower()
+        if entity_type == "lead":
+            return await lookup_leads_for_meeting_logic(query or "firstName:")
+        elif entity_type == "contact":
+            return await lookup_contacts_for_meeting_logic(query or "firstName:")
+        elif entity_type == "deal":
+            return await lookup_deals_for_meeting_logic(query or "name:")
+        elif entity_type == "company":
+            return await lookup_companies_for_meeting_logic(query or "comp:")
+        elif entity_type == "invitee":
+            return await lookup_meeting_invitees_logic(query)
+        else:
+            return f"Error: Unsupported entity_type '{entity_type}'. Must be lead, contact, deal, company, or invitee."
+    except KylasAPIError as e:
+        return f"Error: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("lookup_meeting_related_entity")
+        return f"Unexpected error: {str(e)}"
+
 async def search_meetings(
     filters: List[Dict[str, Any]],
     page: int = 0,
@@ -4786,14 +4854,16 @@ async def search_meetings(
 ) -> str:
     """
     Search/filter meetings. Use [FILTERABLE] from get_meeting_field_instructions, plus synthetic fields:
-    associatedLeads, associatedContacts, associatedDeals, associatedCompanies (long; equal / is_null / is_not_null).
-    Resolve entity ids with lookup_leads_for_meeting, lookup_contacts_for_meeting, lookup_deals_for_meeting,
-    lookup_companies_for_meeting before filtering by equal.
+    associatedLeads, associatedContacts, associatedDeals, associatedCompanies (long; equal / is_null / is_not_null),
+    and participants (participants_lookup; in / not_in).
+    
+    Resolve entity ids or participant objects with lookup_meeting_related_entity before filtering.
+    For `participants`, value MUST be a list containing the full participant object from lookup_meeting_related_entity.
 
     filters: List of filter objects. Each must have:
-      - field (str): e.g. title, status, from, owner, associatedLeads, associatedContacts, associatedDeals, associatedCompanies.
-      - operator (str): e.g. equal, contains, is_null, is_not_null.
-      - value: For status use internal name. For associated* equal, numeric id. For is_null / is_not_null, omit or null.
+      - field (str): e.g. title, status, from, owner, associatedLeads, participants.
+      - operator (str): e.g. equal, contains, in.
+      - value: For status use internal name. For associated* equal, numeric id. For participants, list of full objects.
       - timeZone (str, optional): For date/datetime filters.
     page: 0-based page (default 0).
     size: Page size, max 100 (default 20).
@@ -5760,7 +5830,7 @@ _ENTITY_CONFIG = {
         "idle_fn": None,
         "search_fields": None,
         "search_endpoint": "/meetings/search",
-        "search_page_offset": 1,
+        "search_page_offset": 0,
         "search_rule_builder": _build_meeting_search_json_rule,
         "normalize": False,
         "field_fmt": "meeting",
@@ -5771,7 +5841,7 @@ _ENTITY_CONFIG = {
         "idle_fn": None,
         "search_fields": None,
         "search_endpoint": "/call-logs/search",
-        "search_page_offset": 1,
+        "search_page_offset": 0,
         "search_rule_builder": _build_call_log_search_json_rule,
         "normalize": False,
         "field_fmt": "meeting",
