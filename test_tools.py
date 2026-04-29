@@ -1054,5 +1054,69 @@ def test_search_tasks_with_any_relation_post_merge_sort():
     assert all_tasks[2]["id"] == 2, "Aug last"
 
 
+# ---------------------------------------------------------------------------
+# User-Agent / MCP client name Tests
+# ---------------------------------------------------------------------------
+
+def _make_mock_context(client_name: str, client_version: str):
+    """Build a mock fastmcp Context with clientInfo populated."""
+    mock_client_info = MagicMock()
+    mock_client_info.name = client_name
+    mock_client_info.version = client_version
+
+    mock_client_params = MagicMock()
+    mock_client_params.clientInfo = mock_client_info
+
+    mock_session = MagicMock()
+    mock_session.client_params = mock_client_params
+
+    mock_ctx = MagicMock()
+    mock_ctx.session = mock_session
+    return mock_ctx
+
+
+def test_get_mcp_client_name_with_name_and_version():
+    """Returns 'Name(version)' when both client name and version are present."""
+    mock_ctx = _make_mock_context("Claude Desktop", "1.2.3")
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+        result = main._get_mcp_client_name()
+    assert result == "Claude Desktop(1.2.3)"
+
+
+def test_get_mcp_client_name_without_version():
+    """Returns just the name when version is empty."""
+    mock_ctx = _make_mock_context("cursor", "")
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+        result = main._get_mcp_client_name()
+    assert result == "cursor"
+
+
+def test_get_mcp_client_name_outside_request_context():
+    """Returns 'unknown' when called outside a request (get_context raises)."""
+    with patch.object(main.mcp, "get_context", side_effect=LookupError):
+        result = main._get_mcp_client_name()
+    assert result == "unknown"
+
+
+def test_get_mcp_client_name_no_client_params():
+    """Returns 'unknown' when session has no client_params."""
+    mock_session = MagicMock()
+    mock_session.client_params = None
+    mock_ctx = MagicMock()
+    mock_ctx.session = mock_session
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+        result = main._get_mcp_client_name()
+    assert result == "unknown"
+
+
+def test_throttled_client_context_user_agent_format():
+    """User-Agent header must be 'kylas_mcp_server({version}) on {client}'."""
+    with patch("main._resolve_api_key", return_value="test-key"), \
+         patch("main._get_mcp_client_name", return_value="Claude Desktop(1.2.3)"):
+        ctx = main._ThrottledClientContext()
+        ua = ctx._raw.headers.get("user-agent")
+    assert ua == f"kylas_mcp_server({main.SERVER_VERSION}) on Claude Desktop(1.2.3)"
+
+
 if __name__ == "__main__":
     asyncio.run(run_manual_tests())

@@ -33,6 +33,7 @@ import random
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from importlib.metadata import version as _pkg_version
 from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
@@ -56,6 +57,7 @@ logger = logging.getLogger("kylas-mcp")
 
 BASE_URL = os.getenv("KYLAS_BASE_URL", "https://api.kylas.io/v1")
 API_KEY = os.getenv("KYLAS_API_KEY")
+SERVER_VERSION = _pkg_version("kylas-crm-mcp-server")
 
 
 # ---------------------------------------------------------------------------
@@ -484,11 +486,19 @@ class KylasAPIError(Exception):
 
 def _get_mcp_client_name() -> str:
     """
-    Resolve the MCP client name (e.g. cursor, claude) from request context or HTTP User-Agent.
-    Used for the outbound User-Agent to Kylas: kylas_mcp_server/{clientName}.
+    Resolve the MCP client identifier from the MCP initialize handshake.
+    Returns '{name}/{version}' (e.g. 'Claude Desktop/1.2.3') or 'unknown'.
+    Used for the outbound User-Agent to Kylas: kylas_mcp_server/{clientName}/{clientVersion}.
     """
-    # Note: get_context() and get_http_request() not available in fastmcp 2.0
-    # Gracefully fall back to "unknown"
+    try:
+        ctx = mcp.get_context()
+        client_params = ctx.session.client_params
+        if client_params and client_params.clientInfo:
+            name = client_params.clientInfo.name or "unknown"
+            version = client_params.clientInfo.version or ""
+            return f"{name}({version})" if version else name
+    except Exception:
+        pass
     return "unknown"
 
 
@@ -508,7 +518,7 @@ class _ThrottledClientContext:
     def __init__(self) -> None:
         api_key = _resolve_api_key()
         client_name = _get_mcp_client_name()
-        user_agent = f"kylas_mcp_server/{client_name}"
+        user_agent = f"kylas_mcp_server({SERVER_VERSION}) on {client_name}"
         self._raw = httpx.AsyncClient(
             base_url=BASE_URL,
             headers={
