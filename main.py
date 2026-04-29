@@ -6,20 +6,19 @@ Model Context Protocol server for Kylas CRM operations:
 LEAD OPERATIONS:
 - get_lead_field_instructions (call FIRST to get schema)
 - create_lead, update_lead, get_lead
-- search_leads (filter by criteria)
-- search_idle_leads (no activity for N days)
+- search_entity("lead", filters) (filter by criteria)
+- search_idle_entities("lead", days) (no activity for N days)
 - lookup_pipelines, get_pipeline_stages, get_pipeline_details
 
 CONTACT OPERATIONS:
 - get_contact_field_instructions (call FIRST to get schema)
 - create_contact, update_contact, get_contact
-- search_contacts (filter by criteria - NO PIPELINE)
+- search_entity("contact", filters) (filter by criteria - NO PIPELINE)
 
 TASK OPERATIONS:
 - get_task_field_instructions (call FIRST to get schema)
 - create_task, update_task, get_task
-- search_tasks (filter by criteria - NO PIPELINE)
-- search_tasks_for_lead, search_tasks_for_contact, search_tasks_for_deal, search_tasks_for_company (find tasks associated with entity)
+- search_tasks (filter by criteria - NO PIPELINE; use associatedLeads/Contacts/Deals/Companies filter for entity-linked tasks)
 
 SHARED TOOLS (for all Lead, Contact, Task):
 - get_current_user (timezone, ID; use for date/datetime handling)
@@ -32,6 +31,7 @@ import asyncio
 import os
 import random
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo
@@ -67,6 +67,9 @@ def _get_default_timezone() -> str:
 
 DEFAULT_TIMEZONE = _get_default_timezone()
 
+# Entity label mapping (tenant-specific display names)
+_ENTITY_LABELS: Dict[str, Dict[str, str]] = {}
+
 
 def _threshold_iso_days_ago(days: int, time_zone: str) -> str:
     """Return (now - days) in the given timezone as ISO string (UTC with Z)."""
@@ -79,6 +82,91 @@ def _threshold_iso_days_ago(days: int, time_zone: str) -> str:
     return threshold.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) -> str:
+    """
+    Format entity labels as action-oriented routing rules for system instructions.
+    Returns empty string if no labels.
+    """
+    if not labels:
+        return ""
+
+    lines = [
+        "## ENTITY NAME ROUTING — CALL get_entity_labels() FIRST, THEN USE THESE RULES",
+        "",
+        "This tenant has renamed CRM entities. When the user mentions any of the names below,",
+        "call get_entity_labels() to confirm, then use the standard type for all tool calls:",
+        "",
+    ]
+
+    for entity_type in sorted(labels.keys()):
+        label_data = labels[entity_type]
+        display_name = label_data.get("displayName", entity_type)
+        display_plural = label_data.get("displayNamePlural", entity_type)
+        std_type = entity_type.lower()
+        lines.append(
+            f'- If user says "{display_name}" or "{display_plural}" → call get_entity_labels(), '
+            f'then use standard type "{std_type}" in all tool calls'
+        )
+
+    lines.append("")
+    lines.append('DO NOT tell the user an entity "doesn\'t exist" before calling get_entity_labels().')
+
+    return "\n".join(lines)
+
+
+async def _load_entity_labels() -> Dict[str, Dict[str, str]]:
+    """
+    Fetch entity labels from /v1/entities/label endpoint.
+    Returns mapping like: {"LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"}, ...}
+    Returns empty dict if fetch fails.
+    """
+    global _ENTITY_LABELS
+    try:
+        async with get_client() as client:
+            resp = await client.get(f"{BASE_URL}/entities/label")
+            _ENTITY_LABELS = resp.json()
+            # Log with display names in clear format
+            logger.info("Loaded entity labels:")
+            for entity_type in sorted(_ENTITY_LABELS.keys()):
+                label_data = _ENTITY_LABELS[entity_type]
+                display_name = label_data.get("displayName", entity_type)
+                display_plural = label_data.get("displayNamePlural", entity_type)
+                logger.info(f"  {entity_type} => {display_name}, {display_plural}")
+            return _ENTITY_LABELS
+    except Exception as e:
+        logger.warning(f"Failed to load entity labels: {e}")
+        _ENTITY_LABELS = {}
+        return {}
+
+
+async def _label_refresh_loop(interval_seconds: int = 1800) -> None:
+    """
+    Background task: periodically refresh entity labels.
+    Default interval: 1800 seconds (30 minutes).
+    Runs forever until cancelled. Updates _ENTITY_LABELS in-place and
+    rebuilds MCP server instructions so new labels are picked up immediately.
+    """
+    global _ENTITY_LABELS
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            logger.debug("Refreshing entity labels...")
+            async with get_client() as client:
+                resp = await client.get(f"{BASE_URL}/entities/label")
+                new_labels = resp.json()
+                _ENTITY_LABELS.clear()
+                _ENTITY_LABELS.update(new_labels)
+                logger.info(f"Refreshed entity labels: {list(_ENTITY_LABELS.keys())}")
+                mcp._mcp_server.instructions = _build_instructions()
+                _update_tool_description(mcp)
+                _patch_entity_tool_descriptions(mcp)
+        except asyncio.CancelledError:
+            logger.info("Label refresh loop cancelled")
+            break
+        except Exception as e:
+            logger.warning(f"Label refresh failed: {e}. Keeping cached labels.")
+
+
 if not API_KEY:
     logger.info("KYLAS_API_KEY not set. Server will rely on per-request 'x-api-key' header.")
 
@@ -89,154 +177,121 @@ if not API_KEY:
 SYSTEM_INSTRUCTIONS = """
 # Kylas CRM MCP Server - Lead, Contact & Task Support
 
-## ⚠️ MANDATORY SESSION RULE — READ THIS FIRST
+## ⚠️ MANDATORY SESSION RULES — READ FIRST
 
-**For ANY entity, call its field instructions tool ONCE per session — the very first time you interact with that entity. After that, reuse the field schema already in context; do NOT call it again for subsequent queries on the same entity.**
+### Rule 0 — Call first, every session
+Call `get_entity_labels()` IMMEDIATELY at the start of every session before anything else.
+This tenant uses custom names for CRM entities. Without this, you will misidentify entity requests.
 
-| Entity    | Call ONCE per session (first interaction only) |
-|-----------|------------------------------------------------|
-| Lead      | `get_lead_field_instructions`                  |
-| Contact   | `get_contact_field_instructions`               |
-| Task      | `get_task_field_instructions`                  |
-| Deal      | `get_deal_field_instructions`                  |
-| Company   | `get_company_field_instructions`               |
-| Meeting   | `get_meeting_field_instructions`               |
-| Call Log  | `get_call_log_field_instructions`              |
+### Rule 1 — Entity field schemas (once per session)
+Call each entity’s field instructions tool the FIRST time you interact with that entity. Do NOT call it again for subsequent operations on the same entity in the same session.
 
-**Why:** All field API names, custom field IDs, and picklist option IDs are tenant-specific. You need this schema once to correctly build field_values. Once fetched, the schema is in your context — do not fetch it again for the same entity in the same session.
-
-**Example:** User asks "show leads" → call `get_lead_field_instructions` then `search_leads`. User then asks "show leads again" → skip `get_lead_field_instructions` (already fetched), call `search_leads` directly.
+| Entity    | Tool (call once per session)       |
+|-----------|------------------------------------|
+| Lead      | `get_lead_field_instructions`      |
+| Contact   | `get_contact_field_instructions`   |
+| Task      | `get_task_field_instructions`      |
+| Deal      | `get_deal_field_instructions`      |
+| Company   | `get_company_field_instructions`   |
+| Meeting   | `get_meeting_field_instructions`   |
+| Call Log  | `get_call_log_field_instructions`  |
 
 ---
 
-## ⚠️ DEFAULT DATE RANGE RULE — "SHOW ALL" / "GIVE ALL" QUERIES
+## 🚨 ENTITY LABEL MAPPING (Tenant-Customized Names)
 
-**When the user asks for "all" records of any entity (e.g. "show all leads", "give all deals", "list all contacts") WITHOUT specifying a date range, ALWAYS apply a default filter: `createdAt` in the last 3 months.**
+Before saying "Kylas doesn’t have X entity", check this mapping first. If the user’s entity name is found here, use the standard type for all tool calls. Only say "entity not found" if the name is absent from both this mapping and the standard types.
 
-- Do NOT fetch all records without a date filter — this could return thousands of records.
-- Compute the 3-month threshold as: today minus 90 days, in the user's timezone (call `get_current_user` first if timezone is not yet known).
-- Use `updatedAt` with operator `greater_or_equal` and value = (today − 90 days) ISO string.
-- If the user explicitly provides a date range (e.g. "show leads from Jan to March"), use that instead — do not override it with the 3-month default.
-- Inform the user that results are filtered to the last 3 months, e.g.: *"Showing leads updated in the last 3 months. Specify a date range if you need older records."*
+{ENTITY_LABEL_MAPPING}
 
-**Example:**
-- User: "show all leads" → apply `updatedAt >= (today - 90 days)` filter automatically.
-- User: "show all leads from last year" → use the user-specified range, not the 3-month default.
+---
 
-## CRITICAL: Workflow (applies to Lead, Contact, and Task)
+## DEFAULT DATE RANGE — "SHOW ALL" / "GIVE ALL" QUERIES
 
-### Step 1: ALWAYS call `get_<entity>_field_instructions` FIRST
-Before creating a lead, contact, or task, you MUST call the appropriate field instructions tool:
-- **For Leads:** `get_lead_field_instructions`
-- **For Contacts:** `get_contact_field_instructions`
-- **For Tasks:** `get_task_field_instructions`
+When the user asks for "all" records without a date range, apply `updatedAt ≥ (today − 90 days)`.
+- **Never use `search_entity_by_term` with `"*"` or blank** — returns no results.
+- Call `get_current_user` first if timezone is unknown.
+- Tell the user: *"Showing records updated in the last 3 months. Specify a date range for older records."*
+- If the user specifies a date range, use that instead.
 
-This provides:
-- All available lead fields (standard and custom)
-- API names for standard fields (e.g. firstName, lastName, emails, companyName)
-- Field IDs for custom fields (e.g. "57256")
-- Picklist option IDs for dropdowns (e.g. leadSource: 12345)
+Use `search_entity(entity_type, [{"field": "updatedAt", "operator": "greater_or_equal", "value": "<ISO>"}])` where `entity_type` is one of: `lead`, `contact`, `task`, `deal`, `company`, `meeting`.
 
-### Step 2: Create/Update Lead, Contact, or Task from user context only
-- Do NOT use a fixed list of fields. Infer from the user's message what they want to create or update.
-- Build `field_values` with ONLY the fields the user provided or implied.
-- For **update_lead**, **update_contact**, or **update_task**: pass the entity ID (e.g. from search results) and the fields to update; same field_values format as create. For owner/ownerId use user ID from lookup_users.
-- **Important differences:**
-  - **Contacts do NOT have:** pipeline, pipelineStage fields (Lead-specific)
-  - **Tasks do NOT have:** pipeline, pipelineStage fields (Lead-specific)
-  - Use only entity-specific fields from field instructions
-- Keys: use API Name for standard fields (from cheat sheet), or Field ID string for custom fields.
-- Values: use the exact format expected by Kylas (see below).
+---
 
-### Field value formats (from Kylas API)
-- **Standard fields** (firstName, lastName, companyName, isNew, etc.): use API name as key at top level.
-- **emails**: array of objects (types OFFICE, PERSONAL only; exactly one must be primary). Or pass "email": "user@example.com" to normalize (OFFICE, primary). First entry is primary by default.
-- **phoneNumbers**: array of objects (types MOBILE, WORK, HOME, PERSONAL only; exactly one must be primary; "code" = 2-letter country e.g. IN, US). Or pass "phone": "5551234567". You MUST also pass "phone_country_code": "IN" or "+91" at the top level whenever any phone is included. **If the user gave phone number(s) but did NOT specify country or dial code: do NOT call create_lead.** Reply asking for country/dial code (e.g. "Which country or dial code should I use for these phone numbers? (e.g. India: IN or +91, US: +1)"). Only after the user provides it, call create_lead with that phone_country_code. Do not infer country from currency (e.g. INR), locale, or number format—always ask. First entry is primary by default.
-- **Picklist fields** (e.g. leadSource, salutation): use the **Option ID** (number) from the cheat sheet.
-- **Custom fields**: MUST go in "customFieldValues" with **internal name** as key (e.g. "customFieldValues": {"cfLeadCheck": "Checked"}). Never use field ID as the key in the request—the API expects internal names (e.g. cfLeadCheck). If you pass a field ID by mistake, the server will resolve it to the internal name automatically. From the cheat sheet, use the "Field ID" only to identify the field; for the payload use the field's **name** (internal/API name) in customFieldValues.
+## COMMON RULES (apply to all entities)
 
-### NEVER guess IDs
-- Always use the cheat sheet from `get_lead_field_instructions` for API names and IDs.
-- Omit any field the user did not mention; do not add static/default fields.
+### Building field_values
+- Use ONLY fields the user provided — no defaults, no extras.
+- Keys: API name for standard fields, or field ID string for custom fields.
+- Custom fields: `"customFieldValues": {"<internalName>": <value>}` — never use field ID as the key.
 
-### Search/Filter leads
-- **By specific field:** When the user specifies a field (e.g. "leads where phone number is X", "leads where first name is John"), use **search_leads** with the appropriate filter(s).
-- Call `get_lead_field_instructions` first to see which fields are **filterable** (marked in cheat sheet) when using search_leads.
-- Only fields with filterable=true can be used in search_leads filters.
-- For PICK_LIST/MULTI_PICKLIST: use **Option ID** (number) in filter value, except for: requirementCurrency, companyBusinessType, country, timezone, companyIndustry — for these use **internal name** (string).
-- Use the correct operator for the field type (see operator list in search_leads docstring).
+### Emails
+Shorthand: `"email": "user@example.com"` (normalized to OFFICE/primary).
+Full: `[{"email": "...", "type": "OFFICE|PERSONAL", "primary": true}]`
 
-### User look-up fields (createdBy, updatedBy, convertedBy, ownerId, importedBy)
-- These fields reference **users**; filter value must be the **user ID** (number), not the name.
-- When the user asks e.g. "leads where created by is Last": (1) Call **lookup_users** with query in field:value form (e.g. "firstName:Last" or "name:Last"). (2) If **more than one** user is returned, ask the user explicitly which person they mean and list the matches (id and name). (3) Once exactly one user is identified, call **search_leads** with filter e.g. {"field": "createdBy", "operator": "equal", "value": <user_id>}.
-- Do not guess user IDs; always use lookup_users first when filtering by created by / updated by / owner / imported by / converted by.
+### Phone numbers
+Full: `[{"number": "...", "type": "MOBILE|WORK|HOME|PERSONAL", "code": "IN", "primary": true}]`
+Shorthand: `"phone": "5551234567"` + top-level `"phone_country_code": "IN"` (required whenever phone is included).
+**If user gives phone but NO country/dial code: do NOT create/update — ask first. Never infer from currency, locale, or number format.**
 
-### Product filter (products field)
-- The **products** field on leads references products; filter value must be the **product ID** (number), not the name.
-- When the user asks e.g. "leads with product X" or "leads that have product Y": (1) Call **lookup_products** with query e.g. "name:X" or "name:Y". (2) If **more than one** product is returned, ask the user which product they mean and list the matches (id and name). (3) Once exactly one product is identified, call **search_leads** with filter {"field": "products", "operator": "equal", "value": <product_id>}.
-- Do not guess product IDs; always use lookup_products first when filtering by product name.
+### Picklist fields
+Use **Option ID** (number) from cheat sheet. Exceptions — use **internal name** (string): `requirementCurrency`, `companyBusinessType`, `country`, `timezone`, `companyIndustry`.
 
-### Pipeline and pipeline stage (create, update, search)
+### Date / datetime fields
+1. Call `get_current_user` to get user’s timezone (e.g. `Asia/Calcutta`).
+2. **Create/update:** call `parse_datetime_to_utc_iso_tool(datetime_string, timezone)` → use the returned UTC ISO string in field_values.
+3. **Filter/search:** keep value in user’s timezone; pass `timeZone` in the filter (or omit — server uses it). Do NOT convert filter values to UTC.
 
-**Always resolve pipeline first when stage is involved.** Call **lookup_pipelines** (entityType=LEAD); do **not** call get_pipeline_stages until the user has confirmed which pipeline.
+### Never guess IDs — always resolve first
+- **Users** (createdBy, updatedBy, ownerId, assignedTo, etc.): call `lookup_users(query)`. If multiple matches, list them and ask user to pick.
+- **Products**: call `lookup_products(query)`. If multiple matches, list and ask.
+- **Entity IDs** (for association filters — associatedLeads, associatedDeals, etc.): search for the entity first to get its real ID. Never invent IDs — this causes hallucinated results.
+  - Example: "contacts associated with deals from Acme" → search deals for "Acme" first, confirm which deal, then search contacts by that deal ID.
 
-- **If there are multiple pipelines:** Always list them (id and name) and ask which pipeline the user means. Even if the user says "default lead pipeline", there may be more than one—ask explicitly (e.g. "Do you mean 'Default Lead Pipeline' (id 996) or 'new PIpeline' (id 1232)?").
-- **If there is only one pipeline:** Still ask for confirmation (e.g. "I found one pipeline: [name]. Should I use this one?") before calling get_pipeline_stages or updating the lead.
-- **After confirmation only:** Call **get_pipeline_stages** with that pipeline ID, then map stage intent (e.g. "open" → OPEN, "won" → CLOSED_WON) and use that pipeline + stage in create_lead, update_lead, or search_leads as below.
+---
 
-**Create lead with stage** (e.g. "create lead with open stage"):
-- User must confirm which pipeline before creating. Follow the rules above (list pipelines, get confirmation; if only one pipeline, still confirm). Then get_pipeline_stages for that pipeline, pick the matching stage (e.g. Open), and include pipeline + pipelineStage (or pipeline object with stage) in create_lead field_values.
+## Lead Operations
 
-**Move lead to a pipeline stage** (e.g. "move this lead to Open", "set stage to Won"):
-- **Use `update_lead(lead_id, {"pipelineStage": stage_id})` to move a lead to a specific pipeline stage.**
-- If the user did **not** specify which pipeline: call lookup_pipelines, list pipelines, and ask which pipeline to use. Then call get_pipeline_stages for that pipeline.
-- Once the user confirms the pipeline and stage, call **update_lead** with the lead_id and field_values `{"pipelineStage": stage_id}` from get_pipeline_stages.
-- The tool automatically fetches the correct `forecastingType` for the stage and sends the full lead object.
-- If the lead **already has a pipeline** and the user is moving to a **different pipeline**: ask for confirmation first (e.g. "This lead is in [current pipeline]. Move it to [new pipeline]?").
-- If only one pipeline exists and user didn’t name it: still ask for confirmation.
-- **When moving to Closed Lost or Closed Unqualified:** A closing reason may be required (check with get_pipeline_details). If required, ask the user to pick a reason from lostReasons or unqualifiedReasons, then call update_lead with both `{"pipelineStage": stage_id, "pipelineStageReason": reason_string}`.
+### Create / Update
+Build `field_values` from user input only. For `update_lead`: pass lead ID from search results + fields to update.
 
-**Search/filter by stage** (e.g. "open leads", "closed leads", "leads in Won"):
-- Same as above: ask for pipeline first (list and get confirmation), then get_pipeline_stages, then search_leads with pipeline + pipelineStage filters.
-- Do not guess pipeline or pipeline stage IDs.
+### Search / Filter
+- Use `search_entity("lead", filters)`. Only `filterable=true` fields (from cheat sheet) are allowed.
+- PICK_LIST/MULTI_PICKLIST: use Option ID, except `requirementCurrency`, `companyBusinessType`, `country`, `timezone`, `companyIndustry` → use internal name.
 
-### Idle / Stagnant leads (no activity for N days)
-- "Idle" or "stagnant" means no activity on the lead for at least N days. Use **last activity** = the **later** of `updatedAt` and `latestActivityCreatedAt`; the lead is idle if that date is before (today − N days).
-- Since the API cannot filter on "max of two fields", use **both** conditions: `updatedAt` ≤ threshold **and** `latestActivityCreatedAt` ≤ threshold (threshold = now − N days in ISO). That way the lead is returned only when both dates are old, i.e. the effective last activity is before the threshold.
-- Prefer the **search_idle_leads** tool when the user asks for idle/stagnant/inactive leads (e.g. "no activity since 10 days"). Otherwise build search_leads filters as above with operator "less_or_equal" and value = ISO date string for (now − N days).
+### Pipeline and Stage
+1. Call `lookup_pipelines(entityType="LEAD")` first.
+2. Multiple pipelines → list them and ask. Single pipeline → still confirm before proceeding.
+3. After confirmation: `get_pipeline_stages(pipeline_id)` → map intent to stage → use in create/update/search.
+4. **Move to stage:** `update_lead(lead_id, {"pipelineStage": stage_id})`
+5. **Closed Lost / Closed Unqualified:** call `get_pipeline_details` for closing reasons; ask user to pick, then pass `{"pipelineStage": stage_id, "pipelineStageReason": reason}`.
+6. If lead already has a pipeline and user moves to a different one: confirm first.
 
-### Contact-Specific Operations (NO PIPELINE/STAGE)
-- **Search Contacts:** Use `search_contacts` with filters. **IMPORTANT:** Contacts do NOT support pipeline or pipelineStage filters.
-- **Update Contact:** Use `update_contact` with contact ID and field_values. Same field format as create_contact.
-- **Fields available:** firstName, lastName, emails, phoneNumbers, department, designation, company, ownerId, custom fields, etc.
-- **Fields NOT available:** pipeline, pipelineStage (these are Lead-specific).
-- All other instructions (email/phone normalization, timezone handling, lookup_users, lookup_products, custom fields) apply the same to contacts as leads.
+### Idle / Stagnant Leads
+Use `search_idle_entities("lead", days)` for "no activity for N days" queries.
+Fallback: `search_entity("lead", [...])` with `updatedAt ≤ threshold AND latestActivityCreatedAt ≤ threshold`.
 
-### Task-Specific Operations (NO PIPELINE/STAGE)
-- **Create Task with Entity Association:** When creating a task on a lead, contact, deal, or company, include the **"relation"** field:
-  ```json
-  "relation": [
-    {"targetEntityId": <id>, "targetEntityType": "LEAD|CONTACT|DEAL|COMPANY", "targetEntityName": "<entity_name>"}
-  ]
-  ```
-  Example: `create_task({"name": "Follow up", "relation": [{"targetEntityId": 45089710, "targetEntityType": "LEAD", "targetEntityName": "John Doe"}]})`
-- **Search Tasks:** Use `search_tasks` with filters. **IMPORTANT:** Tasks do NOT support pipeline or pipelineStage filters.
-- **Update Task:** Use `update_task` with task ID and field_values. Same field format as create_task (including relation if updating associations).
-- **Fields available:** name, description, status, priority, dueDate, assignedTo, reminder, relation, custom fields, etc.
-- **Fields NOT available:** pipeline, pipelineStage (these are Lead-specific), emails, phoneNumbers (Contact-specific).
-- All other instructions (timezone handling, lookup_users, lookup_products, custom fields) apply the same to tasks.
+---
 
-### Task Association Filters (finding tasks for a specific entity)
-- **Find tasks for a Lead:** Use `search_tasks_for_lead` with the lead ID. Internally filters by `associatedLeads` field.
-- **Find tasks for a Contact:** Use `search_tasks_for_contact` with the contact ID. Internally filters by `associatedContacts` field.
-- **Find tasks for a Deal:** Use `search_tasks_for_deal` with the deal ID. Internally filters by `associatedDeals` field.
-- **Find tasks for a Company:** Use `search_tasks_for_company` with the company ID. Internally filters by `associatedCompanies` field.
-- These are convenience tools; alternatively, use `search_tasks` with filters like `{"field": "associatedLeads", "operator": "equal", "value": <lead_id>}`.
+## Contact Operations
+No pipeline or pipelineStage fields. Use `search_entity("contact", filters)`, `create_contact`, `update_contact`.
+All common rules (phone, email, date, custom fields, ID lookups) apply.
 
-### Date and datetime fields — timezone from current user (GET /users/me)
-- Whenever a **date or datetime** is involved (create lead/contact with a date/datetime field, or filter by date/datetime), call **get_current_user** first to get the user's **timezone** (e.g. Asia/Calcutta).
-- **Creating a lead/contact with a datetime field:** The user gives the datetime in their own timezone (e.g. "11th Feb 2026 at 7:30 AM"). You MUST convert it to UTC before sending: call **get_current_user** → get timezone → call **parse_datetime_to_utc_iso_tool**(user's datetime string, user's timezone) → put the returned UTC ISO string in field_values for that date/datetime field. Do not send the user's local time as-is.
-- **Filtering by date/datetime (search_leads, search_contacts, search_idle_leads):** Use the user's timezone from get_current_user as the **timeZone** in the filter (or rely on the server using it when timeZone is omitted). Keep the date/datetime value as the user said it (in their timezone); do **not** convert filter values to UTC — the API interprets them using the timeZone field.
+---
+
+## Task Operations
+No pipeline, pipelineStage, emails, or phoneNumbers fields.
+
+**Association (link task to an entity):**
+```json
+"relation": [{"targetEntityId": <id>, "targetEntityType": "LEAD|CONTACT|DEAL|COMPANY", "targetEntityName": "<name>"}]
+```
+
+**Filter tasks by entity:**
+- Lead: `search_tasks([{"field": "associatedLeads", "operator": "equal", "value": <lead_id>}])`
+- Contact: `search_tasks([{"field": "associatedContacts", "operator": "equal", "value": <contact_id>}])`
+- Deal: `search_tasks([{"field": "associatedDeals", "operator": "equal", "value": <deal_id>}])`
+- Company: `search_tasks([{"field": "associatedCompanies", "operator": "equal", "value": <company_id>}])`
 """
 
 # ---------------------------------------------------------------------------
@@ -424,74 +479,32 @@ async def handle_api_response(response: httpx.Response, operation: str) -> Dict[
 DEAL_SYSTEM_INSTRUCTIONS = """
 # Kylas CRM MCP Server - Deal Operations
 
-## CRITICAL: Workflow for Deals
+### Create / Update
+Build `field_values` from user input only. For `update_deal`: pass deal ID from search results + fields to update.
 
-### Step 1: ALWAYS call `get_deal_field_instructions` FIRST
-Before creating or updating a deal, you MUST call `get_deal_field_instructions` to get:
-- All available deal fields (standard and custom)
-- API names for standard fields (e.g. name, value, closingDate, dealSource)
-- Field IDs for custom fields (e.g. "57256")
-- Picklist option IDs for dropdowns (e.g. dealSource: 12345)
+### Deal-Specific Field Formats
+- **Monetary fields** (`estimatedValue`, `actualValue`, `value`): must be `{"currencyId": <id>, "value": <number>}`. Never pass a plain number — API will reject it. (e.g. `"estimatedValue": {"currencyId": 431, "value": 32}`)
+- **Owner** (`ownedBy`): `{"id": <user_id>}` — resolve via `lookup_users`. (e.g. `"ownedBy": {"id": 7236}`)
 
-### Step 2: Create/Update deal from user context only
-- Do NOT use a fixed list of fields. Infer from the user's message what they want to create or update.
-- Build `field_values` with ONLY the fields the user provided or implied.
-- For **update_deal**: pass the deal ID (e.g. from search results) and the fields to update; same field_values format as create_deal. For owner/ownerId use user ID from lookup_users.
-- Keys: use API Name for standard fields (from cheat sheet), or Field ID string for custom fields.
-- Values: use the exact format expected by Kylas (see below).
+### Search / Filter
+- Use `search_entity("deal", filters)`. Only `filterable=true` fields (from cheat sheet) are allowed.
+- PICK_LIST exceptions (use internal name string, not Option ID): `currency`, `country`, `dealSource`.
 
-### Field value formats
-- **Standard fields** (name, value, closingDate, dealSource, etc.): use API name as key at top level.
-- **emails**: array of objects (types OFFICE, PERSONAL only; exactly one must be primary). Or pass "email": "user@example.com" to normalize (OFFICE, primary). First entry is primary by default.
-- **phoneNumbers**: array of objects (types MOBILE, WORK, HOME, PERSONAL only; exactly one must be primary; "code" = 2-letter country e.g. IN, US). Or pass "phone": "5551234567". You MUST also pass "phone_country_code": "IN" or "+91" at the top level whenever any phone is included. **If the user gave phone number(s) but did NOT specify country or dial code: do NOT call create_deal.** Reply asking for country/dial code. Only after the user provides it, call create_deal with that phone_country_code.
-- **Picklist fields** (e.g. dealSource, dealStatus): use the **Option ID** (number) from the cheat sheet.
-- **Custom fields**: MUST go in "customFieldValues" with **internal name** as key (e.g. "customFieldValues": {"cfDealStage": "Active"}). Never use field ID as the key in the request—the API expects internal names.
-- **Date/datetime fields**: The user gives the datetime in their own timezone (e.g. "11th Feb 2026 at 7:30 AM"). You MUST convert it to UTC before sending: call **get_current_user** → get timezone → call **parse_datetime_to_utc_iso_tool**(user's datetime string, user's timezone) → put the returned UTC ISO string in field_values for that date/datetime field. Do not send the user's local time as-is.
+### Pipeline and Stage
+- Call `lookup_pipelines(entity_type="DEAL")` first. List pipelines and confirm with user (even if only one).
+- **Move to same-pipeline stage:** `update_deal(deal_id, {"pipelineStage": stage_id})`
+- **Move to different pipeline:** `update_deal(deal_id, {"pipeline": {...}, "forecastingType": "..."})` with full pipeline object including nested stage.
+- Closing reasons (Closed Lost/Unqualified): call `get_pipeline_details`, ask user to pick, then pass `pipelineStageReason`.
 
-### NEVER guess IDs
-- Always use the cheat sheet from `get_deal_field_instructions` for API names and IDs.
-- Omit any field the user did not mention; do not add static/default fields.
+### Idle / Stagnant Deals
+`search_idle_entities("deal", days)` — or `search_entity("deal", [...])` with `updatedAt ≤ threshold AND latestActivityCreatedAt ≤ threshold`.
 
-### Search/Filter deals
-- **By specific field:** When the user specifies a field (e.g. "deals where value is > 10000", "deals where status is Won"), use **search_deals** with the appropriate filter(s).
-- Call `get_deal_field_instructions` first to see which fields are **filterable** (marked in cheat sheet).
-- Only fields with filterable=true can be used in search_deals filters.
-- For PICK_LIST/MULTI_PICKLIST: use **Option ID** (number) in filter value, except for: currency, country, dealSource — for these use **internal name** (string).
-- Use the correct operator for the field type (see operator list in search_deals docstring).
-
-### User look-up fields (createdBy, updatedBy, ownerId, etc.)
-- These fields reference **users**; filter value must be the **user ID** (number), not the name.
-- When the user asks e.g. "deals where owner is John": (1) Call **lookup_users** with query (e.g. "name:John"). (2) If **more than one** user is returned, ask which person. (3) Once exactly one user is identified, call **search_deals** with filter {"field": "ownerId", "operator": "equal", "value": <user_id>}.
-- Do not guess user IDs; always use lookup_users first.
-
-### Pipeline and pipeline stage (create, update, search)
-- **Always resolve pipeline first when stage is involved.**
-- Call **lookup_pipelines** with `entity_type="DEAL"` when resolving a deal pipeline.
-- **To move a deal to a different stage in the same pipeline:** Use `update_deal(deal_id, {"pipelineStage": stage_id})`. The tool automatically updates the nested `pipeline.stage.id` and fetches the correct `forecastingType`.
-- **To move a deal to a completely different pipeline:** Use `update_deal(deal_id, {"pipeline": {...}, "forecastingType": "..."})` with the full pipeline object including nested stage and the matching forecastingType.
-- For closing reasons (Closed Lost, Closed Unqualified): call get_pipeline_details and ask user to pick a reason, then use update_deal with `pipelineStageReason` field.
-- Then follow the same workflow as leads: ask for confirmation, call get_pipeline_stages, get_pipeline_details for closing reasons, etc.
-
-### Date and datetime fields — timezone from current user (GET /users/me)
-- Same as leads: call **get_current_user** first to get timezone.
-- For creating a deal with a datetime field: call parse_datetime_to_utc_iso_tool(user's datetime string, user's timezone).
-- For filtering by date/datetime: use the user's timezone in the filter; do not convert filter values to UTC.
-
-### Idle / Stagnant deals (no activity for N days)
-- "Idle" or "stagnant" means no activity on the deal for at least N days.
-- Use **last activity** = the **later** of `updatedAt` and `latestActivityCreatedAt`.
-- Use **search_deals** with filters: `updatedAt` ≤ threshold **and** `latestActivityCreatedAt` ≤ threshold (threshold = now − N days in ISO).
-
-### Adding products to a deal
-- When the user wants to add a product to a deal, you MUST ask for the following details before calling update_deal or create_deal:
-  1. **Product name** — use `lookup_products` to resolve the product ID. If multiple matches, ask the user which one.
-  2. **Quantity** — how many units (e.g. 10). Ask: "How many units?"
-  3. **Price per unit** — the unit price (e.g. 100). Ask: "What is the price per unit?"
-  4. **Currency** — which currency for the price (e.g. INR, USD). Ask: "Which currency?" (use the currencyId from deal or tenant).
-  5. **Discount** (optional) — discount value and type. Ask: "Any discount? If yes, is it a percentage or flat amount?"
-- Do NOT add a product without confirming price, quantity, and currency with the user first.
-- Product payload format: `{"products": [{"id": <product_id>, "quantity": <qty>, "price": {"currencyId": <currency_id>, "value": <price>}, "discount": {"value": <disc>, "type": "PERCENTAGE"|"FLAT"}}]}`
-- Existing products on the deal are preserved; new products are merged (duplicates by ID are skipped).
+### Adding Products to a Deal
+Before create/update, ask user for: product name (resolve via `lookup_products`), quantity, price per unit, currency, and optional discount. Do NOT add without confirming price, quantity, and currency first.
+```
+{"products": [{"id": <product_id>, "quantity": <qty>, "price": {"currencyId": <id>, "value": <price>}, "discount": {"value": <disc>, "type": "PERCENTAGE|FLAT"}}]}
+```
+Existing products preserved; new products merged (duplicates by ID skipped).
 """
 
 # ---------------------------------------------------------------------------
@@ -501,41 +514,16 @@ Before creating or updating a deal, you MUST call `get_deal_field_instructions` 
 COMPANY_SYSTEM_INSTRUCTIONS = """
 # Kylas CRM MCP Server - Company Operations
 
-## CRITICAL: Workflow for Companies
+### Create / Update
+Build `field_values` from user input only. No pipeline, pipelineStage, associatedContacts, or products fields.
+All common rules apply (phone, email, date, custom fields, ID lookups).
 
-### Step 1: ALWAYS call `get_company_field_instructions` FIRST
-Before creating or updating a company, you MUST call `get_company_field_instructions` to get:
-- All available company fields (standard and custom)
-- API names for standard fields (e.g. name, website, employees)
-- Field IDs for custom fields
-- Picklist option IDs for dropdowns
+### Search / Filter
+- Use `search_entity("company", filters)`. Only `filterable=true` fields (from cheat sheet) allowed.
+- PICK_LIST exception: `country` → use internal name (string), not Option ID.
 
-### Step 2: Create/Update company from user context only
-- Do NOT use a fixed list of fields. Infer from the user's message what they want to create or update.
-- Build `field_values` with ONLY the fields the user provided or implied.
-- For **update_company**: pass the company ID (e.g. from search results) and the fields to update; same field_values format as create_company. For owner/ownerId use user ID from lookup_users.
-- Keys: use API Name for standard fields (from cheat sheet), or Field ID string for custom fields.
-- Values: use the exact format expected by Kylas (see below).
-- **Companies do NOT have:** pipeline, pipelineStage, associatedContacts, products fields.
-
-### Field value formats
-- **Standard fields** (name, website, employees, etc.): use API name as key at top level.
-- **emails**: array of objects (types OFFICE, PERSONAL only; exactly one must be primary). Or pass "email": "user@example.com" to normalize (OFFICE, primary).
-- **phoneNumbers**: array of objects (types MOBILE, WORK, HOME, PERSONAL only; exactly one must be primary; "code" = 2-letter country e.g. IN, US). Or pass "phone": "5551234567". You MUST also pass "phone_country_code": "IN" or "+91" at the top level whenever any phone is included. **If the user gave phone number(s) but did NOT specify country or dial code:** Reply asking for country/dial code first.
-- **Picklist fields**: use the **Option ID** (number) from the cheat sheet.
-- **Custom fields**: MUST go in "customFieldValues" with **internal name** as key.
-
-### NEVER guess IDs
-- Always use the cheat sheet from `get_company_field_instructions` for API names and IDs.
-- Omit any field the user did not mention; do not add static/default fields.
-
-### Search/Filter companies
-- **By specific field:** Use **search_companies** with the appropriate filter(s).
-- Call `get_company_field_instructions` first to see which fields are **filterable**.
-- For PICK_LIST/MULTI_PICKLIST: use **Option ID** (number), except for country — use **internal name** (string).
-
-### Idle / Stagnant companies (no activity for N days)
-- Use **search_companies** with filters: `updatedAt` ≤ threshold **and** `latestActivityCreatedAt` ≤ threshold (threshold = now − N days in ISO).
+### Idle / Stagnant Companies
+`search_idle_entities("company", days)`.
 """
 
 # ---------------------------------------------------------------------------
@@ -545,64 +533,45 @@ Before creating or updating a company, you MUST call `get_company_field_instruct
 MEETING_SYSTEM_INSTRUCTIONS = """
 # Kylas CRM MCP Server - Meeting Operations
 
-## CRITICAL: Workflow for Meetings
+### Create / Update
+Before creating, ask for:
+1. **Title** (required)
+2. **Start/end datetime** (required) — convert to UTC via `get_current_user` + `parse_datetime_to_utc_iso_tool`
+3. **Participants** (required) — resolve via `lookup_meeting_invitees`; pick row with correct `entity` type
+4. **Related entities** (optional) — resolve IDs first via entity lookup tools
+5. **Location**, **allDay** (optional)
 
-### Step 1: ALWAYS call `get_meeting_field_instructions` FIRST
-Before creating or updating a meeting, you MUST call `get_meeting_field_instructions` to get:
-- All available meeting fields (standard and custom)
-- Timezone picklist with IDs
-- Status options (scheduled, missed, conducted, cancelled)
-- Medium options (OFFLINE, GOOGLE, MICROSOFT)
-
-### Step 2: Ask the user for required details
-Before creating a meeting, ask for:
-1. **Title** — meeting title (required)
-2. **Date and time** — start (from) and end (to) datetime (required). Convert to UTC using get_current_user + parse_datetime_to_utc_iso_tool.
-3. **Participants** — who should attend (required). Use **lookup_meeting_invitees** first (or lookup_users for users only). Format: [{"id": user_id, "entity": "user|lead|contact|external"}] per API
-4. **Related entities** (optional) — link to leads, contacts, deals, or companies. Format: [{"id": entity_id, "entity": "lead|contact|deal|company"}]
-5. **Location** (optional) — meeting location
-6. **All day** (optional) — whether it's an all-day meeting
-
-### Create meeting payload format
+### Payload Format
 ```json
 {
-  "title": "Meeting Title",
-  "from": "2024-01-15T08:00:00.000Z",
-  "to": "2024-01-15T08:30:00.000Z",
-  "allDay": false,
+  "title": "...", "from": "<UTC ISO>", "to": "<UTC ISO>", "allDay": false,
   "timezone": {"id": 372, "name": "Asia/Calcutta"},
-  "participants": [{"id": 2530, "entity": "user"}],
-  "relatedTo": [{"id": 150, "entity": "contact"}, {"id": 169, "entity": "deal"}],
-  "location": "Office",
-  "description": "Discussion about project"
+  "participants": [{"id": <user_id>, "entity": "user|lead|contact|external"}],
+  "relatedTo": [{"id": <entity_id>, "entity": "lead|contact|deal|company"}],
+  "location": "Office", "description": "..."
 }
 ```
 
-### NEVER guess IDs
-- Use **lookup_meeting_invitees** when the user mentions organizer or invitees by name (GET /search/meeting-invitee/lookup). Pick the row with the right **entity** (organizer is usually **user**).
-- Use `lookup_users` for plain user ID resolution outside meeting-invitee context
-- Use entity search tools to find IDs for relatedTo (e.g. search_leads_by_term, search_contacts_by_term, search_deals_by_term)
+### Resolving Entity IDs
+- **Participants/organizer:** `lookup_meeting_invitees` (pick row with right `entity` — organizer is usually `user`)
+- **relatedTo leads:** `lookup_leads_for_meeting` → filter `associatedLeads`
+- **relatedTo contacts:** `lookup_contacts_for_meeting` → filter `associatedContacts`
+- **relatedTo deals:** `lookup_deals_for_meeting` → filter `associatedDeals`
+- **relatedTo companies:** `lookup_companies_for_meeting` → filter `associatedCompanies`
+- Combine multiple rules with AND.
 
-### Search/Filter meetings
-- **By associated lead / contact / deal / company:** Always **resolve the entity id first** using the meeting lookup tools (same endpoints as Kylas web), then `search_meetings` with **long** rules:
-  - Lead: **lookup_leads_for_meeting** (GET /search/lead/lookup?q=…, default `firstName:`) → filter `associatedLeads` `equal` `<lead_id>`
-  - Contact: **lookup_contacts_for_meeting** (GET /search/contact/lookup?q=…, default `firstName:`) → `associatedContacts`
-  - Deal: **lookup_deals_for_meeting** (GET /search/deal/lookup?q=…, default `name:`) → `associatedDeals`
-  - Company: **lookup_companies_for_meeting** (GET /companies/lookup?view=meeting&q=…, default `comp:`) → `associatedCompanies`
-  - Combine multiple rules in one jsonRule with **AND** (same as web).
-- **Presence only:** `associatedLeads` / `associatedContacts` / `associatedDeals` / `associatedCompanies` with `is_not_null` or `is_null` and value null.
-- **By organizer:** Call **lookup_meeting_invitees** first, then `search_meetings` with filter `{"field": "organizer", "operator": "equal", "value": <user_id>}` using the **user** row's id (if the API accepts the rule).
-- **By specific field (status, date range, title, etc.):** Use `search_meetings` with filters.
-  - Status filter: use internal name — "scheduled", "conducted", "missed", "cancelled"
-  - Date filters: use from/to fields with operators like "greater", "less", "between"
-- Call `get_meeting_field_instructions` first to see filterable fields.
+### Search / Filter
+- By associated entity: resolve ID first via lookup tool, then `search_entity("meeting", filters)` with association filter.
+- Presence check: `is_not_null` / `is_null` with value null.
+- By organizer: `lookup_meeting_invitees` → `{"field": "organizer", "operator": "equal", "value": <user_id>}`.
+- Status filter: use internal name — "scheduled", "conducted", "missed", "cancelled".
 
-### Cancel vs Delete meetings
-- **cancel_meeting** — changes status to "cancelled" (reversible, meeting record preserved)
-- **delete_meeting** — permanently removes the meeting (irreversible). Confirm with user before deleting.
+### Cancel vs Delete
+- `cancel_meeting` — sets status to "cancelled" (reversible)
+- `delete_meeting` — permanent; confirm with user first.
 
-### Notes on meetings
-- Use `add_note("MEETING", meeting_id, "note text")` to add notes to a meeting.
+### Notes
+`add_note("MEETING", meeting_id, "note text")`
 """
 
 # ---------------------------------------------------------------------------
@@ -612,58 +581,153 @@ Before creating a meeting, ask for:
 CALL_LOG_SYSTEM_INSTRUCTIONS = """
 # Kylas CRM MCP Server - Call Log Operations
 
-## CRITICAL: Workflow for Call Logs
+### Create
+Before creating, ask for:
+1. **Entity** — which lead, contact, or deal? Search to get the ID.
+2. **Phone number**, **call type** (incoming/outgoing), **outcome** (connected/rejected/busy/no_answer/missed_call/in_progress), **start time** (convert to UTC).
+3. **Duration** (seconds) and **notes** — optional.
 
-### Step 1: ALWAYS call `get_call_log_field_instructions` FIRST
-Before creating a call log, you MUST call `get_call_log_field_instructions` to get:
-- All available call log fields
-- Outcome options (connected, rejected, busy, no_answer, missed_call, in_progress)
-- Call type options (incoming, outgoing)
-- Call disposition options
-- Sentiment options
-
-### Step 2: Ask the user for required details before creating
-Before creating a call log, ask for:
-1. **Entity** — which lead, contact, or deal is this call for? Search to get the ID.
-2. **Phone number** — the phone number used in the call
-3. **Call type** — "incoming" or "outgoing"
-4. **Outcome** — "connected", "rejected", "busy", "no_answer", "missed_call", "in_progress"
-5. **Start time** — when did the call start? Convert to UTC.
-6. **Duration** (optional) — how long was the call in seconds?
-7. **Notes** (optional) — any call notes?
-
-### Call log on a Lead
+### Payload — Lead or Contact
 ```json
 {
   "outcome": "connected", "callType": "outgoing",
-  "startTime": "2024-01-15T08:00:00.000Z",
-  "phoneNumber": "9618488578", "duration": "420",
-  "relatedTo": {"id": 297573, "entity": "lead", "phoneNumber": "9618488578"},
-  "notes": [{"description": "Discussed pricing"}]
+  "startTime": "<UTC ISO>", "phoneNumber": "9618488578", "duration": "420",
+  "relatedTo": {"id": <entity_id>, "entity": "lead|contact", "phoneNumber": "..."},
+  "notes": [{"description": "..."}]
 }
 ```
 
-### Call log on a Contact
-Same as lead but `"entity": "contact"` in relatedTo.
-
-### Call log on a Deal
-Same as lead but `"entity": "deal"` in relatedTo. Optionally add `associatedTo` to link a contact:
+### Payload — Deal
+Same as above with `"entity": "deal"` in relatedTo. Optionally link a contact:
 ```json
-"associatedTo": [{"id": 112936, "entity": "contact", "phoneNumber": "9848022338"}]
+"associatedTo": [{"id": <contact_id>, "entity": "contact", "phoneNumber": "..."}]
 ```
 
-### Fetching call logs
-- Use `get_call_logs(entity_id, entity_type)` to get call logs for a lead, contact, or deal.
+### Fetching Call Logs
+`get_call_logs(entity_id, entity_type)` — for a lead, contact, or deal.
 
-### Notes on call logs
-- Use `add_note("CALL_LOG", call_log_id, "note text")` to add notes to a call log.
+### Notes
+`add_note("CALL_LOG", call_log_id, "note text")`
 """
 
 # ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("Kylas CRM", instructions=SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" + COMPANY_SYSTEM_INSTRUCTIONS + "\n\n" + MEETING_SYSTEM_INSTRUCTIONS + "\n\n" + CALL_LOG_SYSTEM_INSTRUCTIONS)
+_base_instructions = (
+    SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" +
+    COMPANY_SYSTEM_INSTRUCTIONS + "\n\n" + MEETING_SYSTEM_INSTRUCTIONS + "\n\n" +
+    CALL_LOG_SYSTEM_INSTRUCTIONS
+)
+
+
+def _build_instructions() -> str:
+    """Build final instructions with entity label mapping injected once."""
+    label_block = _format_entity_labels_for_instructions(_ENTITY_LABELS)
+    return _base_instructions.replace("{ENTITY_LABEL_MAPPING}", label_block)
+
+
+def _format_label_summary() -> str:
+    """One-line summary of entity labels for tool description."""
+    if not _ENTITY_LABELS:
+        return ""
+    parts = []
+    for entity_type in sorted(_ENTITY_LABELS.keys()):
+        label_data = _ENTITY_LABELS[entity_type]
+        display_name = label_data.get("displayName", entity_type)
+        display_plural = label_data.get("displayNamePlural", entity_type)
+        std_type = entity_type.lower()
+        parts.append(f'"{display_name}"/"{display_plural}"={std_type}')
+    return ", ".join(parts)
+
+
+def _update_tool_description(app: FastMCP) -> None:
+    """Patch get_entity_labels tool description with live label data so Claude sees it in the tool list."""
+    tool = app._tool_manager._tools.get("get_entity_labels")
+    if not tool:
+        return
+    summary = _format_label_summary()
+    if summary:
+        tool.description = (
+            f"REQUIRED: Call this ONCE per session before any other action.\n"
+            f"THIS TENANT'S ENTITY NAMES: {summary}\n"
+            f"Returns the full mapping. Use standard types (right of =) in all tool calls."
+        )
+        logger.info(f"Updated get_entity_labels tool description: {summary}")
+
+
+# Maps entity type keys to tool name substrings for description patching
+_ENTITY_TOOL_SUBSTRINGS: Dict[str, str] = {
+    "CONTACT": "contact",
+    "LEAD": "lead",
+    "DEAL": "deal",
+    "TASK": "task",
+    "COMPANY": "company",
+    "MEETING": "meeting",
+    "CALL_LOG": "call_log",
+}
+
+# Stores original tool descriptions so refreshes don't stack the prefix
+_ORIGINAL_TOOL_DESCRIPTIONS: Dict[str, str] = {}
+
+_ENTITY_LABELS_RESOURCE_URI = "kylas://entity-labels"
+
+
+def _patch_entity_tool_descriptions(app: FastMCP) -> None:
+    """
+    Prepend a one-line resource reference to each entity tool's description.
+    Claude reads tool descriptions before deciding which tool to call; seeing the
+    resource URI there prompts it to read kylas://entity-labels for name resolution.
+    """
+    if not _ENTITY_LABELS:
+        return
+    for entity_type, substring in _ENTITY_TOOL_SUBSTRINGS.items():
+        label_data = _ENTITY_LABELS.get(entity_type)
+        if not label_data:
+            continue
+        display_name = label_data.get("displayName", "")
+        display_plural = label_data.get("displayNamePlural", "")
+        std_type = entity_type.lower()
+        prefix = (
+            f'[Tenant entity name: "{display_name}" / "{display_plural}" = {std_type}. '
+            f"If user uses a custom name, read resource `{_ENTITY_LABELS_RESOURCE_URI}` to resolve it.]\n"
+        )
+        for tool_name, tool in app._tool_manager._tools.items():
+            if substring in tool_name.lower() and tool_name != "get_entity_labels":
+                if tool_name not in _ORIGINAL_TOOL_DESCRIPTIONS:
+                    _ORIGINAL_TOOL_DESCRIPTIONS[tool_name] = tool.description
+                tool.description = prefix + _ORIGINAL_TOOL_DESCRIPTIONS[tool_name]
+    logger.info("Patched entity tool descriptions with resource reference")
+
+
+@asynccontextmanager
+async def _app_lifespan(app: FastMCP):
+    """Load entity labels on startup, refresh them in background."""
+    await _load_entity_labels()
+    # Inject label data into server instructions
+    app._mcp_server.instructions = _build_instructions()
+    # Patch get_entity_labels tool description with live label summary
+    _update_tool_description(app)
+    # Embed resource reference in every entity tool's description
+    _patch_entity_tool_descriptions(app)
+    logger.info("Updated MCP server instructions with entity labels")
+    if "ENTITY NAME ROUTING" in (app._mcp_server.instructions or ""):
+        logger.info("✓ Entity Name Routing section found in instructions")
+    else:
+        logger.warning("✗ Entity Name Routing section NOT found in instructions")
+    # Start background refresh loop — runs in the server's own event loop
+    refresh_task = asyncio.create_task(_label_refresh_loop(interval_seconds=1800))
+    try:
+        yield {}
+    finally:
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
+
+
+mcp = FastMCP("Kylas CRM", instructions=_base_instructions, lifespan=_app_lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -838,6 +902,79 @@ async def get_lead_field_instructions_logic() -> str:
         for f in custom:
             lines.extend(_format_field(f, include_filterable=True))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
+    return "\n".join(lines)
+
+
+async def _format_entity_labels_for_display(labels: Dict[str, Dict[str, str]]) -> str:
+    """
+    Format entity labels for display (internal use, not exposed as a tool).
+    Returns a mapping like: LEAD→"Lid", DEAL→"Cars", CONTACT→"Animals", etc.
+    """
+    if not labels:
+        return ""
+    lines = ["# Entity Label Mapping (Tenant-Customized Names)\n"]
+    for entity_type in sorted(labels.keys()):
+        label_data = labels[entity_type]
+        display_name = label_data.get("displayName", entity_type)
+        display_plural = label_data.get("displayNamePlural", entity_type)
+        lines.append(f"- **{entity_type}** (standard type) → **{display_name}** / **{display_plural}** (display names)")
+    lines.append("\n**Remember:** When calling tools, use the standard type (left side), not the display name (right side).")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_entity_labels() -> str:
+    """
+    Returns the mapping of this tenant's custom entity display names to standard CRM entity types.
+    CALL THIS ONCE at the start of every session, before any other tool.
+    This tenant uses custom names (e.g. "animals" instead of contacts, "cars" instead of deals).
+    Without this, you will fail to recognize entity requests from users.
+    After calling this, when the user mentions a custom name, map it to the standard type for all tool calls.
+    """
+    if not _ENTITY_LABELS:
+        return "No custom entity labels configured for this tenant. Standard names apply: lead, contact, deal, task, company, meeting, call_log."
+    lines = ["# Entity Label Mapping — Custom Names for This Tenant\n"]
+    lines.append("When the user says one of the custom names below, use the corresponding STANDARD TYPE in all tool calls.\n")
+    for entity_type in sorted(_ENTITY_LABELS.keys()):
+        label_data = _ENTITY_LABELS[entity_type]
+        display_name = label_data.get("displayName", entity_type)
+        display_plural = label_data.get("displayNamePlural", entity_type)
+        std_type = entity_type.lower()
+        lines.append(f'- User says "{display_name}" or "{display_plural}" → use standard type: "{std_type}"')
+    lines.append('\n**Example:** User says "get animals" → map "animals" to "contact" → call search_contacts(...)')
+    lines.append('**Example:** User says "show cars" → map "cars" to "deal" → call search_deals(...)')
+    return "\n".join(lines)
+
+
+@mcp.resource(
+    "kylas://entity-labels",
+    name="Entity Label Mapping",
+    description=(
+        "Tenant-specific entity name mapping. Read this to resolve custom entity names to standard CRM types. "
+        "Example: 'animals' may map to 'contact', 'cars' may map to 'deal'. "
+        "Always read this resource when the user refers to an entity by an unfamiliar name."
+    ),
+    mime_type="text/plain",
+)
+def entity_labels_resource() -> str:
+    """Serve current entity label mapping as a readable resource."""
+    if not _ENTITY_LABELS:
+        return "No custom entity labels. Standard names apply: lead, contact, deal, task, company, meeting, call_log."
+    lines = ["# Entity Label Mapping — Tenant-Specific Custom Names", ""]
+    lines.append("When the user says a custom name, use the STANDARD TYPE (right of →) in all tool calls.")
+    lines.append("")
+    for entity_type in sorted(_ENTITY_LABELS.keys()):
+        label_data = _ENTITY_LABELS[entity_type]
+        display_name = label_data.get("displayName", entity_type)
+        display_plural = label_data.get("displayNamePlural", entity_type)
+        std_type = entity_type.lower()
+        lines.append(f'- "{display_name}" / "{display_plural}" → "{std_type}"')
+    lines.extend([
+        "",
+        "Examples:",
+        '  User says "get animals" → standard type is "contact" → call search_contacts(...)',
+        '  User says "show cars"   → standard type is "deal"    → call search_deals(...)',
+    ])
     return "\n".join(lines)
 
 
@@ -2095,6 +2232,10 @@ async def search_contacts_logic(
     """Search contacts with jsonRule; only filterable fields allowed."""
     fields_list = await _fetch_contact_fields()
     filterable_map = _get_filterable_fields_map(fields_list)
+    # Add associated entity fields which are filterable but may not be marked as such in schema
+    for associated_field in ["associatedLeads", "associatedDeals", "associatedCompanies"]:
+        if associated_field not in filterable_map:
+            filterable_map[associated_field] = {"type": "LOOK_UP", "standard": False}
     if not filterable_map:
         return "No filterable contact fields found for this tenant."
     default_tz = None
@@ -2150,6 +2291,12 @@ async def search_contacts(
     Search/filter contacts by criteria. Only fields marked [FILTERABLE] can be used.
     Call get_contact_field_instructions first to see filterable fields and their types.
     Same filter format as search_leads (no pipeline/stage filters for contacts).
+
+    Additional filterable fields (always available):
+    - associatedLeads (long): Filter by lead IDs associated with contacts
+    - associatedDeals (long): Filter by deal IDs associated with contacts
+    - associatedCompanies (long): Filter by company IDs associated with contacts
+    Use operators: equal, is_null, is_not_null
     """
     try:
         _reset_api_call_count()
@@ -2409,6 +2556,10 @@ async def search_tasks_logic(
     """Search tasks with jsonRule; only filterable fields allowed."""
     fields_list = await _fetch_task_fields()
     filterable_map = _get_filterable_fields_map(fields_list)
+    # Add associated entity fields which are filterable but may not be marked as such in schema
+    for associated_field in ["associatedLeads", "associatedContacts", "associatedDeals", "associatedCompanies"]:
+        if associated_field not in filterable_map:
+            filterable_map[associated_field] = {"type": "LOOK_UP", "standard": False}
     if not filterable_map:
         return "No filterable task fields found for this tenant."
     default_tz = None
@@ -2432,7 +2583,7 @@ async def search_tasks_logic(
     params = {"page": page, "size": min(size, 100)}
     if sort:
         params["sort"] = sort
-    logger.info("Searching tasks with %d filter(s)", len(filters))
+    logger.info("Searching tasks with %d filter(s): jsonRule=%s", len(filters), json_rule)
     async with get_client() as client:
         response = await client.post("/tasks/search", params=params, json=payload)
         data = await handle_api_response(response, "Search tasks")
@@ -2440,7 +2591,8 @@ async def search_tasks_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No tasks found matching the filters. (Total in DB: {total})"
+        filter_summary = "; ".join([f"{f.get('field')}={f.get('value')}" for f in filters])
+        return f"No tasks found matching filters: {filter_summary}. (Total tasks in DB: {total})"
     lines = [f"Found {len(results)} task(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for task in results:
         tid = task.get("id", "?")
@@ -2453,6 +2605,7 @@ async def search_tasks_logic(
     return "\n".join(lines)
 
 
+@mcp.tool()
 async def search_tasks(
     filters: List[Dict[str, Any]],
     page: int = 0,
@@ -2463,6 +2616,13 @@ async def search_tasks(
     Search/filter tasks by criteria. Only fields marked [FILTERABLE] can be used.
     Call get_task_field_instructions first to see filterable fields and their types.
     Same filter format as search_leads/search_contacts (no pipeline filters for tasks).
+
+    Additional filterable fields (always available):
+    - associatedLeads (long): Filter by lead IDs associated with tasks
+    - associatedContacts (long): Filter by contact IDs associated with tasks
+    - associatedDeals (long): Filter by deal IDs associated with tasks
+    - associatedCompanies (long): Filter by company IDs associated with tasks
+    Use operators: equal, is_null, is_not_null
     """
     try:
         _reset_api_call_count()
@@ -2476,7 +2636,6 @@ async def search_tasks(
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def lookup_leads_for_task_tool(search_term: str = "") -> str:
     """
     Look up leads to associate with a task.
@@ -2505,7 +2664,6 @@ async def lookup_leads_for_task_tool(search_term: str = "") -> str:
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def lookup_contacts_for_task_tool(search_term: str = "") -> str:
     """
     Look up contacts to associate with a task.
@@ -2533,7 +2691,6 @@ async def lookup_contacts_for_task_tool(search_term: str = "") -> str:
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def lookup_deals_for_task_tool(search_term: str = "") -> str:
     """
     Look up deals to associate with a task.
@@ -2561,7 +2718,6 @@ async def lookup_deals_for_task_tool(search_term: str = "") -> str:
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
 async def lookup_companies_for_task_tool(search_term: str = "") -> str:
     """
     Look up companies to associate with a task.
@@ -2832,12 +2988,42 @@ def _build_deal_search_json_rule(
 # Deal create/update/get logic
 # ---------------------------------------------------------------------------
 
+def _normalize_deal_payload(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Apply deal-specific field normalization on top of generic _normalize_field_values output.
+    - ownedBy: int → {"id": int}
+    - estimatedValue / actualValue / value: number → {"currencyId": <id>, "value": number}
+      (currencyId taken from existing deal if available)
+    """
+    _MONETARY_FIELDS = ("estimatedValue", "actualValue", "value")
+
+    if "ownedBy" in payload and isinstance(payload["ownedBy"], (int, float)) and not isinstance(payload["ownedBy"], bool):
+        payload["ownedBy"] = {"id": int(payload["ownedBy"])}
+
+    for field in _MONETARY_FIELDS:
+        if field not in payload:
+            continue
+        v = payload[field]
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            # Try to get currencyId from existing deal object for this field
+            currency_id = None
+            if existing and isinstance(existing.get(field), dict):
+                currency_id = existing[field].get("currencyId")
+            if currency_id:
+                payload[field] = {"currencyId": currency_id, "value": v}
+            else:
+                # Can't wrap without a currencyId — leave as-is; system instructions tell Claude to pass full object
+                logger.warning("Deal field '%s' is a plain number but no currencyId available; sending as-is.", field)
+    return payload
+
+
 async def create_deal_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     """Create a deal with the given dynamic field_values (Kylas API payload shape)."""
     fv = dict(field_values)
     has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
     id_to_name = await _get_deal_custom_field_id_to_name() if has_custom_by_id else {}
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    payload = _normalize_deal_payload(payload)
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
     logger.info("Creating deal with fields: %s", list(payload.keys()))
@@ -2857,7 +3043,10 @@ async def create_deal(field_values: Dict[str, Any]) -> str:
     Infer from user context which fields to send; include only those in field_values.
 
     field_values: Map of field identifier to value.
-    - Standard fields: use API name as key at top level (e.g. name, value, closingDate, dealSource).
+    - Standard fields: use API name as key at top level (e.g. name, closingDate, dealSource).
+    - Monetary fields (estimatedValue, actualValue, value): MUST be objects: {"currencyId": <id>, "value": <number>}.
+      Get currencyId from get_deal_field_instructions. NEVER pass a plain number.
+    - Owner (ownedBy): pass as {"id": <user_id>}. Use lookup_users to get user ID.
     - Custom fields: MUST be under "customFieldValues" with **internal name** as key (e.g. "customFieldValues": {"cfDealStatus": "Active"}). Do not use field ID as key.
     - For a single email use "email": "user@example.com". For phones use "phone": "5551234567" (or "phoneNumbers" array) and you MUST include "phone_country_code": "IN" or "+91" at top level.
     - For picklists use the Option ID (number) from the cheat sheet.
@@ -2895,6 +3084,7 @@ async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[
     async with get_client() as client:
         get_response = await client.get(f"/deals/{deal_id}")
         existing = await handle_api_response(get_response, "Get deal")
+        payload = _normalize_deal_payload(payload, existing=existing)
         merged = dict(existing)
         for key, value in payload.items():
             if key == "customFieldValues" and isinstance(value, dict):
@@ -3172,7 +3362,7 @@ async def search_deals_logic(
     if err:
         return f"Invalid filters: {err}"
     payload = {
-        "fields": ["id", "name", "value", "currency", "closingDate", "ownedBy", "createdAt", "actualValue", "estimatedValue"],
+        "fields": ["id", "name", "value", "currency", "closingDate", "ownedBy", "createdAt", "actualValue", "estimatedValue", "associatedContacts", "associatedLeads", "associatedCompanies"],
         "jsonRule": json_rule,
     }
     params = {"page": page, "size": min(size, 100)}
@@ -3196,7 +3386,9 @@ async def search_deals_logic(
         estimated_val = _extract_primary_deal_value(deal.get("estimatedValue"))
         owner_obj = deal.get("ownedBy", {})
         owner_name = owner_obj.get("name", "—") if isinstance(owner_obj, dict) else "—"
-        lines.append(f"• ID: {did} | Name: {name} | Owner: {owner_name} | Value: {value} | Actual: {actual_val} | Estimated: {estimated_val}")
+        associated_contacts = deal.get("associatedContacts") or []
+        associated_contacts_str = ", ".join(str(cid) for cid in associated_contacts) if associated_contacts else "—"
+        lines.append(f"• ID: {did} | Name: {name} | Owner: {owner_name} | Value: {value} | Contacts: {associated_contacts_str}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -3215,6 +3407,12 @@ async def search_deals(
 
     DO NOT use this for keyword/text searches - use search_deals_by_term instead.
     Call get_deal_field_instructions first to get filterable fields and their types.
+
+    **Returned fields include associated entities:**
+    - associatedContacts (array of contact IDs)
+    - associatedLeads (array of lead IDs)
+    - associatedCompanies (array of company IDs)
+    These are real IDs that can be used directly in subsequent searches without needing to look them up separately.
 
     filters: List of filter objects. Each must have:
       - field (str): Field internal/API name (e.g. name, value, dealSource, createdAt).
@@ -5702,12 +5900,16 @@ async def search_entity_by_term(
     sort: Optional[str] = "updatedAt,desc",
 ) -> str:
     """
-    Search/filter any entity type by a search term (lead, contact, task, deal, company, meeting).
-    Use this tool for free-text search instead of filter-based search.
+    Search/filter any entity type by a free-text search term (lead, contact, task, deal, company, meeting).
+    Use this tool ONLY when the user provides a specific search term (e.g. a name, email, or keyword).
+
+    ⚠️ NEVER use this tool with wildcard characters ("*"), empty strings, or blank terms.
+    ⚠️ NEVER use this tool when the user asks for "all" records (e.g. "show all leads", "list all contacts").
+       → For "all" / "list" queries, use `search_entity` with a date filter (e.g. updatedAt >= last 90 days).
 
     Valid entity_type values: lead, contact, task, deal, company, meeting
 
-    search_term: Term to search across fields (exact behavior depends on entity type).
+    search_term: A specific term to search across fields (e.g. "John", "acme@corp.com", "Acme Inc").
       - For meeting: searches 'title' field only.
       - For others: multi-field search (first name, last name, email, phone, etc.).
 
