@@ -40,6 +40,7 @@ import httpx
 from dateutil import parser as dateutil_parser
 from fastmcp import FastMCP
 from dotenv import load_dotenv
+import json
 
 # ---------------------------------------------------------------------------
 # Configuration & Logging
@@ -55,6 +56,74 @@ logger = logging.getLogger("kylas-mcp")
 
 BASE_URL = os.getenv("KYLAS_BASE_URL", "https://api.kylas.io/v1")
 API_KEY = os.getenv("KYLAS_API_KEY")
+
+
+# ---------------------------------------------------------------------------
+# Logging Helpers
+# ---------------------------------------------------------------------------
+
+def _mask_api_key(api_key: Optional[str]) -> str:
+    """Mask API key but keep last 12 characters for context."""
+    if not api_key:
+        return "None"
+    if len(api_key) <= 12:
+        return "***"
+    return "*" * (len(api_key) - 12) + api_key[-12:]
+
+
+async def _log_request(request: httpx.Request) -> None:
+    """Log request details in a readable format."""
+    api_key = request.headers.get("api-key")
+    masked_key = _mask_api_key(api_key)
+
+    payload = "None"
+    if request.content:
+        try:
+            payload = json.dumps(json.loads(request.content), indent=2)
+        except Exception:
+            payload = request.content.decode("utf-8", errors="replace")
+
+    logger.info(
+        f"\n{'='*60}\n"
+        f"🚀 API REQUEST\n"
+        f"{'-'*60}\n"
+        f"Method:   {request.method}\n"
+        f"URL:      {request.url}\n"
+        f"API Key:  {masked_key}\n"
+        f"Payload:\n{payload}\n"
+        f"{'='*60}"
+    )
+
+
+async def _log_response(response: httpx.Response) -> None:
+    """Log response details in a readable format."""
+    await response.aread()
+
+    body = "None"
+    if response.content:
+        try:
+            body = json.dumps(response.json(), indent=2)
+        except Exception:
+            body = response.text
+
+    error_info = ""
+    if response.status_code >= 400:
+        try:
+            data = response.json()
+            error_code = data.get("errorCode", "N/A")
+            details = data.get("details") or data.get("message") or "N/A"
+            error_info = f"\nError Code: {error_code}\nDetails:    {details}"
+        except Exception:
+            pass
+
+    logger.info(
+        f"\n{'='*60}\n"
+        f"✅ API RESPONSE\n"
+        f"{'-'*60}\n"
+        f"Status:   {response.status_code}{error_info}\n"
+        f"Body:\n{body}\n"
+        f"{'='*60}"
+    )
 
 
 def _get_default_timezone() -> str:
@@ -126,12 +195,11 @@ async def _load_entity_labels() -> Dict[str, Dict[str, str]]:
             resp = await client.get(f"{BASE_URL}/entities/label")
             _ENTITY_LABELS = resp.json()
             # Log with display names in clear format
-            logger.info("Loaded entity labels:")
-            for entity_type in sorted(_ENTITY_LABELS.keys()):
-                label_data = _ENTITY_LABELS[entity_type]
-                display_name = label_data.get("displayName", entity_type)
-                display_plural = label_data.get("displayNamePlural", entity_type)
-                logger.info(f"  {entity_type} => {display_name}, {display_plural}")
+            summary = "\n".join(
+                f"  • {etype:8} => {data.get('displayName', etype)} / {data.get('displayNamePlural', etype)}"
+                for etype, data in sorted(_ENTITY_LABELS.items())
+            )
+            logger.info(f"\n📦 Loaded Entity Labels:\n{summary}")
             return _ENTITY_LABELS
     except Exception as e:
         logger.warning(f"Failed to load entity labels: {e}")
@@ -156,7 +224,7 @@ async def _label_refresh_loop(interval_seconds: int = 1800) -> None:
                 new_labels = resp.json()
                 _ENTITY_LABELS.clear()
                 _ENTITY_LABELS.update(new_labels)
-                logger.info(f"Refreshed entity labels: {list(_ENTITY_LABELS.keys())}")
+                logger.info(f"🔄 Refreshed entity labels: {list(_ENTITY_LABELS.keys())}")
                 mcp._mcp_server.instructions = _build_instructions()
                 _update_tool_description(mcp)
                 _patch_entity_tool_descriptions(mcp)
@@ -450,6 +518,10 @@ class _ThrottledClientContext:
                 "User-Agent": user_agent,
             },
             timeout=30.0,
+            event_hooks={
+                "request": [_log_request],
+                "response": [_log_response],
+            },
         )
 
     async def __aenter__(self) -> "_ThrottledClient":
@@ -471,7 +543,7 @@ async def handle_api_response(response: httpx.Response, operation: str) -> Dict[
         return response.json()
     except httpx.HTTPStatusError as e:
         error_body = e.response.text
-        logger.error(f"{operation} failed: {e.response.status_code} - {error_body}")
+        logger.error(f"❌ {operation} failed: {e.response.status_code}")
         raise KylasAPIError(
             f"{operation} failed: {e.response.status_code}",
             status_code=e.response.status_code,
@@ -723,11 +795,11 @@ async def _app_lifespan(app: FastMCP):
     _update_tool_description(app)
     # Embed resource reference in every entity tool's description
     _patch_entity_tool_descriptions(app)
-    logger.info("Updated MCP server instructions with entity labels")
+    logger.info("🚀 Updated MCP server instructions with entity labels")
     if "ENTITY NAME ROUTING" in (app._mcp_server.instructions or ""):
-        logger.info("✓ Entity Name Routing section found in instructions")
+        logger.info("✅ Entity Name Routing section found in instructions")
     else:
-        logger.warning("✗ Entity Name Routing section NOT found in instructions")
+        logger.warning("⚠️ Entity Name Routing section NOT found in instructions")
     # Start background refresh loop — runs in the server's own event loop
     refresh_task = asyncio.create_task(_label_refresh_loop(interval_seconds=1800))
     try:
@@ -1615,11 +1687,11 @@ async def create_lead_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
-    logger.info("Creating lead with fields: %s", list(payload.keys()))
+    logger.info("📝 Creating lead with fields: %s", list(payload.keys()))
     async with get_client() as client:
         response = await client.post("/leads", json=payload)
         result = await handle_api_response(response, "Create lead")
-        logger.info("Lead created with ID: %s", result.get("id"))
+        logger.info("✅ Lead created with ID: %s", result.get("id"))
         return result
 
 
@@ -1668,7 +1740,7 @@ async def update_lead_logic(lead_id: int, field_values: Dict[str, Any]) -> Dict[
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
     if not payload:
         raise KylasAPIError("field_values produced an empty payload.")
-    logger.info("Updating lead %s with fields: %s", lead_id, list(payload.keys()))
+    logger.info("🔄 Updating lead %s with fields: %s", lead_id, list(payload.keys()))
     async with get_client() as client:
         get_response = await client.get(f"/leads/{lead_id}")
         existing = await handle_api_response(get_response, "Get lead")
@@ -1710,7 +1782,7 @@ async def update_lead_logic(lead_id: int, field_values: Dict[str, Any]) -> Dict[
                 merged[key] = value
         response = await client.put(f"/leads/{lead_id}", json=merged)
         result = await handle_api_response(response, "Update lead")
-        logger.info("Lead %s updated", lead_id)
+        logger.info("✅ Lead %s updated", lead_id)
         return result
 
 
