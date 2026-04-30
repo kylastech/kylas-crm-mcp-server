@@ -1,26 +1,32 @@
 """
-Kylas CRM MCP Server - Lead, Contact & Task Support
+Kylas CRM MCP Server
 
 Model Context Protocol server for Kylas CRM operations:
 
-LEAD OPERATIONS:
-- get_lead_field_instructions (call FIRST to get schema)
-- create_lead, update_lead, get_lead
-- search_entity("lead", filters) (filter by criteria)
-- search_idle_entities("lead", days) (no activity for N days)
+GENERIC CRUD (use these instead of entity-specific tools):
+- create_entity(entity_type, field_values)  — create any entity
+- update_entity(entity_type, entity_id, field_values)  — update any entity
+  Supported entity_type values: lead, contact, deal, task, company, meeting, call_log
+
+PER-ENTITY FIELD INSTRUCTIONS (call FIRST to get schema before create/update):
+- get_lead_field_instructions
+- get_contact_field_instructions
+- get_task_field_instructions
+- get_deal_field_instructions
+- get_company_field_instructions
+
+PER-ENTITY GET (fetch full record by ID):
+- get_lead, get_contact, get_task, get_deal, get_company, get_meeting, get_call_log
+
+SEARCH:
+- search_entity(entity_type, filters) — filter any entity by criteria
+- search_entity_by_term(entity_type, term) — full-text search
+- search_idle_entities(entity_type, days) — no activity for N days
+
+PIPELINE:
 - lookup_pipelines, get_pipeline_stages, get_pipeline_details
 
-CONTACT OPERATIONS:
-- get_contact_field_instructions (call FIRST to get schema)
-- create_contact, update_contact, get_contact
-- search_entity("contact", filters) (filter by criteria - NO PIPELINE)
-
-TASK OPERATIONS:
-- get_task_field_instructions (call FIRST to get schema)
-- create_task, update_task, get_task
-- search_tasks (filter by criteria - NO PIPELINE; use associatedLeads/Contacts/Deals/Companies filter for entity-linked tasks)
-
-SHARED TOOLS (for all Lead, Contact, Task):
+SHARED UTILITIES:
 - get_current_user (timezone, ID; use for date/datetime handling)
 - lookup_users (resolve user names to IDs for ownerId, createdBy, updatedBy)
 - lookup_products (find products for field_values)
@@ -1758,31 +1764,6 @@ async def update_lead_logic(lead_id: int, field_values: Dict[str, Any]) -> Dict[
         return result
 
 
-@mcp.tool()
-async def update_lead(lead_id: int, field_values: Dict[str, Any]) -> str:
-    """
-    Update a lead in Kylas CRM. Fetches the lead first, merges your field_values into it, then PUTs the full body.
-    Same field_values format as create_lead. Call get_lead_field_instructions first for API names and custom field internal names.
-    For owner: use lookup_users to get the user ID, then pass ownerId: <id> in field_values.
-
-    lead_id: The lead ID to update (e.g. from search_leads or search_leads_by_term results).
-    field_values: Map of field identifier to value (same as create_lead: firstName, lastName, email, phone with phone_country_code, customFieldValues, picklist Option IDs, date/datetime in UTC ISO, etc.). These are merged over the existing lead; other fields are left unchanged.
-    """
-    try:
-        _reset_api_call_count()
-        result = await update_lead_logic(lead_id, field_values)
-        lid = result.get("id", lead_id)
-        name = f"{result.get('firstName', '')} {result.get('lastName', '')}".strip() or "Lead"
-        return f"✓ Lead updated successfully.\n  ID: {lid}\n  Name: {name}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to update lead: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("update_lead")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 # ---------------------------------------------------------------------------
 # Tool 4c: Get lead by ID (full details)
 # ---------------------------------------------------------------------------
@@ -2184,27 +2165,6 @@ async def get_contact_field_instructions() -> str:
         return f"✗ Unexpected error: {str(e)}"
 
 
-@mcp.tool()
-async def update_contact(contact_id: int, field_values: Dict[str, Any]) -> str:
-    """
-    Update a contact. Fetches current contact, merges your field_values into it, then updates.
-    Same field_values format as create_contact. Call get_contact_field_instructions first.
-    """
-    try:
-        _reset_api_call_count()
-        result = await update_contact_logic(contact_id, field_values)
-        cid = result.get("id", contact_id)
-        first_name = result.get("firstName", "")
-        last_name = result.get("lastName", "")
-        name = f"{first_name} {last_name}".strip() or "Contact"
-        return f"✓ Contact updated successfully.\n  ID: {cid}\n  Name: {name}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to update contact: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("update_contact")
-        return f"✗ Unexpected error: {str(e)}"
 
 
 async def get_contact_logic(contact_id: int) -> Dict[str, Any]:
@@ -2482,27 +2442,6 @@ async def get_task_field_instructions() -> str:
 
 
 @mcp.tool()
-async def update_task(task_id: int, field_values: Dict[str, Any]) -> str:
-    """
-    Update a task. Fetches current task, merges your field_values into it, then updates.
-    Same field_values format as create_task. Call get_task_field_instructions first.
-    """
-    try:
-        _reset_api_call_count()
-        result = await update_task_logic(task_id, field_values)
-        tid = result.get("id", task_id)
-        name = result.get("name", "Task")
-        return f"✓ Task updated successfully.\n  ID: {tid}\n  Name: {name}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to update task: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("update_task")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-@mcp.tool()
 async def get_task(task_id: int) -> str:
     """Get full details of a task by ID."""
     try:
@@ -2611,7 +2550,7 @@ async def search_tasks(
 async def lookup_entity_for_task(entity_type: str, search_term: str = "") -> str:
     """
     Look up a lead, contact, deal, or company to associate with a task.
-    Use this BEFORE create_task or update_task when the user specifies an entity by name.
+    Use this BEFORE create_entity or update_entity (task) when the user specifies an entity by name.
 
     entity_type: "lead", "contact", "deal", or "company" (use internal type, not tenant display name)
     search_term: optional name to filter results (e.g. "John", "Acme")
@@ -3155,46 +3094,6 @@ async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[
         return result
 
 
-@mcp.tool()
-async def update_deal(deal_id: int, field_values: Dict[str, Any]) -> str:
-    """
-    Update a deal in Kylas CRM. Fetches the deal first, merges your field_values into it, then PUTs the full body.
-    Same field_values format as create_deal. Call get_deal_field_instructions first for API names.
-
-    deal_id: The deal ID to update (e.g. from search_deals or search_deals_by_term results).
-    field_values: Map of field identifier to value (same as create_deal).
-
-    **Pipeline updates:**
-    - To change stage in current pipeline: {"pipelineStage": stage_id}
-      (automatically updates pipeline.stage.id and forecastingType)
-    - To change to different pipeline: {"pipeline": {"id": id, "name": "name", "stage": {"id": id, "name": "name"}}, "forecastingType": "..."}
-
-    **Link contacts (Kylas deal PUT):** use `associatedContacts` with `{id, name}` per contact, e.g.
-    `{"associatedContacts": [{"id": 4942095, "name": "aditya tambe"}]}`. Existing rows are kept; duplicates by id are skipped.
-    You may also use `contacts` as an alias (same merge into `associatedContacts`). If `name` is omitted, it is loaded from GET /contacts/{id}.
-
-    **Add products:** use `products` with a list of product objects. Each product needs at minimum `id` (product ID from lookup_products).
-    Optional fields: `quantity` (default 1), `name`, `price` ({"currencyId": id, "value": amount}),
-    `discount` ({"value": 0, "type": "PERCENTAGE"|"FLAT"}), `category` ({"id": id, "name": name}),
-    `hsnSacCode`, `countryOfOrigin` ({"id": id, "name": name}), `customFieldValues`.
-    Example: `{"products": [{"id": 245208, "quantity": 10, "price": {"currencyId": 431, "value": 100}}]}`.
-    Existing products are kept; new products are merged (duplicates by id are skipped).
-    """
-    try:
-        _reset_api_call_count()
-        result = await update_deal_logic(deal_id, field_values)
-        did = result.get("id", deal_id)
-        name = result.get("name", "Deal")
-        return f"✓ Deal updated successfully.\n  ID: {did}\n  Name: {name}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to update deal: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("update_deal")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 async def get_deal_logic(deal_id: int) -> Dict[str, Any]:
     """Fetch a single deal by ID (GET /deals/{id}). Returns full deal object."""
     deal_id = int(deal_id)
@@ -3678,30 +3577,6 @@ async def update_company_logic(company_id: int, field_values: Dict[str, Any]) ->
         result = await handle_api_response(response, "Update company")
         logger.info("Company %s updated", company_id)
         return result
-
-
-@mcp.tool()
-async def update_company(company_id: int, field_values: Dict[str, Any]) -> str:
-    """
-    Update a company in Kylas CRM. Fetches the company first, merges your field_values into it, then PUTs the full body.
-    Same field_values format as create_company. Call get_company_field_instructions first for API names.
-
-    company_id: The company ID to update (e.g. from search_companies or search_companies_by_term results).
-    field_values: Map of field identifier to value (same as create_company).
-    """
-    try:
-        _reset_api_call_count()
-        result = await update_company_logic(company_id, field_values)
-        cid = result.get("id", company_id)
-        name = result.get("name", "Company")
-        return f"✓ Company updated successfully.\n  ID: {cid}\n  Name: {name}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to update company: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("update_company")
-        return f"✗ Unexpected error: {str(e)}"
 
 
 async def get_company_logic(company_id: int) -> Dict[str, Any]:
@@ -4247,31 +4122,6 @@ async def update_meeting_logic(meeting_id: int, field_values: Dict[str, Any]) ->
         return result
 
 
-@mcp.tool()
-async def update_meeting(meeting_id: int, field_values: Dict[str, Any]) -> str:
-    """
-    Update a meeting in Kylas CRM. Fetches the meeting first, merges your field_values, then PUTs the full body.
-
-    meeting_id: The meeting ID to update.
-    field_values: Map of field to value (same format as create_meeting).
-      - Participants and relatedTo are merged with existing (duplicates by id+entity are skipped).
-      - Other fields are overwritten.
-    """
-    try:
-        _reset_api_call_count()
-        result = await update_meeting_logic(meeting_id, field_values)
-        mid = result.get("id", meeting_id)
-        title = result.get("title", "Meeting")
-        return f"✓ Meeting updated successfully.\n  ID: {mid}\n  Title: {title}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to update meeting: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("update_meeting")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 async def get_meeting_logic(meeting_id: int) -> Dict[str, Any]:
     """Fetch a single meeting by ID (GET /meetings/{id})."""
     meeting_id = int(meeting_id)
@@ -4679,29 +4529,6 @@ async def update_call_log_logic(call_log_id: int, field_values: Dict[str, Any]) 
         result = await handle_api_response(response, "Update call log")
         logger.info("Call log %s updated", call_log_id)
         return result
-
-
-@mcp.tool()
-async def update_call_log(call_log_id: int, field_values: Dict[str, Any]) -> str:
-    """
-    Update a call log in Kylas CRM (PUT — full replace).
-
-    call_log_id: The call log ID to update.
-    field_values: Full call log payload (same format as create_call_log).
-      Must include all required fields: outcome, startTime, phoneNumber, callType, relatedTo.
-    """
-    try:
-        _reset_api_call_count()
-        result = await update_call_log_logic(call_log_id, field_values)
-        lid = result.get("id", call_log_id)
-        return f"✓ Call log updated successfully.\n  ID: {lid}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to update call log: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("update_call_log")
-        return f"✗ Unexpected error: {str(e)}"
 
 
 def _format_call_log_for_display(log: Dict[str, Any]) -> str:
@@ -5363,30 +5190,37 @@ _ENTITY_CONFIG = {
 _ENTITY_CRUD_CONFIG: Dict[str, Dict[str, Any]] = {
     "lead": {
         "create_fn": create_lead_logic,
+        "update_fn": update_lead_logic,
         "name_fn": lambda r: (f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or "Lead"),
     },
     "contact": {
         "create_fn": create_contact_logic,
+        "update_fn": update_contact_logic,
         "name_fn": lambda r: (f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or "Contact"),
     },
     "deal": {
         "create_fn": create_deal_logic,
+        "update_fn": update_deal_logic,
         "name_fn": lambda r: r.get("name", "Deal"),
     },
     "task": {
         "create_fn": create_task_logic,
+        "update_fn": update_task_logic,
         "name_fn": lambda r: r.get("name", "Task"),
     },
     "company": {
         "create_fn": create_company_logic,
+        "update_fn": update_company_logic,
         "name_fn": lambda r: r.get("name", "Company"),
     },
     "meeting": {
         "create_fn": create_meeting_logic,
+        "update_fn": update_meeting_logic,
         "name_fn": lambda r: r.get("title", "Meeting"),
     },
     "call_log": {
         "create_fn": create_call_log_logic,
+        "update_fn": update_call_log_logic,
         "name_fn": lambda r: f"{r.get('callType', '')} / {r.get('outcome', '')}",
     },
 }
@@ -5681,6 +5515,65 @@ async def create_entity(entity_type: str, field_values: Dict[str, Any]) -> str:
         return f"✗ Failed to create {entity_type}: {e.message}\n  Details: {e.response_body}"
     except Exception as e:
         logger.exception("create_entity")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def update_entity(entity_type: str, entity_id: int, field_values: Dict[str, Any]) -> str:
+    """
+    Update any CRM entity by type and ID. Use instead of entity-specific update tools.
+
+    Valid entity_type values: lead, contact, deal, task, company, meeting, call_log
+
+    entity_id: The ID of the entity to update (from search results or get_entity).
+    field_values: Fields to update (same format as create_entity for that type).
+      For most entities: fields are merged over the existing record (other fields unchanged).
+      For call_log: full replace — include all required fields (outcome, startTime, phoneNumber, callType, relatedTo).
+
+    Examples:
+    lead:
+      entity_type="lead", entity_id=123, field_values={"firstName": "Jane", "lastName": "Doe"}
+
+    deal (change pipeline stage):
+      entity_type="deal", entity_id=456, field_values={"pipelineStage": <stage_id>}
+
+    deal (add contacts/products):
+      entity_type="deal", entity_id=456,
+      field_values={"associatedContacts": [{"id": 4942095, "name": "Alice"}],
+                    "products": [{"id": 245208, "quantity": 2}]}
+
+    meeting (merge participants):
+      entity_type="meeting", entity_id=789,
+      field_values={"participants": [{"id": <user_id>, "entity": "user"}]}
+
+    call_log (full replace):
+      entity_type="call_log", entity_id=321,
+      field_values={"outcome": "connected", "callType": "outgoing",
+                    "startTime": "2026-05-10T08:00:00.000Z",
+                    "phoneNumber": "9876543210",
+                    "relatedTo": {"id": <lead_id>, "entity": "lead", "phoneNumber": "9876543210"}}
+
+    === PHONE & EMAIL RULES ===
+    Phone updates: always include phone_country_code (e.g. "IN", "+91", "US") whenever
+    phone or phoneNumbers is in field_values. Never assume a default country.
+    """
+    cfg = _ENTITY_CRUD_CONFIG.get(entity_type)
+    if not cfg:
+        valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
+        return f"✗ Unknown entity_type '{entity_type}'. Valid: {valid}"
+    try:
+        _reset_api_call_count()
+        result = await cfg["update_fn"](entity_id, field_values)
+        eid = result.get("id", entity_id)
+        name = cfg["name_fn"](result)
+        label = entity_type.replace("_", " ").title()
+        return f"✓ {label} updated successfully.\n  ID: {eid}\n  Name: {name}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to update {entity_type}: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("update_entity")
         return f"✗ Unexpected error: {str(e)}"
 
 

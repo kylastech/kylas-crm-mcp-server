@@ -1179,5 +1179,106 @@ async def test_create_entity_api_error():
     assert "Bad request" in result
 
 
+# ---------------------------------------------------------------------------
+# update_entity Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_update_entity_lead_success():
+    """update_entity dispatches to update_fn for lead and formats the response."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG
+    mock_result = {"id": 55, "firstName": "Alice", "lastName": "Smith"}
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"lead": {
+        "update_fn": AsyncMock(return_value=mock_result),
+        "name_fn": lambda r: f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or "Lead",
+    }}):
+        result = await update_entity("lead", 55, {"firstName": "Alice"})
+    assert result.startswith("✓ Lead updated")
+    assert "55" in result
+    assert "Alice Smith" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_deal_success():
+    """update_entity dispatches to update_fn for deal and formats the response."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG
+    mock_result = {"id": 77, "name": "Mega Deal"}
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"deal": {
+        "update_fn": AsyncMock(return_value=mock_result),
+        "name_fn": lambda r: r.get("name", "Deal"),
+    }}):
+        result = await update_entity("deal", 77, {"name": "Mega Deal"})
+    assert result.startswith("✓ Deal updated")
+    assert "77" in result
+    assert "Mega Deal" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_call_log_success():
+    """update_entity dispatches to update_fn for call_log and formats the response."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG
+    mock_result = {"id": 33, "callType": "outgoing", "outcome": "connected"}
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"call_log": {
+        "update_fn": AsyncMock(return_value=mock_result),
+        "name_fn": lambda r: f"{r.get('callType', '')} / {r.get('outcome', '')}",
+    }}):
+        result = await update_entity("call_log", 33, {"outcome": "connected"})
+    assert result.startswith("✓ Call Log updated")
+    assert "33" in result
+    assert "outgoing / connected" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_invalid_type():
+    """update_entity returns an error message for unknown entity_type."""
+    from main import update_entity
+    result = await update_entity("unicorn", 1, {"name": "test"})
+    assert "✗" in result
+    assert "unicorn" in result
+    assert "Unknown entity_type" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_api_error():
+    """update_entity surfaces KylasAPIError cleanly."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG, KylasAPIError
+    err = KylasAPIError("Not found")
+    err.message = "Not found"
+    err.response_body = "{}"
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"task": {
+        "update_fn": AsyncMock(side_effect=err),
+        "name_fn": lambda r: r.get("name", "Task"),
+    }}):
+        result = await update_entity("task", 99, {"name": "Test Task"})
+    assert "✗" in result
+    assert "Not found" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_value_error():
+    """update_entity surfaces ValueError (e.g. missing phone country code) cleanly."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"lead": {
+        "update_fn": AsyncMock(side_effect=ValueError("phone: country/dial code required")),
+        "name_fn": lambda r: "Lead",
+    }}):
+        result = await update_entity("lead", 1, {"phone": "9876543210"})
+    assert "✗" in result
+    assert "country/dial code required" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_calls_update_fn_with_correct_args():
+    """update_entity passes entity_id and field_values to update_fn."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG
+    mock_update = AsyncMock(return_value={"id": 10, "name": "Acme"})
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"company": {
+        "update_fn": mock_update,
+        "name_fn": lambda r: r.get("name", "Company"),
+    }}):
+        await update_entity("company", 10, {"name": "Acme"})
+    mock_update.assert_called_once_with(10, {"name": "Acme"})
+
+
 if __name__ == "__main__":
     asyncio.run(run_manual_tests())
