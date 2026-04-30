@@ -33,7 +33,7 @@ import random
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from importlib.metadata import version as _pkg_version
+from importlib.metadata import version as _pkg_version, PackageNotFoundError
 from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
@@ -57,7 +57,10 @@ logger = logging.getLogger("kylas-mcp")
 
 BASE_URL = os.getenv("KYLAS_BASE_URL", "https://api.kylas.io/v1")
 API_KEY = os.getenv("KYLAS_API_KEY")
-SERVER_VERSION = _pkg_version("kylas-crm-mcp-server")
+try:
+    SERVER_VERSION = _pkg_version("kylas-crm-mcp-server")
+except PackageNotFoundError:
+    SERVER_VERSION = "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -487,18 +490,24 @@ class KylasAPIError(Exception):
 def _get_mcp_client_name() -> str:
     """
     Resolve the MCP client identifier from the MCP initialize handshake.
-    Returns '{name}/{version}' (e.g. 'Claude Desktop/1.2.3') or 'unknown'.
-    Used for the outbound User-Agent to Kylas: kylas_mcp_server/{clientName}/{clientVersion}.
+    Returns '{name}({version})' (e.g. 'Claude Desktop(1.2.3)') or 'unknown'.
+    Used for the outbound User-Agent to Kylas: kylas_mcp_server({version}) on {client}.
     """
     try:
         ctx = mcp.get_context()
         client_params = ctx.session.client_params
         if client_params and client_params.clientInfo:
-            name = client_params.clientInfo.name or "unknown"
+            name = client_params.clientInfo.name or ""
             version = client_params.clientInfo.version or ""
-            return f"{name}({version})" if version else name
-    except Exception:
-        pass
+            if name:
+                result = f"{name}({version})" if version else name
+                logger.debug("MCP client identified: %s", result)
+                return result
+            logger.warning("MCP clientInfo present but name is empty: %r", client_params.clientInfo)
+        else:
+            logger.warning("MCP client_params missing or has no clientInfo (proxy/unknown client)")
+    except Exception as exc:
+        logger.warning("Could not resolve MCP client name: %s", exc)
     return "unknown"
 
 
@@ -999,23 +1008,6 @@ async def get_lead_field_instructions_logic() -> str:
         for f in custom:
             lines.extend(_format_field(f, include_filterable=True))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
-    return "\n".join(lines)
-
-
-async def _format_entity_labels_for_display(labels: Dict[str, Dict[str, str]]) -> str:
-    """
-    Format entity labels for display (internal use, not exposed as a tool).
-    Returns a mapping like: LEAD→"Lid", DEAL→"Cars", CONTACT→"Animals", etc.
-    """
-    if not labels:
-        return ""
-    lines = ["# Entity Label Mapping (Tenant-Customized Names)\n"]
-    for entity_type in sorted(labels.keys()):
-        label_data = labels[entity_type]
-        display_name = label_data.get("displayName", entity_type)
-        display_plural = label_data.get("displayNamePlural", entity_type)
-        lines.append(f"- **{entity_type}** (standard type) → **{display_name}** / **{display_plural}** (display names)")
-    lines.append("\n**Remember:** When calling tools, use the standard type (left side), not the display name (right side).")
     return "\n".join(lines)
 
 
@@ -1705,36 +1697,6 @@ async def create_lead_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
         return result
 
 
-@mcp.tool()
-async def create_lead(field_values: Dict[str, Any]) -> str:
-    """
-    Create a lead in Kylas CRM with only the fields the user wants (no static field list).
-    
-    You MUST call get_lead_field_instructions FIRST to get valid API names and Field IDs.
-    Infer from user context which fields to send; include only those in field_values.
-    
-    field_values: Map of field identifier to value.
-    - Standard fields: use API name as key at top level (e.g. firstName, lastName, companyName, emails, phoneNumbers, leadSource, isNew).
-    - Custom fields: MUST be under "customFieldValues" with **internal name** as key (e.g. "customFieldValues": {"cfLeadCheck": "Checked"}). Do not use field ID as key—Kylas expects internal names. If you pass a field ID (e.g. "1210985"), the server will resolve it to the internal name (e.g. cfLeadCheck) automatically.
-    - For a single email use "email": "user@example.com". For phones use "phone": "5551234567" (or "phoneNumbers" array) and you MUST include "phone_country_code": "IN" or "+91" at top level. If the user provided phone(s) but did not specify country or dial code, do NOT call create_lead—ask the user (e.g. which country/dial code for these numbers?) and only call after they respond. Do not infer from currency or other context. Email types: OFFICE, PERSONAL. Phone types: MOBILE, WORK, HOME, PERSONAL. Exactly one email and at most one phone should be primary; first entry is primary by default.
-    - For picklists use the Option ID (number) from the cheat sheet.
-    - For date/datetime fields: the user gives a time in their timezone (e.g. "11th Feb 2026 at 7:30 AM"). Call get_current_user, then parse_datetime_to_utc_iso_tool(local_datetime, timezone) and put the returned UTC ISO string in field_values.
-    """
-    try:
-        _reset_api_call_count()
-        result = await create_lead_logic(field_values)
-        lead_id = result.get("id", "?")
-        name = f"{result.get('firstName', '')} {result.get('lastName', '')}".strip() or "Lead"
-        return f"✓ Lead created successfully.\n  ID: {lead_id}\n  Name: {name}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to create lead: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("create_lead")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 # ---------------------------------------------------------------------------
 # Tool 4b: Update Lead (PUT /leads/{id})
 # ---------------------------------------------------------------------------
@@ -2086,36 +2048,6 @@ async def search_idle_leads_logic(
     return await search_leads_logic(filters, page=page, size=size, sort=sort)
 
 
-async def search_idle_leads(
-    days: int,
-    time_zone: Optional[str] = None,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "createdAt,desc",
-) -> str:
-    """
-    Search for idle/stagnant leads: no activity for at least the given number of days.
-    Uses both updatedAt and latestActivityCreatedAt; a lead is returned only when BOTH dates
-    are on or before (today − days), so the effective last activity is before the threshold.
-
-    days: Minimum days with no activity (e.g. 10 for "no activity since 10 days").
-    time_zone: IANA timezone for threshold (e.g. America/New_York). Default: Asia/Calcutta.
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "createdAt,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        if days < 0:
-            return "Error: days must be non-negative."
-        return await search_idle_leads_logic(days, time_zone, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search idle leads failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_idle_leads")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 # ---------------------------------------------------------------------------
 # Contact Entity Support (similar to Lead but no pipeline/stage)
 # ---------------------------------------------------------------------------
@@ -2249,29 +2181,6 @@ async def get_contact_field_instructions() -> str:
         return f"✗ Failed to fetch fields: {e.message}"
     except Exception as e:
         logger.exception("get_contact_field_instructions")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-@mcp.tool()
-async def create_contact(field_values: Dict[str, Any]) -> str:
-    """
-    Create a contact with dynamic field values. Same format as create_lead but without pipeline fields.
-    ALWAYS call get_contact_field_instructions FIRST to get field names and IDs.
-    """
-    try:
-        _reset_api_call_count()
-        result = await create_contact_logic(field_values)
-        contact_id = result.get("id", "?")
-        first_name = result.get("firstName", "")
-        last_name = result.get("lastName", "")
-        name = f"{first_name} {last_name}".strip() or "Contact"
-        return f"✓ Contact created successfully.\n  ID: {contact_id}\n  Name: {name}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to create contact: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("create_contact")
         return f"✗ Unexpected error: {str(e)}"
 
 
@@ -2570,41 +2479,6 @@ async def get_task_field_instructions() -> str:
         logger.exception("get_task_field_instructions")
         return f"✗ Unexpected error: {str(e)}"
 
-
-@mcp.tool()
-async def create_task(field_values: Dict[str, Any]) -> str:
-    """
-    Create a task with dynamic field values. Same format as create_contact/create_lead but task-specific.
-    ALWAYS call get_task_field_instructions FIRST to get field names and IDs.
-
-    **Important:** To assign the task to entities (lead, contact, deal, company), include "relation" in field_values:
-    "relation": [
-      {"targetEntityId": <lead_id>, "targetEntityType": "LEAD", "targetEntityName": "<lead_name>"},
-      {"targetEntityId": <contact_id>, "targetEntityType": "CONTACT", "targetEntityName": "<contact_name>"}
-    ]
-
-    Example: create_task({
-      "name": "Follow up",
-      "dueDate": "2026-03-26T18:29:59.999Z",
-      "assignedTo": 594,
-      "relation": [
-        {"targetEntityId": 45089710, "targetEntityType": "LEAD", "targetEntityName": "Akshay"}
-      ]
-    })
-    """
-    try:
-        _reset_api_call_count()
-        result = await create_task_logic(field_values)
-        task_id = result.get("id", "?")
-        name = result.get("name", "Task")
-        return f"✓ Task created successfully.\n  ID: {task_id}\n  Name: {name}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to create task: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("create_task")
-        return f"✗ Unexpected error: {str(e)}"
 
 
 @mcp.tool()
@@ -3143,41 +3017,6 @@ async def create_deal_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
         return result
 
 
-@mcp.tool()
-async def create_deal(field_values: Dict[str, Any]) -> str:
-    """
-    Create a deal in Kylas CRM with only the fields the user wants (no static field list).
-
-    You MUST call get_deal_field_instructions FIRST to get valid API names and Field IDs.
-    Infer from user context which fields to send; include only those in field_values.
-
-    field_values: Map of field identifier to value.
-    - Standard fields: use API name as key at top level (e.g. name, closingDate, dealSource).
-    - Monetary fields (estimatedValue, actualValue, value): MUST be objects: {"currencyId": <id>, "value": <number>}.
-      Get currencyId from get_deal_field_instructions. NEVER pass a plain number.
-    - Owner (ownedBy): pass as {"id": <user_id>}. Use lookup_users to get user ID.
-    - Custom fields: MUST be under "customFieldValues" with **internal name** as key (e.g. "customFieldValues": {"cfDealStatus": "Active"}). Do not use field ID as key.
-    - For a single email use "email": "user@example.com". For phones use "phone": "5551234567" (or "phoneNumbers" array) and you MUST include "phone_country_code": "IN" or "+91" at top level.
-    - For picklists use the Option ID (number) from the cheat sheet.
-    - For date/datetime fields: call get_current_user, then parse_datetime_to_utc_iso_tool and put the UTC ISO string in field_values.
-    - For products: use "products" with a list of product objects, e.g. [{"id": 245208, "quantity": 10, "price": {"currencyId": 431, "value": 100}}].
-      Use lookup_products to find product IDs first.
-    """
-    try:
-        _reset_api_call_count()
-        result = await create_deal_logic(field_values)
-        deal_id = result.get("id", "?")
-        name = result.get("name", "Deal")
-        return f"✓ Deal created successfully.\n  ID: {deal_id}\n  Name: {name}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to create deal: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("create_deal")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
     """GET the deal first, merge field_values into it, then PUT the full body. No partial update."""
     deal_id = int(deal_id)
@@ -3587,37 +3426,6 @@ async def search_deals_by_term_logic(
     return "\n".join(lines)
 
 
-async def search_deals_by_term(
-    search_term: str,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "updatedAt,desc",
-) -> str:
-    """
-    Search deals by KEYWORD/TEXT TERM only (name, description, etc.).
-    Use ONLY when the user asks for "deals with X", "deals containing Y", or "deals named Z" WITH A SPECIFIC SEARCH TERM.
-
-    DO NOT use for:
-    - Getting all deals → use search_deals with filters=[{"field":"id","operator":"is_not_null"}]
-    - Filtering by field value → use search_deals instead
-
-    Requires a non-empty search_term.
-
-    search_term: The term to search for (e.g. "acme", "contract").
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "updatedAt,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        return await search_deals_by_term_logic(search_term, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_deals_by_term")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 async def search_idle_deals_logic(
     days: int,
     time_zone: Optional[str] = None,
@@ -3649,35 +3457,6 @@ async def search_idle_deals_logic(
     if not filters:
         return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_deal_field_instructions."
     return await search_deals_logic(filters, page=page, size=size, sort=sort)
-
-
-async def search_idle_deals(
-    days: int,
-    time_zone: Optional[str] = None,
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "createdAt,desc",
-) -> str:
-    """
-    Search for idle/stagnant deals: no activity for at least the given number of days.
-    Uses both updatedAt and latestActivityCreatedAt.
-
-    days: Minimum days with no activity (e.g. 10 for "no activity since 10 days").
-    time_zone: IANA timezone for threshold (e.g. America/New_York). Default: Asia/Calcutta.
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "createdAt,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        if days < 0:
-            return "Error: days must be non-negative."
-        return await search_idle_deals_logic(days, time_zone, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search idle deals failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_idle_deals")
-        return f"✗ Unexpected error: {str(e)}"
 
 
 # ===========================================================================
@@ -3874,36 +3653,6 @@ async def create_company_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
         return result
 
 
-@mcp.tool()
-async def create_company(field_values: Dict[str, Any]) -> str:
-    """
-    Create a company in Kylas CRM with only the fields the user wants (no static field list).
-
-    You MUST call get_company_field_instructions FIRST to get valid API names and Field IDs.
-    Infer from user context which fields to send; include only those in field_values.
-
-    field_values: Map of field identifier to value.
-    - Standard fields: use API name as key at top level (e.g. name, website, employees).
-    - Custom fields: MUST be under "customFieldValues" with **internal name** as key (e.g. "customFieldValues": {"cfCompanyType": "Enterprise"}). Do not use field ID as key.
-    - For a single email use "email": "user@example.com". For phones use "phone": "5551234567" (or "phoneNumbers" array) and you MUST include "phone_country_code": "IN" or "+91" at top level.
-    - For picklists use the Option ID (number) from the cheat sheet.
-    - For date/datetime fields: call get_current_user, then parse_datetime_to_utc_iso_tool and put the UTC ISO string in field_values.
-    """
-    try:
-        _reset_api_call_count()
-        result = await create_company_logic(field_values)
-        company_id = result.get("id", "?")
-        name = result.get("name", "Company")
-        return f"✓ Company created successfully.\n  ID: {company_id}\n  Name: {name}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to create company: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("create_company")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 async def update_company_logic(company_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
     """GET the company first, merge field_values into it, then PUT the full body. No partial update."""
     company_id = int(company_id)
@@ -4076,39 +3825,6 @@ async def search_companies_logic(
         lines.append(f"• ID: {cid} | Name: {name} | Website: {website} | Email: {email} | Phone: {phone}")
     lines.append("-" * 60)
     return "\n".join(lines)
-
-
-async def search_companies(
-    filters: List[Dict[str, Any]],
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "createdAt,desc",
-) -> str:
-    """
-    Search/filter companies. Only fields marked [FILTERABLE] in get_company_field_instructions can be used.
-    Call get_company_field_instructions first to get filterable fields and their types.
-
-    filters: List of filter objects. Each must have:
-      - field (str): Field internal/API name (e.g. name, website, country, createdAt).
-      - operator (str): One of the allowed operators for that field type (e.g. equal, contains, greater).
-      - value: Value to compare. For PICK_LIST/MULTI_PICKLIST use Option ID (number), except
-        country — use internal name (string).
-      - timeZone (str, optional): For date/datetime filters only.
-      - type (str, optional): Field type from cheat sheet.
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "createdAt,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        if not filters:
-            return "Error: filters list cannot be empty. Provide at least one filter with field, operator, and value."
-        return await search_companies_logic(filters, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_companies")
-        return f"✗ Unexpected error: {str(e)}"
 
 
 # ===========================================================================
@@ -4306,28 +4022,6 @@ async def lookup_meeting_invitees_logic(query: str) -> str:
     return "\n".join(lines)
 
 
-async def lookup_meeting_invitees(query: str) -> str:
-    """
-    Look up meeting invitees and organizer candidates (users, leads, contacts, external).
-    Calls GET /search/meeting-invitee/lookup — same as the Kylas web app.
-
-    Call this FIRST when the user mentions meeting organizer or invitees by name, before
-    search_meetings (organizer filter) or create_meeting (participants). Rows include
-    id, name, entity (user | lead | contact | external); for organizer, use the user row
-    that matches the person's name.
-
-    query: Search string (e.g. broad 'key:' or a name / field:value pattern per your tenant).
-    """
-    try:
-        _reset_api_call_count()
-        return await lookup_meeting_invitees_logic(query)
-    except KylasAPIError as e:
-        return f"Error: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("lookup_meeting_invitees")
-        return f"Unexpected error: {str(e)}"
-
-
 # ---------------------------------------------------------------------------
 # Meeting related-entity lookup (resolve IDs before meetings/search filters)
 # ---------------------------------------------------------------------------
@@ -4403,79 +4097,6 @@ async def lookup_companies_for_meeting_logic(query: str) -> str:
         data = await handle_api_response(response, "Lookup companies for meeting")
     rows = _meeting_lookup_rows_from_response(data)
     return _format_meeting_entity_lookup_result("compan(y/ies)", q, rows)
-
-
-async def lookup_leads_for_meeting(query: str = "firstName:") -> str:
-    """
-    Look up leads for meeting association / search filters. GET /search/lead/lookup (Kylas web).
-
-    Call FIRST when the user wants meetings linked to a lead by name — then search_meetings with
-    {"field": "associatedLeads", "operator": "equal", "value": <lead_id>}.
-
-    query: Lookup q string (default firstName: for a broad list; e.g. firstName:John or companyName:Acme per tenant).
-    """
-    try:
-        _reset_api_call_count()
-        return await lookup_leads_for_meeting_logic(query)
-    except KylasAPIError as e:
-        return f"Error: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("lookup_leads_for_meeting")
-        return f"Unexpected error: {str(e)}"
-
-
-async def lookup_contacts_for_meeting(query: str = "firstName:") -> str:
-    """
-    Look up contacts for meeting association / search filters. GET /search/contact/lookup.
-
-    Then search_meetings with {"field": "associatedContacts", "operator": "equal", "value": <contact_id>}.
-
-    query: Lookup q (default firstName:).
-    """
-    try:
-        _reset_api_call_count()
-        return await lookup_contacts_for_meeting_logic(query)
-    except KylasAPIError as e:
-        return f"Error: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("lookup_contacts_for_meeting")
-        return f"Unexpected error: {str(e)}"
-
-
-async def lookup_deals_for_meeting(query: str = "name:") -> str:
-    """
-    Look up deals for meeting association / search filters. GET /search/deal/lookup.
-
-    Then search_meetings with {"field": "associatedDeals", "operator": "equal", "value": <deal_id>}.
-
-    query: Lookup q (default name:).
-    """
-    try:
-        _reset_api_call_count()
-        return await lookup_deals_for_meeting_logic(query)
-    except KylasAPIError as e:
-        return f"Error: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("lookup_deals_for_meeting")
-        return f"Unexpected error: {str(e)}"
-
-
-async def lookup_companies_for_meeting(query: str = "comp:") -> str:
-    """
-    Look up companies for meeting association / search filters. GET /companies/lookup?view=meeting.
-
-    Then search_meetings with {"field": "associatedCompanies", "operator": "equal", "value": <company_id>}.
-
-    query: Lookup q (default comp:).
-    """
-    try:
-        _reset_api_call_count()
-        return await lookup_companies_for_meeting_logic(query)
-    except KylasAPIError as e:
-        return f"Error: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("lookup_companies_for_meeting")
-        return f"Unexpected error: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
@@ -4586,44 +4207,6 @@ async def create_meeting_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
         result = await handle_api_response(response, "Create meeting")
         logger.info("Meeting created with ID: %s", result.get("id"))
         return result
-
-
-@mcp.tool()
-async def create_meeting(field_values: Dict[str, Any]) -> str:
-    """
-    Create a meeting in Kylas CRM.
-
-    You MUST call get_meeting_field_instructions FIRST. Then ask the user for required details.
-
-    field_values: Meeting payload with these fields:
-    - title (str, REQUIRED): Meeting title
-    - from (str, REQUIRED): Start datetime in UTC ISO format (e.g. "2024-01-15T08:00:00.000Z")
-    - to (str, REQUIRED): End datetime in UTC ISO format
-    - allDay (bool): Whether it's an all-day meeting (default false)
-    - participants (list, REQUIRED): List of invitees, e.g. [{"id": 2530, "entity": "user"}]
-      Use lookup_meeting_related_entity with entity_type='invitee' to find participant details.
-      RULES: Leads/contacts MUST have a valid email. Deals CANNOT be added. Inform the user if they asked to add a deal.
-    - relatedTo (list): Related entities, e.g. [{"id": 150, "entity": "contact"}, {"id": 169, "entity": "deal"}]
-      Entity can be: "lead", "contact", "deal", "company"
-    - timezone (dict): e.g. {"id": 372, "name": "Asia/Calcutta"} — get ID from get_meeting_field_instructions
-    - location (str): Meeting location
-    - description (str): Meeting description
-
-    IMPORTANT: Convert user's local datetime to UTC using get_current_user (for timezone) then parse_datetime_to_utc_iso_tool.
-    """
-    try:
-        _reset_api_call_count()
-        result = await create_meeting_logic(field_values)
-        meeting_id = result.get("id", "?")
-        title = result.get("title", "Meeting")
-        return f"✓ Meeting created successfully.\n  ID: {meeting_id}\n  Title: {title}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to create meeting: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("create_meeting")
-        return f"✗ Unexpected error: {str(e)}"
 
 
 async def update_meeting_logic(meeting_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
@@ -4963,51 +4546,6 @@ async def search_meetings(
         return f"✗ Unexpected error: {str(e)}"
 
 
-async def search_all_meetings(
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "from,asc",
-) -> str:
-    """
-    Get all meetings (no filters). Use when user asks to see upcoming meetings or all meetings.
-
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "from,asc" (default — upcoming first).
-    """
-    try:
-        _reset_api_call_count()
-        payload = {"jsonRule": _MEETING_SEARCH_JSON_RULE_ALL}
-        params = {"page": _meetings_search_api_page(page), "size": min(size, 100)}
-        if sort:
-            params["sort"] = sort
-        logger.info("Fetching all meetings (page %d)", page)
-        async with get_client() as client:
-            response = await client.post("/meetings/search", params=params, json=payload)
-            data = await handle_api_response(response, "Search all meetings")
-        results = data.get("content", data.get("data", []))
-        total = data.get("totalElements", data.get("total", len(results)))
-        total_pages = data.get("totalPages", 1)
-        if not results:
-            return "No meetings found."
-        lines = [f"Found {len(results)} meeting(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
-        for m in results:
-            mid = m.get("id", "?")
-            title = m.get("title", "—")
-            status = m.get("status", "—")
-            from_dt = m.get("from", "—")
-            to_dt = m.get("to", "—")
-            location = m.get("location", "—") or "—"
-            lines.append(f"• ID: {mid} | Title: {title} | Status: {status} | From: {from_dt} | To: {to_dt} | Location: {location}")
-        lines.append("-" * 60)
-        return "\n".join(lines)
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_all_meetings")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 # ===========================================================================
 # CALL LOG ENTITY
 # ===========================================================================
@@ -5127,47 +4665,6 @@ async def create_call_log_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
         result = await handle_api_response(response, "Create call log")
         logger.info("Call log created with ID: %s", result.get("id"))
         return result
-
-
-@mcp.tool()
-async def create_call_log(field_values: Dict[str, Any]) -> str:
-    """
-    Create a call log in Kylas CRM. Links a call to a lead, contact, or deal.
-
-    You MUST call get_call_log_field_instructions FIRST. Then ask the user for required details:
-    1. Which entity (lead/contact/deal) and its ID
-    2. Phone number
-    3. Call type: "incoming" or "outgoing"
-    4. Outcome: "connected", "rejected", "busy", "no_answer", "missed_call", "in_progress"
-    5. Start time (convert to UTC using get_current_user + parse_datetime_to_utc_iso_tool)
-    6. Duration in seconds (optional)
-    7. Notes (optional)
-
-    field_values: Call log payload:
-    - outcome (str, REQUIRED): "connected", "rejected", "busy", "no_answer", "missed_call", "in_progress"
-    - callType (str, REQUIRED): "incoming" or "outgoing"
-    - startTime (str, REQUIRED): UTC ISO datetime (e.g. "2024-01-15T08:00:00.000Z")
-    - phoneNumber (str, REQUIRED): Phone number (e.g. "9618488578")
-    - duration (int/str): Duration in seconds (e.g. 420)
-    - relatedTo (dict, REQUIRED): {"id": <entity_id>, "entity": "lead|contact|deal", "phoneNumber": "..."}
-    - associatedTo (list, optional): For deal calls, associate contacts: [{"id": <contact_id>, "entity": "contact", "phoneNumber": "..."}]
-    - notes (list, optional): [{"description": "Note text"}]
-    - callRecording (dict, optional): {"url": "https://...", "fileName": "call.mp3", "data": ""}
-    """
-    try:
-        _reset_api_call_count()
-        result = await create_call_log_logic(field_values)
-        log_id = result.get("id", "?")
-        outcome = result.get("outcome", "")
-        call_type = result.get("callType", "")
-        return f"✓ Call log created successfully.\n  ID: {log_id}\n  Type: {call_type}\n  Outcome: {outcome}"
-    except ValueError as e:
-        return f"✗ {e}"
-    except KylasAPIError as e:
-        return f"✗ Failed to create call log: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("create_call_log")
-        return f"✗ Unexpected error: {str(e)}"
 
 
 async def update_call_log_logic(call_log_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
@@ -5531,78 +5028,6 @@ async def search_call_logs_logic(
     return "\n".join(lines)
 
 
-async def search_call_logs(
-    filters: List[Dict[str, Any]],
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "createdAt,desc",
-) -> str:
-    """
-    Search/filter call logs. Only fields marked [FILTERABLE] in get_call_log_field_instructions can be used.
-    Call get_call_log_field_instructions first.
-
-    filters: List of filter objects. Each must have:
-      - field (str): Field API name (e.g. outcome, callType, owner, createdAt, startTime, phoneNumber).
-      - operator (str): Operator for that field type (e.g. equal, contains, greater).
-      - value: Value to compare. For outcome use internal name (e.g. "connected", "busy").
-        For callType use "incoming" or "outgoing". For owner/createdBy use user ID (number).
-      - timeZone (str, optional): For date/datetime filters.
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "createdAt,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        if not filters:
-            return "Error: filters list cannot be empty."
-        return await search_call_logs_logic(filters, page, size, sort)
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_call_logs")
-        return f"✗ Unexpected error: {str(e)}"
-
-
-async def search_all_call_logs(
-    page: int = 0,
-    size: int = 20,
-    sort: Optional[str] = "createdAt,desc",
-) -> str:
-    """
-    Get all call logs (no filters). Use when user asks to see recent call logs or all call logs.
-
-    page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
-    sort: Sort e.g. "createdAt,desc" (default).
-    """
-    try:
-        _reset_api_call_count()
-        payload = {"jsonRule": None}
-        params = {"page": _call_logs_search_api_page(page), "size": min(size, 100)}
-        if sort:
-            params["sort"] = sort
-        logger.info("Fetching all call logs (page %d)", page)
-        async with get_client() as client:
-            response = await client.post("/call-logs/search", params=params, json=payload)
-            data = await handle_api_response(response, "Search all call logs")
-        results = data.get("content", data.get("data", []))
-        total = data.get("totalElements", data.get("total", len(results)))
-        total_pages = data.get("totalPages", 1)
-        if not results:
-            return "No call logs found."
-        lines = [f"Found {len(results)} call log(s) (page {page + 1} of {total_pages}, total {total})", ""]
-        lines.append(_format_call_logs_table(results))
-        lines.append("")
-        lines.append("💡 HINT: For call logs showing 'Related: contact#123' or 'lead#456', use:")
-        lines.append("  • get_call_logs(entity_id=123, entity_type='contact') to see full contact details with their call logs")
-        return "\n".join(lines)
-    except KylasAPIError as e:
-        return f"✗ Search failed: {e.message}\n  Details: {e.response_body}"
-    except Exception as e:
-        logger.exception("search_all_call_logs")
-        return f"✗ Unexpected error: {str(e)}"
-
-
 # ---------------------------------------------------------------------------
 # NOTES: Add notes to Lead, Contact, Deal, Company, Meeting, Call Log
 # ---------------------------------------------------------------------------
@@ -5932,6 +5357,42 @@ _ENTITY_CONFIG = {
 
 
 # ---------------------------------------------------------------------------
+# CRUD Config for generic create/update/get tools
+# ---------------------------------------------------------------------------
+
+_ENTITY_CRUD_CONFIG: Dict[str, Dict[str, Any]] = {
+    "lead": {
+        "create_fn": create_lead_logic,
+        "name_fn": lambda r: (f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or "Lead"),
+    },
+    "contact": {
+        "create_fn": create_contact_logic,
+        "name_fn": lambda r: (f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or "Contact"),
+    },
+    "deal": {
+        "create_fn": create_deal_logic,
+        "name_fn": lambda r: r.get("name", "Deal"),
+    },
+    "task": {
+        "create_fn": create_task_logic,
+        "name_fn": lambda r: r.get("name", "Task"),
+    },
+    "company": {
+        "create_fn": create_company_logic,
+        "name_fn": lambda r: r.get("name", "Company"),
+    },
+    "meeting": {
+        "create_fn": create_meeting_logic,
+        "name_fn": lambda r: r.get("title", "Meeting"),
+    },
+    "call_log": {
+        "create_fn": create_call_log_logic,
+        "name_fn": lambda r: f"{r.get('callType', '')} / {r.get('outcome', '')}",
+    },
+}
+
+
+# ---------------------------------------------------------------------------
 # Generic Search Tool
 # ---------------------------------------------------------------------------
 
@@ -6130,6 +5591,97 @@ async def search_idle_entities(
     sort: Sort e.g. "createdAt,desc" (default).
     """
     return await search_idle_entities_logic(entity_type, days, time_zone, page, size, sort)
+
+
+# ---------------------------------------------------------------------------
+# Generic CRUD Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def create_entity(entity_type: str, field_values: Dict[str, Any]) -> str:
+    """
+    Create any CRM entity. Use instead of entity-specific create tools.
+    Call get_entity_field_instructions(entity_type) FIRST to get field names and IDs.
+
+    Valid entity_type values: lead, contact, deal, task, company, meeting, call_log
+
+    === PHONE & EMAIL RULES (apply to lead, contact, deal, company) ===
+    Phone:
+      - Shorthand: "phone": "9876543210" + "phone_country_code": "IN"  (2-letter code or dial prefix e.g. "+91")
+      - Full array: "phoneNumbers": [{"value": "9876543210", "code": "IN", "type": "MOBILE", "primary": true}]
+        Still include "phone_country_code" at top level even with full array.
+      - REQUIRED: If the user gave a phone number but NO country/dial code, DO NOT call this tool — ask them first.
+      - Phone types: MOBILE, WORK, HOME, PERSONAL. First entry is primary by default.
+    Email:
+      - Shorthand: "email": "user@example.com"  (becomes OFFICE, primary)
+      - Full array: "emails": [{"value": "user@example.com", "type": "OFFICE", "primary": true}]
+      - Email types: OFFICE, PERSONAL. Exactly one must be primary.
+
+    === FIELD_VALUES FORMAT PER ENTITY TYPE ===
+
+    lead / contact:
+      {"firstName": "Jane", "lastName": "Doe",
+       "email": "jane@example.com",
+       "phone": "9876543210", "phone_country_code": "IN",
+       "customFieldValues": {"cfLeadSource": "Web"},   ← internal names only
+       "leadSource": <picklist_option_id>}              ← picklist = Option ID number
+
+    deal:
+      {"name": "Big Deal",
+       "closingDate": "2026-06-30T00:00:00.000Z",       ← UTC ISO
+       "estimatedValue": {"currencyId": 431, "value": 50000},  ← NEVER a plain number
+       "ownedBy": {"id": <user_id>},
+       "customFieldValues": {"cfDealStatus": "Active"}}
+
+    task:
+      {"name": "Follow up",
+       "dueDate": "2026-05-01T18:29:59.999Z",           ← UTC ISO
+       "assignedTo": <user_id>,
+       "relation": [{"targetEntityId": <id>, "targetEntityType": "LEAD", "targetEntityName": "<name>"}],
+       "customFieldValues": {"cfPriority": "High"}}
+
+    company:
+      {"name": "Acme Corp", "website": "https://acme.com",
+       "email": "contact@acme.com",
+       "phone": "9876543210", "phone_country_code": "IN",
+       "customFieldValues": {"cfIndustry": "SaaS"}}
+
+    meeting:
+      {"title": "Demo Call",                             ← REQUIRED
+       "from": "2026-05-10T08:00:00.000Z",              ← REQUIRED, UTC ISO
+       "to":   "2026-05-10T08:30:00.000Z",              ← REQUIRED, UTC ISO
+       "participants": [{"id": <user_id>, "entity": "user"}],  ← REQUIRED; NO deals
+       "relatedTo": [{"id": <lead_id>, "entity": "lead"}],
+       "timezone": {"id": 372, "name": "Asia/Calcutta"}}
+      Use get_current_user + parse_datetime_to_utc_iso_tool to convert local time to UTC.
+
+    call_log:
+      {"outcome": "connected",                           ← REQUIRED: connected/rejected/busy/no_answer/missed_call/in_progress
+       "callType": "outgoing",                           ← REQUIRED: incoming/outgoing
+       "startTime": "2026-05-10T08:00:00.000Z",         ← REQUIRED, UTC ISO
+       "phoneNumber": "9876543210",                      ← REQUIRED
+       "relatedTo": {"id": <entity_id>, "entity": "lead", "phoneNumber": "9876543210"},  ← REQUIRED
+       "duration": 120,                                  ← seconds, optional
+       "notes": [{"description": "Discussed pricing"}]} ← optional
+    """
+    cfg = _ENTITY_CRUD_CONFIG.get(entity_type)
+    if not cfg:
+        valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
+        return f"✗ Unknown entity_type '{entity_type}'. Valid: {valid}"
+    try:
+        _reset_api_call_count()
+        result = await cfg["create_fn"](field_values)
+        entity_id = result.get("id", "?")
+        name = cfg["name_fn"](result)
+        label = entity_type.replace("_", " ").title()
+        return f"✓ {label} created successfully.\n  ID: {entity_id}\n  Name: {name}"
+    except ValueError as e:
+        return f"✗ {e}"
+    except KylasAPIError as e:
+        return f"✗ Failed to create {entity_type}: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("create_entity")
+        return f"✗ Unexpected error: {str(e)}"
 
 
 # ---------------------------------------------------------------------------

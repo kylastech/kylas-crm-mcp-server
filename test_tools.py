@@ -1118,5 +1118,66 @@ def test_throttled_client_context_user_agent_format():
     assert ua == f"kylas_mcp_server({main.SERVER_VERSION}) on Claude Desktop(1.2.3)"
 
 
+# ---------------------------------------------------------------------------
+# create_entity Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_create_entity_lead_success():
+    """create_entity dispatches to create_lead_logic and formats the response."""
+    from main import create_entity, _ENTITY_CRUD_CONFIG
+    mock_result = {"id": 42, "firstName": "Jane", "lastName": "Doe"}
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"lead": {
+        "create_fn": AsyncMock(return_value=mock_result),
+        "name_fn": lambda r: f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or "Lead",
+    }}):
+        result = await create_entity("lead", {"firstName": "Jane", "lastName": "Doe"})
+    assert "✓" in result
+    assert "42" in result
+    assert "Jane Doe" in result
+    assert "Lead" in result
+
+
+@pytest.mark.asyncio
+async def test_create_entity_deal_success():
+    """create_entity dispatches to create_deal_logic and formats the response."""
+    from main import create_entity, _ENTITY_CRUD_CONFIG
+    mock_result = {"id": 99, "name": "Big Deal"}
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"deal": {
+        "create_fn": AsyncMock(return_value=mock_result),
+        "name_fn": lambda r: r.get("name", "Deal"),
+    }}):
+        result = await create_entity("deal", {"name": "Big Deal"})
+    assert "✓" in result
+    assert "99" in result
+    assert "Big Deal" in result
+
+
+@pytest.mark.asyncio
+async def test_create_entity_invalid_type():
+    """create_entity returns an error message for unknown entity_type."""
+    from main import create_entity
+    result = await create_entity("unicorn", {"name": "test"})
+    assert "✗" in result
+    assert "unicorn" in result
+    assert "Unknown entity_type" in result
+
+
+@pytest.mark.asyncio
+async def test_create_entity_api_error():
+    """create_entity surfaces KylasAPIError cleanly."""
+    from main import create_entity, _ENTITY_CRUD_CONFIG, KylasAPIError
+    err = KylasAPIError("Bad request")
+    err.message = "Bad request"
+    err.response_body = "{}"
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"task": {
+        "create_fn": AsyncMock(side_effect=err),
+        "name_fn": lambda r: r.get("name", "Task"),
+    }}):
+        result = await create_entity("task", {"name": "Test Task"})
+    assert "✗" in result
+    assert "Bad request" in result
+
+
 if __name__ == "__main__":
     asyncio.run(run_manual_tests())
