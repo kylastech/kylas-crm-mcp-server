@@ -1054,5 +1054,231 @@ def test_search_tasks_with_any_relation_post_merge_sort():
     assert all_tasks[2]["id"] == 2, "Aug last"
 
 
+# ---------------------------------------------------------------------------
+# User-Agent / MCP client name Tests
+# ---------------------------------------------------------------------------
+
+def _make_mock_context(client_name: str, client_version: str):
+    """Build a mock fastmcp Context with clientInfo populated."""
+    mock_client_info = MagicMock()
+    mock_client_info.name = client_name
+    mock_client_info.version = client_version
+
+    mock_client_params = MagicMock()
+    mock_client_params.clientInfo = mock_client_info
+
+    mock_session = MagicMock()
+    mock_session.client_params = mock_client_params
+
+    mock_ctx = MagicMock()
+    mock_ctx.session = mock_session
+    return mock_ctx
+
+
+def test_get_mcp_client_name_with_name_and_version():
+    """Returns 'Name(version)' when both client name and version are present."""
+    mock_ctx = _make_mock_context("Claude Desktop", "1.2.3")
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+        result = main._get_mcp_client_name()
+    assert result == "Claude Desktop(1.2.3)"
+
+
+def test_get_mcp_client_name_without_version():
+    """Returns just the name when version is empty."""
+    mock_ctx = _make_mock_context("cursor", "")
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+        result = main._get_mcp_client_name()
+    assert result == "cursor"
+
+
+def test_get_mcp_client_name_outside_request_context():
+    """Returns 'unknown' when called outside a request (get_context raises)."""
+    with patch.object(main.mcp, "get_context", side_effect=LookupError):
+        result = main._get_mcp_client_name()
+    assert result == "unknown"
+
+
+def test_get_mcp_client_name_no_client_params():
+    """Returns 'unknown' when session has no client_params."""
+    mock_session = MagicMock()
+    mock_session.client_params = None
+    mock_ctx = MagicMock()
+    mock_ctx.session = mock_session
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+        result = main._get_mcp_client_name()
+    assert result == "unknown"
+
+
+def test_throttled_client_context_user_agent_format():
+    """User-Agent header must be 'kylas_mcp_server({version}) on {client}'."""
+    with patch("main._resolve_api_key", return_value="test-key"), \
+         patch("main._get_mcp_client_name", return_value="Claude Desktop(1.2.3)"):
+        ctx = main._ThrottledClientContext()
+        ua = ctx._raw.headers.get("user-agent")
+    assert ua == f"kylas_mcp_server({main.SERVER_VERSION}) on Claude Desktop(1.2.3)"
+
+
+# ---------------------------------------------------------------------------
+# create_entity Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_create_entity_lead_success():
+    """create_entity dispatches to create_lead_logic and formats the response."""
+    from main import create_entity, _ENTITY_CRUD_CONFIG
+    mock_result = {"id": 42, "firstName": "Jane", "lastName": "Doe"}
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"lead": {
+        "create_fn": AsyncMock(return_value=mock_result),
+        "name_fn": lambda r: f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or "Lead",
+    }}):
+        result = await create_entity("lead", {"firstName": "Jane", "lastName": "Doe"})
+    assert "✓" in result
+    assert "42" in result
+    assert "Jane Doe" in result
+    assert "Lead" in result
+
+
+@pytest.mark.asyncio
+async def test_create_entity_deal_success():
+    """create_entity dispatches to create_deal_logic and formats the response."""
+    from main import create_entity, _ENTITY_CRUD_CONFIG
+    mock_result = {"id": 99, "name": "Big Deal"}
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"deal": {
+        "create_fn": AsyncMock(return_value=mock_result),
+        "name_fn": lambda r: r.get("name", "Deal"),
+    }}):
+        result = await create_entity("deal", {"name": "Big Deal"})
+    assert "✓" in result
+    assert "99" in result
+    assert "Big Deal" in result
+
+
+@pytest.mark.asyncio
+async def test_create_entity_invalid_type():
+    """create_entity returns an error message for unknown entity_type."""
+    from main import create_entity
+    result = await create_entity("unicorn", {"name": "test"})
+    assert "✗" in result
+    assert "unicorn" in result
+    assert "Unknown entity_type" in result
+
+
+@pytest.mark.asyncio
+async def test_create_entity_api_error():
+    """create_entity surfaces KylasAPIError cleanly."""
+    from main import create_entity, _ENTITY_CRUD_CONFIG, KylasAPIError
+    err = KylasAPIError("Bad request")
+    err.message = "Bad request"
+    err.response_body = "{}"
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"task": {
+        "create_fn": AsyncMock(side_effect=err),
+        "name_fn": lambda r: r.get("name", "Task"),
+    }}):
+        result = await create_entity("task", {"name": "Test Task"})
+    assert "✗" in result
+    assert "Bad request" in result
+
+
+# ---------------------------------------------------------------------------
+# update_entity Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_update_entity_lead_success():
+    """update_entity dispatches to update_fn for lead and formats the response."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG
+    mock_result = {"id": 55, "firstName": "Alice", "lastName": "Smith"}
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"lead": {
+        "update_fn": AsyncMock(return_value=mock_result),
+        "name_fn": lambda r: f"{r.get('firstName', '')} {r.get('lastName', '')}".strip() or "Lead",
+    }}):
+        result = await update_entity("lead", 55, {"firstName": "Alice"})
+    assert result.startswith("✓ Lead updated")
+    assert "55" in result
+    assert "Alice Smith" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_deal_success():
+    """update_entity dispatches to update_fn for deal and formats the response."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG
+    mock_result = {"id": 77, "name": "Mega Deal"}
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"deal": {
+        "update_fn": AsyncMock(return_value=mock_result),
+        "name_fn": lambda r: r.get("name", "Deal"),
+    }}):
+        result = await update_entity("deal", 77, {"name": "Mega Deal"})
+    assert result.startswith("✓ Deal updated")
+    assert "77" in result
+    assert "Mega Deal" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_call_log_success():
+    """update_entity dispatches to update_fn for call_log and formats the response."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG
+    mock_result = {"id": 33, "callType": "outgoing", "outcome": "connected"}
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"call_log": {
+        "update_fn": AsyncMock(return_value=mock_result),
+        "name_fn": lambda r: f"{r.get('callType', '')} / {r.get('outcome', '')}",
+    }}):
+        result = await update_entity("call_log", 33, {"outcome": "connected"})
+    assert result.startswith("✓ Call Log updated")
+    assert "33" in result
+    assert "outgoing / connected" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_invalid_type():
+    """update_entity returns an error message for unknown entity_type."""
+    from main import update_entity
+    result = await update_entity("unicorn", 1, {"name": "test"})
+    assert "✗" in result
+    assert "unicorn" in result
+    assert "Unknown entity_type" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_api_error():
+    """update_entity surfaces KylasAPIError cleanly."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG, KylasAPIError
+    err = KylasAPIError("Not found")
+    err.message = "Not found"
+    err.response_body = "{}"
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"task": {
+        "update_fn": AsyncMock(side_effect=err),
+        "name_fn": lambda r: r.get("name", "Task"),
+    }}):
+        result = await update_entity("task", 99, {"name": "Test Task"})
+    assert "✗" in result
+    assert "Not found" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_value_error():
+    """update_entity surfaces ValueError (e.g. missing phone country code) cleanly."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"lead": {
+        "update_fn": AsyncMock(side_effect=ValueError("phone: country/dial code required")),
+        "name_fn": lambda r: "Lead",
+    }}):
+        result = await update_entity("lead", 1, {"phone": "9876543210"})
+    assert "✗" in result
+    assert "country/dial code required" in result
+
+
+@pytest.mark.asyncio
+async def test_update_entity_calls_update_fn_with_correct_args():
+    """update_entity passes entity_id and field_values to update_fn."""
+    from main import update_entity, _ENTITY_CRUD_CONFIG
+    mock_update = AsyncMock(return_value={"id": 10, "name": "Acme"})
+    with patch.dict(_ENTITY_CRUD_CONFIG, {"company": {
+        "update_fn": mock_update,
+        "name_fn": lambda r: r.get("name", "Company"),
+    }}):
+        await update_entity("company", 10, {"name": "Acme"})
+    mock_update.assert_called_once_with(10, {"name": "Acme"})
+
+
 if __name__ == "__main__":
     asyncio.run(run_manual_tests())
