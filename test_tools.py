@@ -157,7 +157,7 @@ def test_normalize_field_values_email_string():
 
 
 def test_normalize_field_values_phone_string():
-    fv = {"firstName": "Jane", "phone": "5551234567", "phone_country_code": "+1"}
+    fv = {"firstName": "Jane", "phone": "5551234567", "phone_country_code": "+1", "phone_type": "MOBILE"}
     payload = _normalize_field_values(fv)
     assert payload["firstName"] == "Jane"
     # +1 normalized to 2-letter code US
@@ -171,12 +171,33 @@ def test_normalize_field_values_phone_string_requires_country_code():
         _normalize_field_values(fv)
 
 
+def test_normalize_field_values_phone_string_requires_phone_type():
+    """Phone without phone_type must raise so caller asks user."""
+    fv = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "IN"}
+    with pytest.raises(ValueError, match="type was not specified"):
+        _normalize_field_values(fv)
+
+
+def test_normalize_field_values_phone_string_invalid_type():
+    """Invalid phone_type must raise ValueError."""
+    fv = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "IN", "phone_type": "LANDLINE"}
+    with pytest.raises(ValueError, match="Invalid phone type"):
+        _normalize_field_values(fv)
+
+
+def test_normalize_field_values_phone_string_work_type():
+    """phone_type WORK is accepted and preserved in payload."""
+    fv = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "IN", "phone_type": "WORK"}
+    payload = _normalize_field_values(fv)
+    assert payload["phoneNumbers"] == [{"type": "WORK", "code": "IN", "value": "8830311640", "primary": True}]
+
+
 def test_normalize_field_values_phone_string_with_country_code():
     """Phone with phone_country_code IN or +91 normalizes to code IN."""
-    fv = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "IN"}
+    fv = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "IN", "phone_type": "MOBILE"}
     payload = _normalize_field_values(fv)
     assert payload["phoneNumbers"] == [{"type": "MOBILE", "code": "IN", "value": "8830311640", "primary": True}]
-    fv2 = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "+91"}
+    fv2 = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "+91", "phone_type": "MOBILE"}
     payload2 = _normalize_field_values(fv2)
     assert payload2["phoneNumbers"] == [{"type": "MOBILE", "code": "IN", "value": "8830311640", "primary": True}]
 
@@ -1278,6 +1299,104 @@ async def test_update_entity_calls_update_fn_with_correct_args():
     }}):
         await update_entity("company", 10, {"name": "Acme"})
     mock_update.assert_called_once_with(10, {"name": "Acme"})
+
+
+# ---------------------------------------------------------------------------
+# _is_stage_lock_error Tests
+# ---------------------------------------------------------------------------
+
+def test_is_stage_lock_error_no_body():
+    from main import _is_stage_lock_error, KylasAPIError
+    err = KylasAPIError("some error")
+    err.response_body = None
+    assert _is_stage_lock_error(err) is False
+
+
+def test_is_stage_lock_error_invalid_json():
+    from main import _is_stage_lock_error, KylasAPIError
+    err = KylasAPIError("some error")
+    err.response_body = "not json"
+    assert _is_stage_lock_error(err) is False
+
+
+def test_is_stage_lock_error_correct_code():
+    from main import _is_stage_lock_error, KylasAPIError
+    err = KylasAPIError("stage lock")
+    err.response_body = json.dumps({"code": "01001086", "message": "Stage lock"})
+    assert _is_stage_lock_error(err) is True
+
+
+def test_is_stage_lock_error_different_code():
+    from main import _is_stage_lock_error, KylasAPIError
+    err = KylasAPIError("other error")
+    err.response_body = json.dumps({"code": "00000001", "message": "Other"})
+    assert _is_stage_lock_error(err) is False
+
+
+# ---------------------------------------------------------------------------
+# _advance_deal_to_stage_sequentially Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_advance_deal_sequentially_invalid_current_stage():
+    from main import _advance_deal_to_stage_sequentially, KylasAPIError
+    stages = [{"id": 1, "name": "S1", "forecastingType": "OPEN"}, {"id": 2, "name": "S2", "forecastingType": "OPEN"}]
+    with pytest.raises(KylasAPIError, match="not found in pipeline"):
+        await _advance_deal_to_stage_sequentially(99, stages, current_stage_id=999, target_stage_id=2, base_deal={})
+
+
+@pytest.mark.asyncio
+async def test_advance_deal_sequentially_invalid_target_stage():
+    from main import _advance_deal_to_stage_sequentially, KylasAPIError
+    stages = [{"id": 1, "name": "S1", "forecastingType": "OPEN"}, {"id": 2, "name": "S2", "forecastingType": "OPEN"}]
+    with pytest.raises(KylasAPIError, match="not found in pipeline"):
+        await _advance_deal_to_stage_sequentially(99, stages, current_stage_id=1, target_stage_id=999, base_deal={})
+
+
+@pytest.mark.asyncio
+async def test_advance_deal_sequentially_target_before_current():
+    from main import _advance_deal_to_stage_sequentially, KylasAPIError
+    stages = [
+        {"id": 1, "name": "S1", "forecastingType": "OPEN"},
+        {"id": 2, "name": "S2", "forecastingType": "OPEN"},
+        {"id": 3, "name": "S3", "forecastingType": "OPEN"},
+    ]
+    with pytest.raises(KylasAPIError, match="must be after current stage"):
+        await _advance_deal_to_stage_sequentially(99, stages, current_stage_id=3, target_stage_id=1, base_deal={})
+
+
+@pytest.mark.asyncio
+async def test_advance_deal_sequentially_happy_path():
+    from main import _advance_deal_to_stage_sequentially
+    stages = [
+        {"id": 10, "name": "S1", "forecastingType": "OPEN"},
+        {"id": 20, "name": "S2", "forecastingType": "OPEN"},
+        {"id": 30, "name": "S3", "forecastingType": "WON"},
+    ]
+    base_deal = {"id": 5, "pipeline": {"id": 1, "stage": {"id": 10}}}
+
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        # Each PUT returns the deal with the new stage
+        responses = [
+            {"id": 5, "pipeline": {"id": 1, "stage": {"id": 20}}},
+            {"id": 5, "pipeline": {"id": 1, "stage": {"id": 30}}},
+        ]
+        mock_responses = []
+        for r in responses:
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = r
+            mock_resp.raise_for_status = MagicMock()
+            mock_responses.append(mock_resp)
+        mock_client.put.side_effect = mock_responses
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await _advance_deal_to_stage_sequentially(5, stages, current_stage_id=10, target_stage_id=30, base_deal=base_deal)
+
+    assert result["pipeline"]["stage"]["id"] == 30
+    assert mock_client.put.call_count == 2
 
 
 if __name__ == "__main__":
