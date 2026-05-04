@@ -472,48 +472,29 @@ def _reset_api_call_count() -> None:
 
 
 class _ThrottledClient:
-    """Wraps httpx.AsyncClient to add 100–500 ms random delay before 2nd, 3rd, … request in the same tool.
-    Also retries on 429 responses with backoff (Retry-After header if present, else exponential: 2s, 4s, 8s)."""
-
-    _MAX_RETRIES = 3
+    """Wraps httpx.AsyncClient to add 100–500 ms random delay before 2nd, 3rd, … request in the same tool."""
 
     def __init__(self, client: httpx.AsyncClient):
         self._client = client
 
-    async def _request_with_429_retry(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        for attempt in range(self._MAX_RETRIES + 1):
-            response = await getattr(self._client, method)(url, **kwargs)
-            if response.status_code != 429 or attempt >= self._MAX_RETRIES:
-                return response
-            retry_after = min(
-                float(response.headers.get("Retry-After", 2 ** (attempt + 1))),
-                30.0,
-            )
-            logger.warning(
-                f"Rate limited (429) on {url}. Retrying in {retry_after:.1f}s "
-                f"(attempt {attempt + 1}/{self._MAX_RETRIES})"
-            )
-            await asyncio.sleep(retry_after)
-        return response  # exhausted retries — let handle_api_response raise KylasAPIError
-
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         await _before_api_call()
         try:
-            return await self._request_with_429_retry("get", url, **kwargs)
+            return await self._client.get(url, **kwargs)
         finally:
             _after_api_call()
 
     async def post(self, url: str, **kwargs: Any) -> httpx.Response:
         await _before_api_call()
         try:
-            return await self._request_with_429_retry("post", url, **kwargs)
+            return await self._client.post(url, **kwargs)
         finally:
             _after_api_call()
 
     async def put(self, url: str, **kwargs: Any) -> httpx.Response:
         await _before_api_call()
         try:
-            return await self._request_with_429_retry("put", url, **kwargs)
+            return await self._client.put(url, **kwargs)
         finally:
             _after_api_call()
 
@@ -609,6 +590,14 @@ async def handle_api_response(response: httpx.Response, operation: str) -> Dict[
     except httpx.HTTPStatusError as e:
         error_body = e.response.text
         logger.error(f"❌ {operation} failed: {e.response.status_code}")
+        if e.response.status_code == 429:
+            retry_after = e.response.headers.get("Retry-After", "30")
+            raise KylasAPIError(
+                f"Rate limit hit (429). Wait {retry_after} seconds before retrying. "
+                "If you were paginating, stop and ask the user before fetching more pages.",
+                status_code=429,
+                response_body=error_body,
+            )
         raise KylasAPIError(
             f"{operation} failed: {e.response.status_code}",
             status_code=e.response.status_code,
