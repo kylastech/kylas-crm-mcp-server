@@ -293,6 +293,18 @@ Before saying "Kylas doesn’t have X entity", check this mapping first. If the 
 
 ---
 
+## PAGINATION — AVOID RATE LIMITS (429)
+
+The Kylas API rate-limits rapid sequential requests. Every search tool returns `totalPages` — follow these rules strictly when there are multiple pages:
+
+1. **Always use the largest page size available** (`size=50` is the max for most endpoints). Fewer calls = fewer 429s.
+2. **Do NOT auto-fetch all pages sequentially.** Fetch page 1, show results, then ask: *"There are N more pages. Do you want me to fetch them?"* Wait for user confirmation before fetching page 2, 3, etc.
+3. **Use `return_all=True` / `fetch_all_pages=True` where available** (e.g. `lookup_users`). These flags do the paging server-side in one tool call — far safer than manual iteration.
+4. **One page at a time when manually paginating.** After showing page N, wait for the user to ask for the next page. Never fetch multiple pages in one reasoning step.
+5. **If you receive a 429 error:** stop, wait at least 5 seconds, then retry once. If it fails again, tell the user the API is rate-limited and suggest retrying after 30 seconds. (The server retries automatically up to 3 times with backoff, so a 429 reaching you means retries were exhausted.)
+
+---
+
 ## DEFAULT DATE RANGE — "SHOW ALL" / "GIVE ALL" QUERIES
 
 When the user asks for "all" records without a date range, apply `updatedAt ≥ (today − 90 days)`.
@@ -460,29 +472,48 @@ def _reset_api_call_count() -> None:
 
 
 class _ThrottledClient:
-    """Wraps httpx.AsyncClient to add 100–500 ms random delay before 2nd, 3rd, … request in the same tool."""
+    """Wraps httpx.AsyncClient to add 100–500 ms random delay before 2nd, 3rd, … request in the same tool.
+    Also retries on 429 responses with backoff (Retry-After header if present, else exponential: 2s, 4s, 8s)."""
+
+    _MAX_RETRIES = 3
 
     def __init__(self, client: httpx.AsyncClient):
         self._client = client
 
+    async def _request_with_429_retry(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        for attempt in range(self._MAX_RETRIES + 1):
+            response = await getattr(self._client, method)(url, **kwargs)
+            if response.status_code != 429 or attempt >= self._MAX_RETRIES:
+                return response
+            retry_after = min(
+                float(response.headers.get("Retry-After", 2 ** (attempt + 1))),
+                30.0,
+            )
+            logger.warning(
+                f"Rate limited (429) on {url}. Retrying in {retry_after:.1f}s "
+                f"(attempt {attempt + 1}/{self._MAX_RETRIES})"
+            )
+            await asyncio.sleep(retry_after)
+        return response  # exhausted retries — let handle_api_response raise KylasAPIError
+
     async def get(self, url: str, **kwargs: Any) -> httpx.Response:
         await _before_api_call()
         try:
-            return await self._client.get(url, **kwargs)
+            return await self._request_with_429_retry("get", url, **kwargs)
         finally:
             _after_api_call()
 
     async def post(self, url: str, **kwargs: Any) -> httpx.Response:
         await _before_api_call()
         try:
-            return await self._client.post(url, **kwargs)
+            return await self._request_with_429_retry("post", url, **kwargs)
         finally:
             _after_api_call()
 
     async def put(self, url: str, **kwargs: Any) -> httpx.Response:
         await _before_api_call()
         try:
-            return await self._client.put(url, **kwargs)
+            return await self._request_with_429_retry("put", url, **kwargs)
         finally:
             _after_api_call()
 
