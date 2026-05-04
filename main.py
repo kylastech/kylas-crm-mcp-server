@@ -44,6 +44,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
+import phonenumbers
 from dateutil import parser as dateutil_parser
 from fastmcp import FastMCP
 from dotenv import load_dotenv
@@ -1553,20 +1554,49 @@ def parse_datetime_to_utc_iso_tool(local_datetime: str, timezone: str) -> str:
 # Tool 4: Create Lead (single tool, dynamic field_values)
 # ---------------------------------------------------------------------------
 
-# Kylas API uses 2-letter country codes (e.g. IN, US). No default—caller must provide when phone is used.
-COUNTRY_CODE_MAP = {
-    "+91": "IN", "IN": "IN", "in": "IN", "india": "IN",
-    "+1": "US", "US": "US", "us": "US", "usa": "US",
-    "GB": "GB", "+44": "GB", "UK": "GB",
+# Non-standard aliases not recognized as ISO region codes by the phonenumbers library.
+_COUNTRY_CODE_ALIASES: Dict[str, str] = {
+    "UK": "GB",
+    "USA": "US",
+    "INDIA": "IN",
 }
 
 
 def _normalize_country_code(code: Optional[str]) -> str:
-    """Normalize user-provided country code to Kylas 2-letter code. Returns empty string if not provided (caller must require it when phone is present)."""
+    """Normalize user-provided country code/dial prefix to a Kylas 2-letter ISO region code.
+
+    Accepts:
+      - Dial prefixes: "+91" → "IN", "+1" → "US", "+44" → "GB", all 190+ countries
+      - ISO 3166-1 alpha-2 codes: "IN", "US", "GB", etc. (validated via phonenumbers)
+      - Common aliases: "UK" → "GB", "USA" → "US", "INDIA" → "IN"
+
+    Returns empty string if the code is absent or unrecognised (caller enforces presence when phone given).
+    """
     if not code or not str(code).strip():
         return ""
-    raw = str(code).strip().upper() if len(str(code).strip()) <= 3 else str(code).strip()
-    return COUNTRY_CODE_MAP.get(raw) or COUNTRY_CODE_MAP.get(code) or (raw if len(raw) == 2 else "")
+    raw = str(code).strip()
+
+    # Dial code prefix e.g. "+91", "+1", "+44"
+    if raw.startswith("+"):
+        try:
+            calling_code = int(raw[1:])
+            region = phonenumbers.region_code_for_country_code(calling_code)
+            if region and region != "ZZ":
+                return region
+        except (ValueError, Exception):
+            pass
+
+    upper = raw.upper()
+
+    # Non-standard aliases (UK, USA, INDIA, …)
+    if upper in _COUNTRY_CODE_ALIASES:
+        return _COUNTRY_CODE_ALIASES[upper]
+
+    # Validate 2-letter ISO region code via phonenumbers (returns 0 for unknown regions)
+    if phonenumbers.country_code_for_region(upper) != 0:
+        return upper
+
+    return ""
 
 
 def _ensure_single_primary(entries: List[Dict[str, Any]], allowed_types: List[str], default_type: str) -> List[Dict[str, Any]]:

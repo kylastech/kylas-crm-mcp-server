@@ -18,6 +18,7 @@ except ImportError:
 
 import main
 from main import (
+    _normalize_country_code,
     get_lead_field_instructions_logic,
     create_lead_logic,
     search_leads_logic,
@@ -95,6 +96,55 @@ MOCK_CREATE_LEAD_RESPONSE = {
     "lastName": "Doe",
     "emails": [{"type": "OFFICE", "value": "john@example.com", "primary": True}],
 }
+
+
+# ---------------------------------------------------------------------------
+# _normalize_country_code tests
+# ---------------------------------------------------------------------------
+
+def test_normalize_country_code_dial_prefix_common():
+    """Common dial prefixes resolve to correct 2-letter ISO codes via phonenumbers library."""
+    assert _normalize_country_code("+91") == "IN"
+    assert _normalize_country_code("+1") == "US"
+    assert _normalize_country_code("+44") == "GB"
+    assert _normalize_country_code("+61") == "AU"
+
+
+def test_normalize_country_code_dial_prefix_extended():
+    """Dial prefixes for countries not in the old COUNTRY_CODE_MAP resolve correctly."""
+    assert _normalize_country_code("+49") == "DE"   # Germany
+    assert _normalize_country_code("+33") == "FR"   # France
+    assert _normalize_country_code("+81") == "JP"   # Japan
+    assert _normalize_country_code("+55") == "BR"   # Brazil
+    assert _normalize_country_code("+64") == "NZ"   # New Zealand
+    assert _normalize_country_code("+27") == "ZA"   # South Africa
+    assert _normalize_country_code("+971") == "AE"  # UAE
+    assert _normalize_country_code("+65") == "SG"   # Singapore
+
+
+def test_normalize_country_code_iso_codes():
+    """Valid ISO 3166-1 alpha-2 region codes pass through unchanged (case-insensitive)."""
+    assert _normalize_country_code("IN") == "IN"
+    assert _normalize_country_code("US") == "US"
+    assert _normalize_country_code("GB") == "GB"
+    assert _normalize_country_code("AU") == "AU"
+    assert _normalize_country_code("in") == "IN"
+    assert _normalize_country_code("us") == "US"
+
+
+def test_normalize_country_code_aliases():
+    """Non-standard aliases are resolved via the alias map."""
+    assert _normalize_country_code("UK") == "GB"
+    assert _normalize_country_code("USA") == "US"
+    assert _normalize_country_code("INDIA") == "IN"
+
+
+def test_normalize_country_code_empty_and_invalid():
+    """Empty, None, and unrecognised codes return empty string."""
+    assert _normalize_country_code("") == ""
+    assert _normalize_country_code(None) == ""
+    assert _normalize_country_code("INVALID") == ""
+    assert _normalize_country_code("ZZZ") == ""
 
 
 # ---------------------------------------------------------------------------
