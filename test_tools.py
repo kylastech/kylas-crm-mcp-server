@@ -18,6 +18,7 @@ except ImportError:
 
 import main
 from main import (
+    _normalize_country_code,
     get_lead_field_instructions_logic,
     create_lead_logic,
     search_leads_logic,
@@ -98,6 +99,55 @@ MOCK_CREATE_LEAD_RESPONSE = {
 
 
 # ---------------------------------------------------------------------------
+# _normalize_country_code tests
+# ---------------------------------------------------------------------------
+
+def test_normalize_country_code_dial_prefix_common():
+    """Common dial prefixes resolve to correct 2-letter ISO codes via phonenumbers library."""
+    assert _normalize_country_code("+91") == "IN"
+    assert _normalize_country_code("+1") == "US"
+    assert _normalize_country_code("+44") == "GB"
+    assert _normalize_country_code("+61") == "AU"
+
+
+def test_normalize_country_code_dial_prefix_extended():
+    """Dial prefixes for countries not in the old COUNTRY_CODE_MAP resolve correctly."""
+    assert _normalize_country_code("+49") == "DE"   # Germany
+    assert _normalize_country_code("+33") == "FR"   # France
+    assert _normalize_country_code("+81") == "JP"   # Japan
+    assert _normalize_country_code("+55") == "BR"   # Brazil
+    assert _normalize_country_code("+64") == "NZ"   # New Zealand
+    assert _normalize_country_code("+27") == "ZA"   # South Africa
+    assert _normalize_country_code("+971") == "AE"  # UAE
+    assert _normalize_country_code("+65") == "SG"   # Singapore
+
+
+def test_normalize_country_code_iso_codes():
+    """Valid ISO 3166-1 alpha-2 region codes pass through unchanged (case-insensitive)."""
+    assert _normalize_country_code("IN") == "IN"
+    assert _normalize_country_code("US") == "US"
+    assert _normalize_country_code("GB") == "GB"
+    assert _normalize_country_code("AU") == "AU"
+    assert _normalize_country_code("in") == "IN"
+    assert _normalize_country_code("us") == "US"
+
+
+def test_normalize_country_code_aliases():
+    """Non-standard aliases are resolved via the alias map."""
+    assert _normalize_country_code("UK") == "GB"
+    assert _normalize_country_code("USA") == "US"
+    assert _normalize_country_code("INDIA") == "IN"
+
+
+def test_normalize_country_code_empty_and_invalid():
+    """Empty, None, and unrecognised codes return empty string."""
+    assert _normalize_country_code("") == ""
+    assert _normalize_country_code(None) == ""
+    assert _normalize_country_code("INVALID") == ""
+    assert _normalize_country_code("ZZZ") == ""
+
+
+# ---------------------------------------------------------------------------
 # Helper tests
 # ---------------------------------------------------------------------------
 
@@ -157,7 +207,7 @@ def test_normalize_field_values_email_string():
 
 
 def test_normalize_field_values_phone_string():
-    fv = {"firstName": "Jane", "phone": "5551234567", "phone_country_code": "+1"}
+    fv = {"firstName": "Jane", "phone": "5551234567", "phone_country_code": "+1", "phone_type": "MOBILE"}
     payload = _normalize_field_values(fv)
     assert payload["firstName"] == "Jane"
     # +1 normalized to 2-letter code US
@@ -171,12 +221,33 @@ def test_normalize_field_values_phone_string_requires_country_code():
         _normalize_field_values(fv)
 
 
+def test_normalize_field_values_phone_string_requires_phone_type():
+    """Phone without phone_type must raise so caller asks user."""
+    fv = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "IN"}
+    with pytest.raises(ValueError, match="type was not specified"):
+        _normalize_field_values(fv)
+
+
+def test_normalize_field_values_phone_string_invalid_type():
+    """Invalid phone_type must raise ValueError."""
+    fv = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "IN", "phone_type": "LANDLINE"}
+    with pytest.raises(ValueError, match="Invalid phone type"):
+        _normalize_field_values(fv)
+
+
+def test_normalize_field_values_phone_string_work_type():
+    """phone_type WORK is accepted and preserved in payload."""
+    fv = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "IN", "phone_type": "WORK"}
+    payload = _normalize_field_values(fv)
+    assert payload["phoneNumbers"] == [{"type": "WORK", "code": "IN", "value": "8830311640", "primary": True}]
+
+
 def test_normalize_field_values_phone_string_with_country_code():
     """Phone with phone_country_code IN or +91 normalizes to code IN."""
-    fv = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "IN"}
+    fv = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "IN", "phone_type": "MOBILE"}
     payload = _normalize_field_values(fv)
     assert payload["phoneNumbers"] == [{"type": "MOBILE", "code": "IN", "value": "8830311640", "primary": True}]
-    fv2 = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "+91"}
+    fv2 = {"firstName": "Jane", "phone": "8830311640", "phone_country_code": "+91", "phone_type": "MOBILE"}
     payload2 = _normalize_field_values(fv2)
     assert payload2["phoneNumbers"] == [{"type": "MOBILE", "code": "IN", "value": "8830311640", "primary": True}]
 
@@ -1278,6 +1349,104 @@ async def test_update_entity_calls_update_fn_with_correct_args():
     }}):
         await update_entity("company", 10, {"name": "Acme"})
     mock_update.assert_called_once_with(10, {"name": "Acme"})
+
+
+# ---------------------------------------------------------------------------
+# _is_stage_lock_error Tests
+# ---------------------------------------------------------------------------
+
+def test_is_stage_lock_error_no_body():
+    from main import _is_stage_lock_error, KylasAPIError
+    err = KylasAPIError("some error")
+    err.response_body = None
+    assert _is_stage_lock_error(err) is False
+
+
+def test_is_stage_lock_error_invalid_json():
+    from main import _is_stage_lock_error, KylasAPIError
+    err = KylasAPIError("some error")
+    err.response_body = "not json"
+    assert _is_stage_lock_error(err) is False
+
+
+def test_is_stage_lock_error_correct_code():
+    from main import _is_stage_lock_error, KylasAPIError
+    err = KylasAPIError("stage lock")
+    err.response_body = json.dumps({"code": "01001086", "message": "Stage lock"})
+    assert _is_stage_lock_error(err) is True
+
+
+def test_is_stage_lock_error_different_code():
+    from main import _is_stage_lock_error, KylasAPIError
+    err = KylasAPIError("other error")
+    err.response_body = json.dumps({"code": "00000001", "message": "Other"})
+    assert _is_stage_lock_error(err) is False
+
+
+# ---------------------------------------------------------------------------
+# _advance_deal_to_stage_sequentially Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_advance_deal_sequentially_invalid_current_stage():
+    from main import _advance_deal_to_stage_sequentially, KylasAPIError
+    stages = [{"id": 1, "name": "S1", "forecastingType": "OPEN"}, {"id": 2, "name": "S2", "forecastingType": "OPEN"}]
+    with pytest.raises(KylasAPIError, match="not found in pipeline"):
+        await _advance_deal_to_stage_sequentially(99, stages, current_stage_id=999, target_stage_id=2, base_deal={})
+
+
+@pytest.mark.asyncio
+async def test_advance_deal_sequentially_invalid_target_stage():
+    from main import _advance_deal_to_stage_sequentially, KylasAPIError
+    stages = [{"id": 1, "name": "S1", "forecastingType": "OPEN"}, {"id": 2, "name": "S2", "forecastingType": "OPEN"}]
+    with pytest.raises(KylasAPIError, match="not found in pipeline"):
+        await _advance_deal_to_stage_sequentially(99, stages, current_stage_id=1, target_stage_id=999, base_deal={})
+
+
+@pytest.mark.asyncio
+async def test_advance_deal_sequentially_target_before_current():
+    from main import _advance_deal_to_stage_sequentially, KylasAPIError
+    stages = [
+        {"id": 1, "name": "S1", "forecastingType": "OPEN"},
+        {"id": 2, "name": "S2", "forecastingType": "OPEN"},
+        {"id": 3, "name": "S3", "forecastingType": "OPEN"},
+    ]
+    with pytest.raises(KylasAPIError, match="must be after current stage"):
+        await _advance_deal_to_stage_sequentially(99, stages, current_stage_id=3, target_stage_id=1, base_deal={})
+
+
+@pytest.mark.asyncio
+async def test_advance_deal_sequentially_happy_path():
+    from main import _advance_deal_to_stage_sequentially
+    stages = [
+        {"id": 10, "name": "S1", "forecastingType": "OPEN"},
+        {"id": 20, "name": "S2", "forecastingType": "OPEN"},
+        {"id": 30, "name": "S3", "forecastingType": "WON"},
+    ]
+    base_deal = {"id": 5, "pipeline": {"id": 1, "stage": {"id": 10}}}
+
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        # Each PUT returns the deal with the new stage
+        responses = [
+            {"id": 5, "pipeline": {"id": 1, "stage": {"id": 20}}},
+            {"id": 5, "pipeline": {"id": 1, "stage": {"id": 30}}},
+        ]
+        mock_responses = []
+        for r in responses:
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = r
+            mock_resp.raise_for_status = MagicMock()
+            mock_responses.append(mock_resp)
+        mock_client.put.side_effect = mock_responses
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await _advance_deal_to_stage_sequentially(5, stages, current_stage_id=10, target_stage_id=30, base_deal=base_deal)
+
+    assert result["pipeline"]["stage"]["id"] == 30
+    assert mock_client.put.call_count == 2
 
 
 if __name__ == "__main__":

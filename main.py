@@ -44,6 +44,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
+import phonenumbers
 from dateutil import parser as dateutil_parser
 from fastmcp import FastMCP
 from dotenv import load_dotenv
@@ -265,6 +266,13 @@ This tenant uses custom names for CRM entities. Without this, you will misidenti
 ### Rule 1 — Entity field schemas (once per session)
 Call each entity’s field instructions tool the FIRST time you interact with that entity. Do NOT call it again for subsequent operations on the same entity in the same session.
 
+### Rule 2 — NEVER simulate CRM actions
+**CRITICAL: You MUST call the appropriate tool for every create / update / delete / search operation. Never respond as if an action succeeded without actually calling the tool.**
+- ❌ Do NOT write an artifact, table, or summary showing what "would be" created and then stop.
+- ❌ Do NOT say "Lead created" or "I’ve created the lead" without a successful tool call response.
+- ❌ Do NOT ask for confirmation before calling a create/update tool — just call it (unless a required field is missing).
+- ✅ Call the tool → show the result. That’s the only valid flow.
+
 | Entity    | Tool (call once per session)       |
 |-----------|------------------------------------|
 | Lead      | `get_lead_field_instructions`      |
@@ -282,6 +290,18 @@ Call each entity’s field instructions tool the FIRST time you interact with th
 Before saying "Kylas doesn’t have X entity", check this mapping first. If the user’s entity name is found here, use the standard type for all tool calls. Only say "entity not found" if the name is absent from both this mapping and the standard types.
 
 {ENTITY_LABEL_MAPPING}
+
+---
+
+## PAGINATION — AVOID RATE LIMITS (429)
+
+The Kylas API rate-limits rapid sequential requests. Every search tool returns `totalPages` — follow these rules strictly when there are multiple pages:
+
+1. **Always use the largest page size available** (`size=50` is the max for most endpoints). Fewer calls = fewer 429s.
+2. **Do NOT auto-fetch all pages sequentially.** Fetch page 1, show results, then ask: *"There are N more pages. Do you want me to fetch them?"* Wait for user confirmation before fetching page 2, 3, etc.
+3. **Use `return_all=True` / `fetch_all_pages=True` where available** (e.g. `lookup_users`). These flags do the paging server-side in one tool call — far safer than manual iteration.
+4. **One page at a time when manually paginating.** After showing page N, wait for the user to ask for the next page. Never fetch multiple pages in one reasoning step.
+5. **If you receive a 429 error:** stop, wait at least 5 seconds, then retry once. If it fails again, tell the user the API is rate-limited and suggest retrying after 30 seconds. (The server retries automatically up to 3 times with backoff, so a 429 reaching you means retries were exhausted.)
 
 ---
 
@@ -310,8 +330,9 @@ Full: `[{"email": "...", "type": "OFFICE|PERSONAL", "primary": true}]`
 
 ### Phone numbers
 Full: `[{"number": "...", "type": "MOBILE|WORK|HOME|PERSONAL", "code": "IN", "primary": true}]`
-Shorthand: `"phone": "5551234567"` + top-level `"phone_country_code": "IN"` (required whenever phone is included).
+Shorthand: `"phone": "5551234567"` + top-level `"phone_country_code": "IN"` + `"phone_type": "MOBILE"` (both required whenever phone is included).
 **If user gives phone but NO country/dial code: do NOT create/update — ask first. Never infer from currency, locale, or number format.**
+**If user gives phone but NO type: do NOT create/update — ask: "Is this number MOBILE, WORK, HOME, or PERSONAL?"**
 
 ### Picklist fields
 Use **Option ID** (number) from cheat sheet. Exceptions — use **internal name** (string): `requirementCurrency`, `companyBusinessType`, `country`, `timezone`, `companyIndustry`.
@@ -569,6 +590,14 @@ async def handle_api_response(response: httpx.Response, operation: str) -> Dict[
     except httpx.HTTPStatusError as e:
         error_body = e.response.text
         logger.error(f"❌ {operation} failed: {e.response.status_code}")
+        if e.response.status_code == 429:
+            retry_after = e.response.headers.get("Retry-After", "30")
+            raise KylasAPIError(
+                f"Rate limit hit (429). Wait {retry_after} seconds before retrying. "
+                "If you were paginating, stop and ask the user before fetching more pages.",
+                status_code=429,
+                response_body=error_body,
+            )
         raise KylasAPIError(
             f"{operation} failed: {e.response.status_code}",
             status_code=e.response.status_code,
@@ -602,6 +631,7 @@ Build `field_values` from user input only. For `update_deal`: pass deal ID from 
 - **Move to same-pipeline stage:** `update_deal(deal_id, {"pipelineStage": stage_id})`
 - **Move to different pipeline:** `update_deal(deal_id, {"pipeline": {...}, "forecastingType": "..."})` with full pipeline object including nested stage.
 - Closing reasons (Closed Lost/Unqualified): call `get_pipeline_details`, ask user to pick, then pass `pipelineStageReason`.
+- **Sequential stage flow:** If the pipeline has `sequentialStageFlow=true` (visible in `get_pipeline_details` output), stages cannot be skipped. The server handles this automatically — if a direct jump is blocked, it creates the deal in stage 1 and advances stage-by-stage. You do NOT need to do anything differently; just pass the desired target stage and the server will handle the sequential advancement transparently.
 
 ### Idle / Stagnant Deals
 `search_idle_entities("deal", days)` — or `search_entity("deal", [...])` with `updatedAt ≤ threshold AND latestActivityCreatedAt ≤ threshold`.
@@ -1436,25 +1466,26 @@ async def get_pipeline_stages(pipeline_id: int) -> str:
 async def get_pipeline_details_logic(pipeline_id: int) -> str:
     """
     Call GET /pipelines/{id}. Returns pipeline name, stages (id, name, forecastingType),
-    unqualifiedReasons (for Closed Unqualified), and lostReasons (for Closed Lost).
+    sequentialStageFlow flag, unqualifiedReasons (for Closed Unqualified), and lostReasons (for Closed Lost).
     Use when moving a lead to Closed Lost or Closed Unqualified: get reasons, ask the user to pick one,
     then update_lead with pipelineStageReason set to that exact string.
     """
     pipeline_id = int(pipeline_id)
-    async with get_client() as client:
-        response = await client.get(f"/pipelines/{pipeline_id}")
-        data = await handle_api_response(response, "Get pipeline details")
+    data = await _get_pipeline_details_raw(pipeline_id)
     name = data.get("name", "—")
+    sequential = data.get("sequentialStageFlow", False)
     lines = [
         f"Pipeline: {name} (ID: {pipeline_id})",
+        f"Sequential Stage Flow: {'YES — stages must be moved one at a time in order' if sequential else 'NO — any stage can be targeted directly'}",
         "",
-        "Stages:",
+        "Stages (ordered by position):",
     ]
-    for s in data.get("stages", []):
+    for s in sorted(data.get("stages", []), key=lambda x: x.get("position", 0)):
         sid = s.get("id", "?")
         sname = s.get("name", "—")
         ftype = s.get("forecastingType", "")
-        lines.append(f"  • Stage ID: {sid}  |  Name: {sname}  |  forecastingType: {ftype}")
+        pos = s.get("position", "?")
+        lines.append(f"  • Position {pos} | Stage ID: {sid}  |  Name: {sname}  |  forecastingType: {ftype}")
     unq = data.get("unqualifiedReasons") or []
     lost = data.get("lostReasons") or []
     lines.extend([
@@ -1543,20 +1574,49 @@ def parse_datetime_to_utc_iso_tool(local_datetime: str, timezone: str) -> str:
 # Tool 4: Create Lead (single tool, dynamic field_values)
 # ---------------------------------------------------------------------------
 
-# Kylas API uses 2-letter country codes (e.g. IN, US). No default—caller must provide when phone is used.
-COUNTRY_CODE_MAP = {
-    "+91": "IN", "IN": "IN", "in": "IN", "india": "IN",
-    "+1": "US", "US": "US", "us": "US", "usa": "US",
-    "GB": "GB", "+44": "GB", "UK": "GB",
+# Non-standard aliases not recognized as ISO region codes by the phonenumbers library.
+_COUNTRY_CODE_ALIASES: Dict[str, str] = {
+    "UK": "GB",
+    "USA": "US",
+    "INDIA": "IN",
 }
 
 
 def _normalize_country_code(code: Optional[str]) -> str:
-    """Normalize user-provided country code to Kylas 2-letter code. Returns empty string if not provided (caller must require it when phone is present)."""
+    """Normalize user-provided country code/dial prefix to a Kylas 2-letter ISO region code.
+
+    Accepts:
+      - Dial prefixes: "+91" → "IN", "+1" → "US", "+44" → "GB", all 190+ countries
+      - ISO 3166-1 alpha-2 codes: "IN", "US", "GB", etc. (validated via phonenumbers)
+      - Common aliases: "UK" → "GB", "USA" → "US", "INDIA" → "IN"
+
+    Returns empty string if the code is absent or unrecognised (caller enforces presence when phone given).
+    """
     if not code or not str(code).strip():
         return ""
-    raw = str(code).strip().upper() if len(str(code).strip()) <= 3 else str(code).strip()
-    return COUNTRY_CODE_MAP.get(raw) or COUNTRY_CODE_MAP.get(code) or (raw if len(raw) == 2 else "")
+    raw = str(code).strip()
+
+    # Dial code prefix e.g. "+91", "+1", "+44"
+    if raw.startswith("+"):
+        try:
+            calling_code = int(raw[1:])
+            region = phonenumbers.region_code_for_country_code(calling_code)
+            if region and region != "ZZ":
+                return region
+        except (ValueError, Exception):
+            pass
+
+    upper = raw.upper()
+
+    # Non-standard aliases (UK, USA, INDIA, …)
+    if upper in _COUNTRY_CODE_ALIASES:
+        return _COUNTRY_CODE_ALIASES[upper]
+
+    # Validate 2-letter ISO region code via phonenumbers (returns 0 for unknown regions)
+    if phonenumbers.country_code_for_region(upper) != 0:
+        return upper
+
+    return ""
 
 
 def _ensure_single_primary(entries: List[Dict[str, Any]], allowed_types: List[str], default_type: str) -> List[Dict[str, Any]]:
@@ -1584,6 +1644,74 @@ def _ensure_single_primary(entries: List[Dict[str, Any]], allowed_types: List[st
 EMAIL_TYPES = ["OFFICE", "PERSONAL"]
 PHONE_TYPES = ["MOBILE", "WORK", "HOME", "PERSONAL"]
 
+# Kylas error code returned when trying to skip a stage on a pipeline with sequentialStageFlow=true
+STAGE_LOCK_ERROR_CODE = "01001086"
+
+
+def _is_stage_lock_error(error: KylasAPIError) -> bool:
+    """Return True if this error is the Kylas sequential-stage-flow lock (code 01001086)."""
+    if not error.response_body:
+        return False
+    try:
+        body = json.loads(error.response_body)
+        return body.get("code") == STAGE_LOCK_ERROR_CODE
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return False
+
+
+async def _get_pipeline_details_raw(pipeline_id: int) -> Dict[str, Any]:
+    """Fetch raw pipeline details dict from GET /pipelines/{id}."""
+    async with get_client() as client:
+        response = await client.get(f"/pipelines/{int(pipeline_id)}")
+        return await handle_api_response(response, "Get pipeline details")
+
+
+async def _advance_deal_to_stage_sequentially(
+    deal_id: int,
+    stages: list,
+    current_stage_id: int,
+    target_stage_id: int,
+    base_deal: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Move deal through pipeline stages one step at a time (required when sequentialStageFlow=true).
+    stages: list of stage dicts ordered by position (each has id, forecastingType).
+    Advances from current_stage_id → target_stage_id inclusive, returning the final deal state.
+    """
+    stage_ids = [s["id"] for s in stages]
+    if current_stage_id not in stage_ids:
+        raise KylasAPIError(f"Current stage {current_stage_id} not found in pipeline stages.")
+    if target_stage_id not in stage_ids:
+        raise KylasAPIError(f"Target stage {target_stage_id} not found in pipeline stages.")
+
+    current_idx = stage_ids.index(current_stage_id)
+    target_idx = stage_ids.index(target_stage_id)
+
+    if target_idx <= current_idx:
+        raise KylasAPIError(
+            f"Target stage (position {target_idx + 1}) must be after current stage (position {current_idx + 1}) "
+            "for sequential advancement."
+        )
+
+    result = base_deal
+    async with get_client() as client:
+        for idx in range(current_idx + 1, target_idx + 1):
+            stage = stages[idx]
+            stage_id = stage["id"]
+            merged = dict(result)
+            if isinstance(merged.get("pipeline"), dict):
+                merged["pipeline"] = dict(merged["pipeline"])
+                merged["pipeline"]["stage"] = dict(merged["pipeline"].get("stage") or {})
+                merged["pipeline"]["stage"]["id"] = stage_id
+                forecast_type = stage.get("forecastingType")
+                if forecast_type:
+                    merged["forecastingType"] = forecast_type
+            response = await client.put(f"/deals/{deal_id}", json=merged)
+            result = await handle_api_response(response, f"Advance deal {deal_id} to stage {stage_id}")
+            logger.info("Deal %s advanced to stage %s (%s)", deal_id, stage_id, stage.get("name", ""))
+
+    return result
+
 
 def _normalize_field_values(
     field_values: Dict[str, Any],
@@ -1594,7 +1722,7 @@ def _normalize_field_values(
     - Custom fields (numeric keys or in customFieldValues) → customFieldValues with INTERNAL NAME as key (never ID).
     - Explicit "customFieldValues" dict → merged; keys must be internal names (e.g. cfLeadCheck).
     - "email" string → emails array (type OFFICE, primary true). One email must be primary.
-    - "phone" / "phoneNumber" + "phone_country_code" (required when phone given) → phoneNumbers array (type MOBILE, code as 2-letter e.g. IN). Caller must ask user for country/dial code when phone is given without it; do not assume or infer. One phone must be primary.
+    - "phone" / "phoneNumber" + "phone_country_code" (required when phone given) + "phone_type" (required when phone given; one of MOBILE|WORK|HOME|PERSONAL) → phoneNumbers array. Caller must ask user for country/dial code AND phone type when either is missing; do not assume or infer. One phone must be primary.
     - emails/phoneNumbers arrays: allowed types email OFFICE|PERSONAL, phone MOBILE|WORK|HOME|PERSONAL; exactly one primary (first if unspecified).
     - Rest → top-level payload (standard fields)
     """
@@ -1605,6 +1733,12 @@ def _normalize_field_values(
 
     phone_country_raw = fv.pop("phone_country_code", None)
     phone_country = _normalize_country_code(phone_country_raw)
+    phone_type_raw = fv.pop("phone_type", None)
+    phone_type = phone_type_raw.strip().upper() if isinstance(phone_type_raw, str) else None
+    if phone_type and phone_type not in PHONE_TYPES:
+        raise ValueError(
+            f"Invalid phone type '{phone_type}'. Must be one of: {', '.join(PHONE_TYPES)}."
+        )
     has_phone_data = (
         fv.get("phone") or fv.get("phoneNumber")
         or (isinstance(fv.get("phoneNumbers"), list) and len(fv["phoneNumbers"]) > 0)
@@ -1647,10 +1781,15 @@ def _normalize_field_values(
             if not phone_country:
                 raise ValueError(
                     "Phone number was provided but country/dial code was not. "
-                    "Ask the user which country and dial code to use and include 'phone_country_code' in field_values."
+                    "Ask the user which country and dial code to use (e.g. India: IN or +91, US: US or +1) and include 'phone_country_code' in field_values."
+                )
+            if not phone_type:
+                raise ValueError(
+                    "Phone number was provided but type was not specified. "
+                    "Ask the user whether this number is MOBILE, WORK, HOME, or PERSONAL and include 'phone_type' in field_values."
                 )
             payload["phoneNumbers"] = _ensure_single_primary(
-                [{"type": "MOBILE", "code": phone_country, "value": value.strip(), "primary": True}],
+                [{"type": phone_type, "code": phone_country, "value": value.strip(), "primary": True}],
                 PHONE_TYPES,
                 "MOBILE",
             )
@@ -2940,7 +3079,10 @@ def _normalize_deal_payload(payload: Dict[str, Any], existing: Optional[Dict[str
 
 
 async def create_deal_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a deal with the given dynamic field_values (Kylas API payload shape)."""
+    """Create a deal with the given dynamic field_values (Kylas API payload shape).
+    If the target pipeline has sequentialStageFlow=true and the target stage is not the first stage,
+    the deal is automatically created in the first stage then advanced sequentially to the target stage.
+    """
     fv = dict(field_values)
     has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
     id_to_name = await _get_deal_custom_field_id_to_name() if has_custom_by_id else {}
@@ -2948,12 +3090,61 @@ async def create_deal_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     payload = _normalize_deal_payload(payload)
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
+
+    # Extract pipeline/stage info for potential stage-lock fallback
+    target_stage_id: Optional[int] = None
+    pipeline_id_for_lock: Optional[int] = None
+    if isinstance(payload.get("pipeline"), dict):
+        pipeline_id_for_lock = payload["pipeline"].get("id")
+        stage = payload["pipeline"].get("stage")
+        if isinstance(stage, dict):
+            target_stage_id = stage.get("id")
+
     logger.info("Creating deal with fields: %s", list(payload.keys()))
     async with get_client() as client:
-        response = await client.post("/deals", json=payload)
-        result = await handle_api_response(response, "Create deal")
-        logger.info("Deal created with ID: %s", result.get("id"))
-        return result
+        try:
+            response = await client.post("/deals", json=payload)
+            result = await handle_api_response(response, "Create deal")
+            logger.info("Deal created with ID: %s", result.get("id"))
+            return result
+        except KylasAPIError as e:
+            if not _is_stage_lock_error(e) or target_stage_id is None or pipeline_id_for_lock is None:
+                raise
+
+    # Stage lock hit — create in first stage then advance sequentially
+    logger.info(
+        "Stage lock on pipeline %s; creating deal in first stage then advancing to stage %s",
+        pipeline_id_for_lock, target_stage_id,
+    )
+    pipeline_data = await _get_pipeline_details_raw(pipeline_id_for_lock)
+    stages = sorted(pipeline_data.get("stages", []), key=lambda s: s.get("position", 0))
+    if not stages:
+        raise KylasAPIError("Pipeline has no stages; cannot create deal.")
+
+    first_stage = stages[0]
+    first_stage_id = first_stage["id"]
+
+    if first_stage_id == target_stage_id:
+        # Already targeting stage 1 but got lock error — unexpected, re-raise
+        raise KylasAPIError(
+            "Sequential stage lock error even when targeting the first stage. "
+            "Check pipeline configuration."
+        )
+
+    # Build payload with first stage
+    first_payload = dict(payload)
+    first_payload["pipeline"] = dict(first_payload["pipeline"])
+    first_payload["pipeline"]["stage"] = {"id": first_stage_id}
+    first_payload["forecastingType"] = first_stage.get("forecastingType", first_payload.get("forecastingType"))
+
+    async with get_client() as client:
+        response = await client.post("/deals", json=first_payload)
+        deal = await handle_api_response(response, "Create deal (first stage)")
+
+    deal_id = deal["id"]
+    logger.info("Deal %s created in first stage %s; advancing to target stage %s", deal_id, first_stage_id, target_stage_id)
+
+    return await _advance_deal_to_stage_sequentially(deal_id, stages, first_stage_id, target_stage_id, deal)
 
 
 async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
@@ -3069,29 +3260,57 @@ async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[
                     # Fetch pipeline details to get the correct forecastingType for this stage
                     try:
                         if pipeline_id:
-                            pipeline_details = await get_pipeline_details_logic(pipeline_id)
-                            # Find the stage in the pipeline details and get its forecastingType
-                            if isinstance(pipeline_details, dict):
-                                stages = pipeline_details.get("stages", [])
-                                for stage in stages:
-                                    if stage.get("id") == stage_id:
-                                        forecast_type = stage.get("forecastingType")
-                                        if forecast_type:
-                                            merged["forecastingType"] = forecast_type
-                                        break
+                            pipeline_data = await _get_pipeline_details_raw(pipeline_id)
+                            for stage in pipeline_data.get("stages", []):
+                                if stage.get("id") == stage_id:
+                                    forecast_type = stage.get("forecastingType")
+                                    if forecast_type:
+                                        merged["forecastingType"] = forecast_type
+                                    break
                     except Exception as e:
                         logger.warning("Could not fetch forecastingType for stage %s: %s", stage_id, e)
-                        # Continue without updating forecastingType; user can pass it explicitly if needed
                 else:
-                    # If no existing pipeline, we can't update stage
                     logger.warning("Trying to set pipelineStage but deal has no pipeline object")
-                    raise KylasAPIError("Deal has no pipeline; cannot set stage. Use move_deal_to_stage instead.")
+                    raise KylasAPIError("Deal has no pipeline; cannot set stage.")
             else:
                 merged[key] = value
-        response = await client.put(f"/deals/{deal_id}", json=merged)
-        result = await handle_api_response(response, "Update deal")
-        logger.info("Deal %s updated", deal_id)
-        return result
+
+        # Capture stage-move info before PUT for sequential fallback
+        update_target_stage_id: Optional[int] = None
+        current_stage_id_for_lock: Optional[int] = None
+        pipeline_id_for_lock: Optional[int] = None
+        if "pipelineStage" in payload:
+            update_target_stage_id = int(payload["pipelineStage"])
+            if isinstance(existing.get("pipeline"), dict):
+                pipeline_id_for_lock = existing["pipeline"].get("id")
+                existing_stage = existing["pipeline"].get("stage")
+                if isinstance(existing_stage, dict):
+                    current_stage_id_for_lock = existing_stage.get("id")
+
+        try:
+            response = await client.put(f"/deals/{deal_id}", json=merged)
+            result = await handle_api_response(response, "Update deal")
+            logger.info("Deal %s updated", deal_id)
+            return result
+        except KylasAPIError as e:
+            if (
+                not _is_stage_lock_error(e)
+                or update_target_stage_id is None
+                or current_stage_id_for_lock is None
+                or pipeline_id_for_lock is None
+            ):
+                raise
+
+        # Stage lock hit during update — advance sequentially
+        logger.info(
+            "Stage lock on pipeline %s; advancing deal %s from stage %s to stage %s sequentially",
+            pipeline_id_for_lock, deal_id, current_stage_id_for_lock, update_target_stage_id,
+        )
+        pipeline_data = await _get_pipeline_details_raw(pipeline_id_for_lock)
+        stages = sorted(pipeline_data.get("stages", []), key=lambda s: s.get("position", 0))
+        return await _advance_deal_to_stage_sequentially(
+            deal_id, stages, current_stage_id_for_lock, update_target_stage_id, existing
+        )
 
 
 async def get_deal_logic(deal_id: int) -> Dict[str, Any]:
@@ -5445,6 +5664,8 @@ async def create_entity(entity_type: str, field_values: Dict[str, Any]) -> str:
       - Full array: "phoneNumbers": [{"value": "9876543210", "code": "IN", "type": "MOBILE", "primary": true}]
         Still include "phone_country_code" at top level even with full array.
       - REQUIRED: If the user gave a phone number but NO country/dial code, DO NOT call this tool — ask them first.
+      - REQUIRED: If the user gave a phone number but NO phone type, DO NOT call this tool — ask them first: "Is this number MOBILE, WORK, HOME, or PERSONAL?"
+      - Include "phone_type": "<TYPE>" at top level alongside "phone_country_code".
       - Phone types: MOBILE, WORK, HOME, PERSONAL. First entry is primary by default.
     Email:
       - Shorthand: "email": "user@example.com"  (becomes OFFICE, primary)
