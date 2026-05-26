@@ -783,7 +783,7 @@ def _format_label_summary() -> str:
 
 def _update_tool_description(app: FastMCP) -> None:
     """Patch get_entity_labels tool description with live label data so Claude sees it in the tool list."""
-    tool = app._tool_manager._tools.get("get_entity_labels")
+    tool = app.local_provider._components.get("get_entity_labels")
     if not tool:
         return
     summary = _format_label_summary()
@@ -832,7 +832,7 @@ def _patch_entity_tool_descriptions(app: FastMCP) -> None:
             f'[Tenant entity name: "{display_name}" / "{display_plural}" = {std_type}. '
             f"If user uses a custom name, read resource `{_ENTITY_LABELS_RESOURCE_URI}` to resolve it.]\n"
         )
-        for tool_name, tool in app._tool_manager._tools.items():
+        for tool_name, tool in app.local_provider._components.items():
             if substring in tool_name.lower() and tool_name != "get_entity_labels":
                 if tool_name not in _ORIGINAL_TOOL_DESCRIPTIONS:
                     _ORIGINAL_TOOL_DESCRIPTIONS[tool_name] = tool.description
