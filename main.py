@@ -46,7 +46,8 @@ from zoneinfo import ZoneInfo
 import httpx
 import phonenumbers
 from dateutil import parser as dateutil_parser
-from fastmcp import FastMCP
+from fastmcp.server import FastMCP
+from fastmcp.server.middleware import Middleware, MiddlewareContext
 from dotenv import load_dotenv
 import json
 
@@ -539,12 +540,21 @@ def _get_mcp_client_name() -> str:
 
 
 def _resolve_api_key() -> str:
-    """Resolve API key: try per-request HTTP header first, then fall back to env var."""
-    # Note: get_http_request() not available in fastmcp 2.0, use env var only
+    """Resolve API key: per-request x-api-key header → env var fallback."""
+    # Try per-request HTTP header (available in fastmcp 3.x)
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        request = get_http_request()
+        header_key = request.headers.get("x-api-key")
+        if header_key:
+            return header_key
+    except Exception:
+        pass
+    # Fall back to env var (single-tenant deployments)
     if API_KEY:
         return API_KEY
     raise KylasAPIError(
-        "API key not provided. Set KYLAS_API_KEY environment variable."
+        "API key not provided. Pass x-api-key header or set KYLAS_API_KEY environment variable."
     )
 
 
@@ -840,22 +850,37 @@ def _patch_entity_tool_descriptions(app: FastMCP) -> None:
     logger.info("Patched entity tool descriptions with resource reference")
 
 
+_entity_labels_lock = asyncio.Lock()
+
+
+class _EnsureEntityLabelsMiddleware(Middleware):
+    """Lazily load entity labels on the first tool call that arrives with a valid API key."""
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        if not _ENTITY_LABELS:
+            async with _entity_labels_lock:
+                # Double-check inside lock — another request may have loaded them first
+                if not _ENTITY_LABELS:
+                    await _load_entity_labels()
+                    if _ENTITY_LABELS:
+                        mcp._mcp_server.instructions = _build_instructions()
+                        _update_tool_description(mcp)
+                        _patch_entity_tool_descriptions(mcp)
+                        logger.info("Lazily loaded entity labels on first request")
+        return await call_next(context)
+
+
 @asynccontextmanager
 async def _app_lifespan(app: FastMCP):
-    """Load entity labels on startup, refresh them in background."""
+    """Startup: attempt eager label load (works if KYLAS_API_KEY env var set), else labels load lazily on first request."""
     await _load_entity_labels()
-    # Inject label data into server instructions
-    app._mcp_server.instructions = _build_instructions()
-    # Patch get_entity_labels tool description with live label summary
-    _update_tool_description(app)
-    # Embed resource reference in every entity tool's description
-    _patch_entity_tool_descriptions(app)
-    logger.info("🚀 Updated MCP server instructions with entity labels")
-    if "ENTITY NAME ROUTING" in (app._mcp_server.instructions or ""):
-        logger.info("✅ Entity Name Routing section found in instructions")
+    if _ENTITY_LABELS:
+        app._mcp_server.instructions = _build_instructions()
+        _update_tool_description(app)
+        _patch_entity_tool_descriptions(app)
+        logger.info("🚀 Updated MCP server instructions with entity labels")
     else:
-        logger.warning("⚠️ Entity Name Routing section NOT found in instructions")
-    # Start background refresh loop — runs in the server's own event loop
+        logger.info("Entity labels not loaded at startup — will load lazily on first request")
     refresh_task = asyncio.create_task(_label_refresh_loop(interval_seconds=1800))
     try:
         yield {}
@@ -868,6 +893,7 @@ async def _app_lifespan(app: FastMCP):
 
 
 mcp = FastMCP("Kylas CRM", instructions=_base_instructions, lifespan=_app_lifespan)
+mcp.add_middleware(_EnsureEntityLabelsMiddleware())
 
 
 # ---------------------------------------------------------------------------
