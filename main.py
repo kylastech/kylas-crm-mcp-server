@@ -646,12 +646,19 @@ Build `field_values` from user input only. For `update_deal`: pass deal ID from 
 ### Idle / Stagnant Deals
 `search_idle_entities("deal", days)` — or `search_entity("deal", [...])` with `updatedAt ≤ threshold AND latestActivityCreatedAt ≤ threshold`.
 
-### Adding Products to a Deal
-Before create/update, ask user for: product name (resolve via `lookup_products`), quantity, price per unit, currency, and optional discount. Do NOT add without confirming price, quantity, and currency first.
+### Products on Deals
+Products are a key part of a deal. Always display them when showing deal details.
+
+**Adding products:** Before create/update, ask user for: product name (resolve via `lookup_products`), quantity, price per unit, currency, and optional discount. Do NOT add without confirming price, quantity, and currency first.
 ```
 {"products": [{"id": <product_id>, "quantity": <qty>, "price": {"currencyId": <id>, "value": <price>}, "discount": {"value": <disc>, "type": "PERCENTAGE|FLAT"}}]}
 ```
 Existing products preserved; new products merged (duplicates by ID skipped).
+
+**Finding deals by product:** Call `lookup_products(query)` to resolve the product name to an ID, then:
+```
+search_entity("deal", [{"field": "products", "operator": "equal", "value": <product_id>}])
+```
 """
 
 # ---------------------------------------------------------------------------
@@ -761,13 +768,123 @@ Same as above with `"entity": "deal"` in relatedTo. Optionally link a contact:
 """
 
 # ---------------------------------------------------------------------------
+# Diagnosis & Reporting Instructions
+# ---------------------------------------------------------------------------
+
+DIAGNOSIS_AND_REPORTING_INSTRUCTIONS = """
+# Intelligent Diagnosis & Reporting
+
+---
+
+## AUTOMATIC DIAGNOSIS — always append after displaying any entity
+
+After showing a deal, lead, or task, **always** append a diagnosis block in this exact format:
+
+```
+── Diagnosis ──────────────────────────────────────────
+🔴 <critical issue>
+🟡 <warning>
+🟢 <healthy signal>
+💡 Suggested: <next step>
+───────────────────────────────────────────────────────
+```
+
+Only include lines that apply. Skip severity levels that have no signals. Always include at least one 💡 line.
+
+### Deal diagnosis signals
+| Severity | Condition | Message |
+|----------|-----------|---------|
+| 🔴 | `closingDate` is in the past | "Closing date passed X days ago — update or move to Closed Lost" |
+| 🔴 | No `associatedContacts` | "No contacts linked — can't track communication" |
+| 🟡 | No activity for > 14 days (from `updatedAt` or `latestActivityCreatedAt`) | "No activity in X days" |
+| 🟡 | `products` list is empty | "No products attached" |
+| 🟡 | `value` is 0 or null | "Deal value not set" |
+| 🟡 | `closingDate` within 7 days but pipeline stage is first or second stage | "Closing soon but still in early stage" |
+| 🟢 | Products attached | "X product(s) attached — total ₹Y" |
+| 🟢 | Closing date is in the future | "Closing in X days" |
+
+💡 suggestions for deals:
+- Overdue closing → "Reschedule closing date or mark as Closed Lost"
+- No products → "Add products to complete the deal"
+- No contacts → "Link a contact to enable follow-ups"
+- Idle → "Schedule a follow-up call or meeting"
+- Closing soon in early stage → "Accelerate through pipeline stages"
+
+### Lead diagnosis signals
+| Severity | Condition | Message |
+|----------|-----------|---------|
+| 🔴 | No activity for > 30 days | "Stagnant for X days — at risk of going cold" |
+| 🟡 | No associated contact or company | "No contact or company linked" |
+| 🟡 | No products | "No products associated" |
+| 🟡 | No owner assigned | "Unassigned — no owner set" |
+| 🟢 | Active within 7 days | "Recently active" |
+
+💡 suggestions for leads:
+- Stagnant → "Follow up immediately or reassign to another owner"
+- No contact → "Create or link a contact for this lead"
+- Unassigned → "Assign to a sales rep"
+
+### Task diagnosis signals
+| Severity | Condition | Message |
+|----------|-----------|---------|
+| 🔴 | Due date is in the past | "Overdue by X days" |
+| 🟡 | No associated entity | "Not linked to any lead, deal, or contact" |
+| 🟢 | Due date is in the future | "Due in X days" |
+
+💡 suggestions for tasks:
+- Overdue → "Complete, reschedule, or reassign this task"
+- No link → "Associate with a lead or deal for context"
+
+---
+
+## REPORT FORMATTING — apply whenever presenting 3+ entities or a summary
+
+### Structure every report like this:
+1. **TL;DR** — one sentence capturing the most important signal (e.g. "3 deals are overdue, totalling ₹8.4L at risk")
+2. **Body** — table or grouped list (see below)
+3. **Key Takeaways** — 3–5 bullets, the most actionable insights only
+
+### Tables over lists
+Use a markdown table whenever showing 3+ entities. Columns: the most relevant 4–5 fields only. Never dump all fields.
+
+Example deals table:
+| Deal | Stage | Value | Closing | Last Activity |
+|------|-------|-------|---------|---------------|
+| Acme Corp | Proposal | ₹2.5L | 3 days ago ⚠️ | 10 days ago |
+
+### Grouping
+For 5+ results, group by the most meaningful dimension:
+- Deals → by pipeline stage or owner
+- Leads → by source or owner
+- Tasks → by due status (Overdue / Due soon / Upcoming)
+
+### Number formatting
+- Currency: use ₹ symbol with K/L/Cr suffixes (₹45K, ₹1.2L, ₹3.5Cr) — never raw numbers like 1200000
+- Dates: show relative ("3 days ago", "in 2 weeks") with absolute in parentheses where precision matters
+- Counts: "3 of 12 deals" not just "3"
+
+### Language
+- Use plain English, not field names (say "closing date" not `closingDate`, "owner" not `ownedBy`)
+- Highlight risks with ⚠️, wins with ✅, neutral info without icons
+- Never show raw IDs in report output — use names
+
+### Key Takeaways block format
+```
+Key Takeaways:
+• [Most urgent action]
+• [Biggest risk or opportunity]
+• [Notable pattern or trend]
+```
+"""
+
+# ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
 
 _base_instructions = (
     SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" +
     COMPANY_SYSTEM_INSTRUCTIONS + "\n\n" + MEETING_SYSTEM_INSTRUCTIONS + "\n\n" +
-    CALL_LOG_SYSTEM_INSTRUCTIONS
+    CALL_LOG_SYSTEM_INSTRUCTIONS + "\n\n" + DIAGNOSIS_AND_REPORTING_INSTRUCTIONS
 )
 
 
@@ -1318,18 +1435,18 @@ async def lookup_products_logic(query: str, page: int = 0, size: int = 50) -> st
         lines.append(f"  • ID: {pid}  |  Name: {name}")
     lines.append("-" * 50)
     if total > 1:
-        lines.append("More than one product matched. Ask the user which one they mean, then use that ID in search_leads (e.g. filter products equal to that ID).")
+        lines.append("More than one product matched. Ask the user which one they mean, then use that ID in search_entity (e.g. filter products equal to that ID).")
     else:
-        lines.append(f"Use product ID {content[0].get('id')} in search_leads when filtering by product (e.g. {{\"field\": \"products\", \"operator\": \"equal\", \"value\": <id>}}).")
+        lines.append(f"Use product ID {content[0].get('id')} in search_entity when filtering by product (e.g. {{\"field\": \"products\", \"operator\": \"equal\", \"value\": <id>}}). Works for both leads and deals.")
     return "\n".join(lines)
 
 
 @mcp.tool()
 async def lookup_products(query: str, page: int = 0, size: int = 50) -> str:
     """
-    Look up products by name. Use this BEFORE filtering leads by product when the user gives a product name.
-    - If one product is found, use that product's ID in search_leads (e.g. {"field": "products", "operator": "equal", "value": <id>}).
-    - If multiple products are found, ask the user which product they mean (list the options), then use the chosen product's ID in search_leads.
+    Look up products by name. Use this BEFORE filtering leads or deals by product when the user gives a product name.
+    - If one product is found, use that product's ID in search_entity for leads or deals (e.g. {"field": "products", "operator": "equal", "value": <id>}).
+    - If multiple products are found, ask the user which product they mean (list the options), then use the chosen product's ID.
     query: Search string. Use "name:<product_name>" (e.g. "name:Widget") or just the product name (e.g. "Widget"); the server will send name:value to the API.
     page: 0-based page (default 0).
     size: Max 50 (default 50).
@@ -3389,6 +3506,50 @@ def _format_deal_for_display(deal: Dict[str, Any]) -> str:
     lines.append(f"Owner ID: {deal.get('ownerId', '—')}")
     lines.append(f"Created At: {deal.get('createdAt', '—')}")
     lines.append(f"Updated At: {deal.get('updatedAt', '—')}")
+    # Products
+    products = deal.get("products") or []
+    lines.append("")
+    if products:
+        lines.append(f"Products ({len(products)}):")
+        products_total = 0.0
+        has_all_totals = True
+        for prod in products:
+            prod_name = prod.get("name") or prod.get("displayName") or f"ID:{prod.get('id', '?')}"
+            qty = prod.get("quantity")
+            price_obj = prod.get("price") or {}
+            unit_price = price_obj.get("value")
+            disc_obj = prod.get("discount") or {}
+            disc_val = disc_obj.get("value")
+            disc_type = disc_obj.get("type", "")
+            # Build display parts
+            qty_str = str(qty) if qty is not None else "?"
+            price_str = str(unit_price) if unit_price is not None else "?"
+            disc_str = f"{disc_val}{'%' if disc_type == 'PERCENTAGE' else ''}" if disc_val is not None else "—"
+            # Compute line total
+            line_total = None
+            if qty is not None and unit_price is not None:
+                try:
+                    q, p = float(qty), float(unit_price)
+                    if disc_val is not None:
+                        d = float(disc_val)
+                        if disc_type == "PERCENTAGE":
+                            line_total = q * p * (1 - d / 100)
+                        else:
+                            line_total = q * p - d
+                    else:
+                        line_total = q * p
+                    products_total += line_total
+                except (TypeError, ValueError):
+                    has_all_totals = False
+            else:
+                has_all_totals = False
+            line_total_str = f"{line_total:,.2f}" if line_total is not None else "?"
+            lines.append(f"  • {prod_name:<20} qty: {qty_str:<5} unit: {price_str:<10} discount: {disc_str:<10} line total: {line_total_str}")
+        if has_all_totals and products:
+            lines.append(f"  {'─' * 55}")
+            lines.append(f"  Products Total: {products_total:,.2f}")
+    else:
+        lines.append("Products: —")
     # Custom fields
     custom = deal.get("customFieldValues") or {}
     if custom:
@@ -3454,7 +3615,7 @@ async def search_deals_logic(
     if err:
         return f"Invalid filters: {err}"
     payload = {
-        "fields": ["id", "name", "value", "currency", "closingDate", "ownedBy", "createdAt", "actualValue", "estimatedValue", "associatedContacts", "associatedLeads", "associatedCompanies"],
+        "fields": ["id", "name", "value", "currency", "closingDate", "ownedBy", "createdAt", "actualValue", "estimatedValue", "associatedContacts", "associatedLeads", "associatedCompanies", "products"],
         "jsonRule": json_rule,
     }
     params = {"page": page, "size": min(size, 100)}
@@ -3480,7 +3641,13 @@ async def search_deals_logic(
         owner_name = owner_obj.get("name", "—") if isinstance(owner_obj, dict) else "—"
         associated_contacts = deal.get("associatedContacts") or []
         associated_contacts_str = ", ".join(str(cid) for cid in associated_contacts) if associated_contacts else "—"
-        lines.append(f"• ID: {did} | Name: {name} | Owner: {owner_name} | Value: {value} | Contacts: {associated_contacts_str}")
+        products = deal.get("products") or []
+        if products:
+            prod_names = [p.get("name") or p.get("displayName") or f"ID:{p.get('id','?')}" for p in products]
+            products_str = ", ".join(prod_names[:3]) + (" ..." if len(prod_names) > 3 else "")
+        else:
+            products_str = "—"
+        lines.append(f"• ID: {did} | Name: {name} | Owner: {owner_name} | Value: {value} | Products: {products_str} | Contacts: {associated_contacts_str}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
