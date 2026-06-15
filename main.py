@@ -5393,7 +5393,13 @@ async def search_leads_by_term_logic(
         return f"No leads found matching '{term}'. (Total in DB: {total})"
     lines = [f"Found {len(results)} lead(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for lead in results:
-        lines.append(_format_lead_for_display(lead))
+        lid = lead.get("id", "?")
+        fn = lead.get("firstName") or ""
+        ln = lead.get("lastName") or ""
+        name = f"{fn} {ln}".strip() or "—"
+        email = _extract_primary_email(lead.get("emails"))
+        phone = _extract_primary_phone(lead.get("phoneNumbers"))
+        lines.append(f"• ID: {lid} | Name: {name} | Email: {email} | Phone: {phone}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -5427,7 +5433,13 @@ async def search_contacts_by_term_logic(
         return f"No contacts found matching '{term}'. (Total in DB: {total})"
     lines = [f"Found {len(results)} contact(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for contact in results:
-        lines.append(_format_contact_for_display(contact))
+        cid = contact.get("id", "?")
+        fn = contact.get("firstName") or ""
+        ln = contact.get("lastName") or ""
+        name = f"{fn} {ln}".strip() or "—"
+        email = _extract_primary_email(contact.get("emails"))
+        phone = _extract_primary_phone(contact.get("phoneNumbers"))
+        lines.append(f"• ID: {cid} | Name: {name} | Email: {email} | Phone: {phone}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -5461,7 +5473,12 @@ async def search_tasks_by_term_logic(
         return f"No tasks found matching '{term}'. (Total in DB: {total})"
     lines = [f"Found {len(results)} task(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for task in results:
-        lines.append(_format_task_for_display(task))
+        tid = task.get("id", "?")
+        name = task.get("name", "—")
+        status = task.get("status", "—")
+        priority = task.get("priority", "—")
+        due_date = task.get("dueDate", "—")
+        lines.append(f"• ID: {tid} | Name: {name} | Status: {status} | Priority: {priority} | Due: {due_date}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -5495,7 +5512,12 @@ async def search_companies_by_term_logic(
         return f"No companies found matching '{term}'. (Total in DB: {total})"
     lines = [f"Found {len(results)} company/ies for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for company in results:
-        lines.append(_format_company_for_display(company))
+        cid = company.get("id", "?")
+        name = company.get("name", "—")
+        website = company.get("website", "—") or "—"
+        email = _extract_primary_email(company.get("emails"))
+        phone = _extract_primary_phone(company.get("phoneNumbers"))
+        lines.append(f"• ID: {cid} | Name: {name} | Website: {website} | Email: {email} | Phone: {phone}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -5538,7 +5560,13 @@ async def search_meetings_by_term_logic(
         return f"No meetings found matching '{term}' in title. (Total in DB: {total})"
     lines = [f"Found {len(results)} meeting(s) with title matching '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for m in results:
-        lines.append(_format_meeting_for_display(m))
+        mid = m.get("id", "?")
+        title = m.get("title", "—")
+        status = m.get("status", "—")
+        from_dt = m.get("from", "—")
+        to_dt = m.get("to", "—")
+        location = m.get("location", "—") or "—"
+        lines.append(f"• ID: {mid} | Title: {title} | Status: {status} | From: {from_dt} | To: {to_dt} | Location: {location}")
     lines.append("-" * 60)
     return "\n".join(lines)
 

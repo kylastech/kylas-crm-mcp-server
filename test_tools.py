@@ -799,7 +799,7 @@ async def test_search_entity_invalid_entity_type():
 
 @pytest.mark.asyncio
 async def test_search_entity_by_term_lead():
-    """search_entity_by_term should search leads by term."""
+    """search_entity_by_term should search leads by term and format concisely."""
     with patch("main.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
@@ -819,11 +819,13 @@ async def test_search_entity_by_term_lead():
         result = await search_leads_by_term_logic("john", page=0, size=20)
         assert isinstance(result, str)
         assert "Found 1" in result
+        assert "• ID: 1 | Name: John Doe | Email: john@example.com | Phone: -" in result
+        assert "LEAD DETAILS" not in result
 
 
 @pytest.mark.asyncio
 async def test_search_entity_by_term_meeting():
-    """search_entity_by_term for meeting should search title field only."""
+    """search_entity_by_term for meeting should search title field and format concisely."""
     with patch("main.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
@@ -843,6 +845,8 @@ async def test_search_entity_by_term_meeting():
         result = await search_meetings_by_term_logic("standup", page=0, size=20)
         assert isinstance(result, str)
         assert "Found 1" in result
+        assert "• ID: 1 | Title: Standup Meeting | Status: Scheduled | From: 2026-04-28T10:00:00Z | To: 2026-04-28T10:30:00Z" in result
+        assert "MEETING DETAILS" not in result
 
 
 @pytest.mark.asyncio
