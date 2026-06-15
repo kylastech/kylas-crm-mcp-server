@@ -441,6 +441,12 @@ OPERATOR_SYMBOL_MAP = {
     "!=": "not_equal",
     "==": "equal",
     "=": "equal",
+    "gte": "greater_or_equal",
+    "lte": "less_or_equal",
+    "gt": "greater",
+    "lt": "less",
+    "ne": "not_equal",
+    "eq": "equal",
 }
 
 # Picklist fields that use internal name (string) in search; all others use Option ID (long)
@@ -722,6 +728,8 @@ Before creating, ask for:
 - Presence check: `is_not_null` / `is_null` with value null.
 - By organizer: `lookup_meeting_related_entity` with `entity_type="invitee"` → `{"field": "organizer", "operator": "equal", "value": <user_id>}`.
 - Status filter: use internal name — "scheduled", "conducted", "missed", "cancelled".
+- By date/time: Use `from` (start datetime), `to` (end datetime), or `conductedAt` (conducted datetime) fields. Do NOT use `scheduledAt`.
+- Sorting: Sort by `from` (e.g., `from,desc`) or `createdAt` (e.g., `createdAt,desc`). Do NOT sort by `scheduledAt`.
 
 ### Cancel vs Delete
 - `cancel_meeting` — sets status to "cancelled" (reversible)
@@ -3142,6 +3150,7 @@ def _build_deal_search_json_rule(
     for i, f in enumerate(filters):
         field_name = f.get("field")
         operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        operator = OPERATOR_SYMBOL_MAP.get(operator, operator)
         value = f.get("value")
         field_type_key = (f.get("type") or "TEXT_FIELD").strip().upper().replace(" ", "_")
 
@@ -3902,6 +3911,7 @@ def _build_company_search_json_rule(
     for i, f in enumerate(filters):
         field_name = f.get("field")
         operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        operator = OPERATOR_SYMBOL_MAP.get(operator, operator)
         value = f.get("value")
         field_type_key = (f.get("type") or "TEXT_FIELD").strip().upper().replace(" ", "_")
 
@@ -4413,7 +4423,10 @@ def _build_meeting_search_json_rule(
     rules = []
     for i, f in enumerate(filters):
         field_name = f.get("field")
+        if field_name == "scheduledAt":
+            field_name = "from"
         operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        operator = OPERATOR_SYMBOL_MAP.get(operator, operator)
         value = f.get("value")
 
         if not field_name:
@@ -4714,6 +4727,8 @@ async def search_meetings_logic(
     payload = {"jsonRule": json_rule}
     params = {"page": _meetings_search_api_page(page), "size": min(size, 100)}
     if sort:
+        if isinstance(sort, str):
+            sort = sort.replace("scheduledAt", "from")
         params["sort"] = sort
     logger.info("Searching meetings with %d filter(s)", len(filters))
     async with get_client() as client:
@@ -5105,6 +5120,7 @@ def _build_call_log_search_json_rule(
     for i, f in enumerate(filters):
         field_name = f.get("field")
         operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        operator = OPERATOR_SYMBOL_MAP.get(operator, operator)
         value = f.get("value")
 
         if not field_name:

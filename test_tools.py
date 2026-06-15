@@ -1149,7 +1149,7 @@ def _make_mock_context(client_name: str, client_version: str):
 def test_get_mcp_client_name_with_name_and_version():
     """Returns 'Name(version)' when both client name and version are present."""
     mock_ctx = _make_mock_context("Claude Desktop", "1.2.3")
-    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
         result = main._get_mcp_client_name()
     assert result == "Claude Desktop(1.2.3)"
 
@@ -1157,14 +1157,14 @@ def test_get_mcp_client_name_with_name_and_version():
 def test_get_mcp_client_name_without_version():
     """Returns just the name when version is empty."""
     mock_ctx = _make_mock_context("cursor", "")
-    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
         result = main._get_mcp_client_name()
     assert result == "cursor"
 
 
 def test_get_mcp_client_name_outside_request_context():
     """Returns 'unknown' when called outside a request (get_context raises)."""
-    with patch.object(main.mcp, "get_context", side_effect=LookupError):
+    with patch.object(main.mcp, "get_context", side_effect=LookupError, create=True):
         result = main._get_mcp_client_name()
     assert result == "unknown"
 
@@ -1175,7 +1175,7 @@ def test_get_mcp_client_name_no_client_params():
     mock_session.client_params = None
     mock_ctx = MagicMock()
     mock_ctx.session = mock_session
-    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
         result = main._get_mcp_client_name()
     assert result == "unknown"
 
@@ -1447,6 +1447,90 @@ async def test_advance_deal_sequentially_happy_path():
 
     assert result["pipeline"]["stage"]["id"] == 30
     assert mock_client.put.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# operator normalization and scheduledAt alias tests
+# ---------------------------------------------------------------------------
+
+def test_operator_normalization_and_scheduled_at_alias_meeting():
+    from main import _build_meeting_search_json_rule
+    filterable_map = {
+        "from": {"type": "DATETIME_PICKER", "standard": True},
+        "title": {"type": "TEXT_FIELD", "standard": True},
+    }
+    filters = [
+        {"field": "title", "operator": "contains", "value": "Demo"},
+        {"field": "scheduledAt", "operator": "gte", "value": "2025-12-15T00:00:00Z"},
+    ]
+    rules, err = _build_meeting_search_json_rule(filters, filterable_map)
+    assert err is None
+    assert len(rules["rules"]) == 2
+    
+    # Check first rule
+    rule0 = rules["rules"][0]
+    assert rule0["id"] == "title"
+    assert rule0["field"] == "title"
+    assert rule0["operator"] == "contains"
+    assert rule0["value"] == "Demo"
+    
+    # Check second rule
+    rule1 = rules["rules"][1]
+    assert rule1["id"] == "from"
+    assert rule1["field"] == "from"
+    assert rule1["operator"] == "greater_or_equal"  # normalized from gte
+    assert rule1["value"] == "2025-12-15T00:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_search_meetings_logic_sort_alias():
+    from main import search_meetings_logic
+    with patch("main.get_client") as mock_get_client, \
+         patch("main._fetch_meeting_fields") as mock_fetch_fields:
+         
+        mock_fetch_fields.return_value = [
+            {"id": 1, "name": "title", "type": "TEXT_FIELD", "active": True, "filterable": True, "standard": True},
+            {"id": 2, "name": "from", "type": "DATETIME_PICKER", "active": True, "filterable": True, "standard": True},
+        ]
+        
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "content": [{"id": 101, "title": "Demo Meeting", "from": "2025-12-15T10:00:00Z"}],
+            "totalElements": 1,
+            "totalPages": 1,
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+        
+        # When querying with scheduledAt,desc sort
+        result = await search_meetings_logic([], page=0, size=10, sort="scheduledAt,desc")
+        
+        assert "Demo Meeting" in result
+        call_args = mock_client.post.call_args
+        params = call_args.kwargs["params"]
+        # scheduledAt,desc should be converted to from,desc
+        assert params["sort"] == "from,desc"
+
+
+def test_operator_normalization_in_general_search_rule_builder():
+    from main import _build_search_json_rule
+    filterable_map = {
+        "firstName": {"type": "TEXT_FIELD", "standard": True},
+        "createdAt": {"type": "DATETIME_PICKER", "standard": True},
+    }
+    filters = [
+        {"field": "firstName", "operator": "eq", "value": "John"},
+        {"field": "createdAt", "operator": "lte", "value": "2026-06-15T00:00:00Z"},
+    ]
+    rules, err = _build_search_json_rule(filters, filterable_map)
+    assert err is None
+    assert len(rules["rules"]) == 2
+    assert rules["rules"][0]["operator"] == "equal"
+    assert rules["rules"][1]["operator"] == "less_or_equal"
 
 
 if __name__ == "__main__":
