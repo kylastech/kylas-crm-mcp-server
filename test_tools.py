@@ -1533,5 +1533,52 @@ def test_operator_normalization_in_general_search_rule_builder():
     assert rules["rules"][1]["operator"] == "less_or_equal"
 
 
+def test_normalize_meeting_sort():
+    """_normalize_meeting_sort maps unsupported sort fields to valid ones."""
+    from main import _normalize_meeting_sort
+    # Unsupported fields are mapped to 'from'
+    assert _normalize_meeting_sort("updatedAt,desc") == "from,desc"
+    assert _normalize_meeting_sort("scheduledAt,asc") == "from,asc"
+    assert _normalize_meeting_sort("startTime,desc") == "from,desc"
+    assert _normalize_meeting_sort("startDate,asc") == "from,asc"
+    # Valid fields pass through unchanged
+    assert _normalize_meeting_sort("from,desc") == "from,desc"
+    assert _normalize_meeting_sort("createdAt,asc") == "createdAt,asc"
+    # None or empty defaults to from,desc
+    assert _normalize_meeting_sort(None) == "from,desc"
+    assert _normalize_meeting_sort("") == "from,desc"
+    # Missing direction defaults to desc
+    assert _normalize_meeting_sort("updatedAt") == "from,desc"
+
+
+@pytest.mark.asyncio
+async def test_search_meetings_by_term_sort_normalization():
+    """search_meetings_by_term_logic should normalize sort (e.g. updatedAt -> from)."""
+    from main import search_meetings_by_term_logic
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "content": [{"id": 1, "title": "Kylas Demo", "status": "Scheduled", "from": "2026-04-28T10:00:00Z", "to": "2026-04-28T10:30:00Z"}],
+            "totalElements": 1,
+            "totalPages": 1,
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        # Simulate generic dispatcher passing updatedAt,desc (the default)
+        result = await search_meetings_by_term_logic("Kylas Demo", page=0, size=100, sort="updatedAt,desc")
+
+        assert "Kylas Demo" in result
+        call_args = mock_client.post.call_args
+        params = call_args.kwargs["params"]
+        # updatedAt,desc must be normalized to from,desc
+        assert params["sort"] == "from,desc"
+
+
 if __name__ == "__main__":
     asyncio.run(run_manual_tests())
+

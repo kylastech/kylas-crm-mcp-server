@@ -4693,6 +4693,27 @@ async def delete_meeting(meeting_id: int) -> str:
 # Unfiltered list matches Kylas web: POST /meetings/search with empty rules (not jsonRule null).
 _MEETING_SEARCH_JSON_RULE_ALL: Dict[str, Any] = {"condition": "AND", "rules": [], "valid": True}
 
+# Meetings API only supports a limited set of sortable fields (e.g. 'from', 'createdAt').
+# LLMs and the generic search dispatcher often send unsupported sort fields like
+# 'updatedAt' or 'scheduledAt', causing 422 errors. This map normalizes them.
+_MEETING_SORT_FIELD_ALIASES: Dict[str, str] = {
+    "scheduledAt": "from",
+    "updatedAt": "from",
+    "startTime": "from",
+    "startDate": "from",
+}
+
+
+def _normalize_meeting_sort(sort: Optional[str]) -> str:
+    """Normalize meeting sort parameter: map unsupported fields to valid ones."""
+    if not sort or not isinstance(sort, str):
+        return "from,desc"
+    parts = sort.split(",", 1)
+    field = parts[0].strip()
+    direction = parts[1].strip() if len(parts) > 1 else "desc"
+    field = _MEETING_SORT_FIELD_ALIASES.get(field, field)
+    return f"{field},{direction}"
+
 
 def _meetings_search_api_page(page_zero_based: int) -> int:
     """POST /meetings/search uses 1-based page; tools stay 0-based."""
@@ -4725,11 +4746,8 @@ async def search_meetings_logic(
     if err:
         return f"Invalid filters: {err}"
     payload = {"jsonRule": json_rule}
-    params = {"page": _meetings_search_api_page(page), "size": min(size, 100)}
-    if sort:
-        if isinstance(sort, str):
-            sort = sort.replace("scheduledAt", "from")
-        params["sort"] = sort
+    sort = _normalize_meeting_sort(sort)
+    params = {"page": _meetings_search_api_page(page), "size": min(size, 100), "sort": sort}
     logger.info("Searching meetings with %d filter(s)", len(filters))
     async with get_client() as client:
         response = await client.post("/meetings/search", params=params, json=payload)
@@ -5507,9 +5525,8 @@ async def search_meetings_by_term_logic(
         "valid": True,
     }
     payload = {"jsonRule": json_rule}
-    params = {"page": _meetings_search_api_page(page), "size": min(size, 100)}
-    if sort:
-        params["sort"] = sort
+    sort = _normalize_meeting_sort(sort)
+    params = {"page": _meetings_search_api_page(page), "size": min(size, 100), "sort": sort}
     logger.info("Searching meetings by term (title only): %r", term)
     async with get_client() as client:
         response = await client.post("/meetings/search", params=params, json=payload)
