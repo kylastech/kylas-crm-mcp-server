@@ -825,13 +825,22 @@ async def test_search_entity_by_term_lead():
 
 @pytest.mark.asyncio
 async def test_search_entity_by_term_meeting():
-    """search_entity_by_term for meeting should search title field and format concisely."""
+    """search_entity_by_term for meeting should search title field and format concisely including owner details."""
     with patch("main.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "content": [
-                {"id": 1, "title": "Standup Meeting", "status": "Scheduled", "from": "2026-04-28T10:00:00Z", "to": "2026-04-28T10:30:00Z"},
+                {
+                    "id": 1,
+                    "title": "Standup Meeting",
+                    "status": "Scheduled",
+                    "from": "2026-04-28T10:00:00Z",
+                    "to": "2026-04-28T10:30:00Z",
+                    "owner": {"id": 12, "name": "John Owner"},
+                    "organizer": {"id": 34, "name": "Alice Organizer"},
+                    "conductedBy": {"id": 56, "name": "Bob Conductor"}
+                },
             ],
             "totalElements": 1,
             "totalPages": 1,
@@ -846,6 +855,9 @@ async def test_search_entity_by_term_meeting():
         assert isinstance(result, str)
         assert "Found 1" in result
         assert "• ID: 1 | Title: Standup Meeting | Status: Scheduled | From: 2026-04-28T10:00:00Z | To: 2026-04-28T10:30:00Z" in result
+        assert "Owner: John Owner" in result
+        assert "Organizer: Alice Organizer" in result
+        assert "Conducted By: Bob Conductor" in result
         assert "MEETING DETAILS" not in result
 
 

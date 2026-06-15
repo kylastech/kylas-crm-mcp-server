@@ -4720,6 +4720,42 @@ def _meetings_search_api_page(page_zero_based: int) -> int:
     return int(page_zero_based) + 1
 
 
+def _format_meeting_summary_line(m: Dict[str, Any]) -> str:
+    """Format a meeting object into a concise 1-line summary including owner, organizer, and conductor details."""
+    mid = m.get("id", "?")
+    title = m.get("title", "—")
+    status = m.get("status", "—")
+    from_dt = m.get("from", "—")
+    to_dt = m.get("to", "—")
+    location = m.get("location") or "—"
+    
+    # Extract owner
+    owner_val = m.get("owner")
+    owner_name = "—"
+    if isinstance(owner_val, dict):
+        owner_name = owner_val.get("name") or str(owner_val.get("id", "—"))
+    elif owner_val:
+        owner_name = str(owner_val)
+        
+    # Extract organizer
+    organizer_val = m.get("organizer")
+    org_name = "—"
+    if isinstance(organizer_val, dict):
+        org_name = organizer_val.get("name") or organizer_val.get("email") or str(organizer_val.get("id", "—"))
+    elif organizer_val:
+        org_name = str(organizer_val)
+        
+    # Extract conductedBy
+    conducted_val = m.get("conductedBy")
+    conducted_name = "—"
+    if isinstance(conducted_val, dict):
+        conducted_name = conducted_val.get("name") or str(conducted_val.get("id", "—"))
+    elif conducted_val:
+        conducted_name = str(conducted_val)
+        
+    return f"• ID: {mid} | Title: {title} | Status: {status} | From: {from_dt} | To: {to_dt} | Location: {location} | Owner: {owner_name} | Organizer: {org_name} | Conducted By: {conducted_name}"
+
+
 async def search_meetings_logic(
     filters: List[Dict[str, Any]],
     page: int = 0,
@@ -4759,13 +4795,7 @@ async def search_meetings_logic(
         return f"No meetings found matching the filters. (Total in DB: {total})"
     lines = [f"Found {len(results)} meeting(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for m in results:
-        mid = m.get("id", "?")
-        title = m.get("title", "—")
-        status = m.get("status", "—")
-        from_dt = m.get("from", "—")
-        to_dt = m.get("to", "—")
-        location = m.get("location", "—") or "—"
-        lines.append(f"• ID: {mid} | Title: {title} | Status: {status} | From: {from_dt} | To: {to_dt} | Location: {location}")
+        lines.append(_format_meeting_summary_line(m))
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -5560,13 +5590,7 @@ async def search_meetings_by_term_logic(
         return f"No meetings found matching '{term}' in title. (Total in DB: {total})"
     lines = [f"Found {len(results)} meeting(s) with title matching '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for m in results:
-        mid = m.get("id", "?")
-        title = m.get("title", "—")
-        status = m.get("status", "—")
-        from_dt = m.get("from", "—")
-        to_dt = m.get("to", "—")
-        location = m.get("location", "—") or "—"
-        lines.append(f"• ID: {mid} | Title: {title} | Status: {status} | From: {from_dt} | To: {to_dt} | Location: {location}")
+        lines.append(_format_meeting_summary_line(m))
     lines.append("-" * 60)
     return "\n".join(lines)
 
