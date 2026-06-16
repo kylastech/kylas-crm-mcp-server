@@ -344,7 +344,7 @@ Use **Option ID** (number) from cheat sheet. Exceptions — use **internal name*
 3. **Filter/search:** keep value in user’s timezone; pass `timeZone` in the filter (or omit — server uses it). Do NOT convert filter values to UTC.
 
 ### Never guess IDs — always resolve first
-- **Users** (createdBy, updatedBy, ownerId, assignedTo, etc.): call `lookup_users(query)`. If multiple matches, list them and ask user to pick.
+- **Users** (createdBy, updatedBy, owner, ownerId, assignedTo, conductedBy, etc. - i.e., sales representatives and employees): call `lookup_users(query)`. Never use contact or lead lookup tools for employees/users. If multiple matches, list them and ask user to pick.
 - **Products**: call `lookup_products(query)`. If multiple matches, list and ask.
 - **Entity IDs** (for association filters — associatedLeads, associatedDeals, etc.): search for the entity first to get its real ID. Never invent IDs — this causes hallucinated results.
   - Example: "contacts associated with deals from Acme" → search deals for "Acme" first, confirm which deal, then search contacts by that deal ID.
@@ -716,6 +716,7 @@ Before creating, ask for:
 ```
 
 ### Resolving Entity IDs
+- **Meeting Owner / Conductor (CRM Users / Sales Reps):** ALWAYS use `lookup_users` (never lookup contacts, leads, or companies for sales reps).
 - **Participants/organizer:** `lookup_meeting_related_entity` with `entity_type="invitee"` (pick row with right `entity` — organizer is usually `user`)
 - **relatedTo leads:** `lookup_meeting_related_entity` with `entity_type="lead"` → filter `associatedLeads`
 - **relatedTo contacts:** `lookup_meeting_related_entity` with `entity_type="contact"` → filter `associatedContacts`
@@ -726,6 +727,7 @@ Before creating, ask for:
 ### Search / Filter
 - By associated entity: resolve ID first via lookup tool, then `search_entity("meeting", filters)` with association filter.
 - Presence check: `is_not_null` / `is_null` with value null.
+- By owner: `lookup_users` to resolve the user ID first → `{"field": "owner", "operator": "equal", "value": <user_id>}`.
 - By organizer: `lookup_meeting_related_entity` with `entity_type="invitee"` → `{"field": "organizer", "operator": "equal", "value": <user_id>}`.
 - Status filter: use internal name — "scheduled", "conducted", "missed", "cancelled".
 - By date/time: Use `from` (start datetime), `to` (end datetime), or `conductedAt` (conducted datetime) fields. Do NOT use `scheduledAt`.
@@ -4783,7 +4785,7 @@ async def search_meetings_logic(
         return f"Invalid filters: {err}"
     payload = {"jsonRule": json_rule}
     sort = _normalize_meeting_sort(sort)
-    params = {"page": _meetings_search_api_page(page), "size": min(size, 100), "sort": sort}
+    params = {"page": _meetings_search_api_page(page), "size": min(size, 500), "sort": sort}
     logger.info("Searching meetings with %d filter(s)", len(filters))
     async with get_client() as client:
         response = await client.post("/meetings/search", params=params, json=payload)
@@ -4856,7 +4858,7 @@ async def search_meetings(
       - value: For status use internal name. For associated* equal, numeric id. For participants, list of full objects.
       - timeZone (str, optional): For date/datetime filters.
     page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
+    size: Page size, max 500 (default 20).
     sort: Sort e.g. "from,desc" (default).
     """
     try:
@@ -5578,7 +5580,7 @@ async def search_meetings_by_term_logic(
     }
     payload = {"jsonRule": json_rule}
     sort = _normalize_meeting_sort(sort)
-    params = {"page": _meetings_search_api_page(page), "size": min(size, 100), "sort": sort}
+    params = {"page": _meetings_search_api_page(page), "size": min(size, 500), "sort": sort}
     logger.info("Searching meetings by term (title only): %r", term)
     async with get_client() as client:
         response = await client.post("/meetings/search", params=params, json=payload)
@@ -5788,7 +5790,7 @@ async def search_entity(
     For meeting/call_log: Filters are OPTIONAL (empty = all records).
 
     page: 0-based page for lead/contact/task/deal/company; 1-based for meeting/call_log (default 0).
-    size: Page size, max 100 (default 20).
+    size: Page size, max 100 (max 500 for meeting/call_log) (default 20).
     sort: Sort e.g. "createdAt,desc" (default).
 
     Task association examples (replaces search_tasks_for_* tools):
@@ -5796,6 +5798,10 @@ async def search_entity(
       - search_entity("task", [{"field": "associatedContacts", "operator": "equal", "value": contact_id}])
       - search_entity("task", [{"field": "associatedDeals", "operator": "equal", "value": deal_id}])
       - search_entity("task", [{"field": "associatedCompanies", "operator": "equal", "value": company_id}])
+
+    Meeting owner/organizer examples (DO NOT use search_entity_by_term):
+      - search_entity("meeting", [{"field": "owner", "operator": "equal", "value": user_id}])
+      - search_entity("meeting", [{"field": "organizer", "operator": "equal", "value": user_id}])
     """
     return await search_entity_logic(entity_type, filters, page, size, sort)
 
@@ -5854,11 +5860,11 @@ async def search_entity_by_term(
     Valid entity_type values: lead, contact, task, deal, company, meeting
 
     search_term: A specific term to search across fields (e.g. "John", "acme@corp.com", "Acme Inc").
-      - For meeting: searches 'title' field only.
+      - For meeting: searches 'title' field only. ⚠️ DO NOT use this tool to search/filter meetings by owner or organizer name; instead, look up their user ID and call `search_entity` with an `owner` or `organizer` filter.
       - For others: multi-field search (first name, last name, email, phone, etc.).
 
     page: 0-based page for lead/contact/task/deal/company; 1-based for meeting (default 0).
-    size: Page size, max 100 (default 20).
+    size: Page size, max 100 (max 500 for meeting) (default 20).
     sort: Sort e.g. "updatedAt,desc" (default).
     """
     return await search_entity_by_term_logic(entity_type, search_term, page, size, sort)
