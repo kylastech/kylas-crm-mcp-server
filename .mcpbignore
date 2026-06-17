@@ -1,0 +1,43 @@
+.git
+.venv
+.idea
+.pytest_cache
+__pycache__
+*.pyc
+*.mcpb
+*.dxt
+.coverage
+docs
+.claude
+*.egg-info
+test_tools.py
+PUBLISHING.md
+.github
+.DS_Store
+
+# node_modules is no longer shipped: mcp-remote and its full dependency tree are
+# pre-bundled by esbuild into the single self-contained `proxy.bundled.mjs`. This
+# collapses the bundle from ~660 files to ~4, which works around the Claude
+# Desktop (Windows) regression where the .mcpb install dialog silently closes on
+# bundles with large/deep node_modules trees (mcpb#281).
+node_modules
+
+# Build artifacts and unused assets
+assets
+dist-unpacked
+kylas-crm-unpacked.zip
+
+# Root-only excludes (leading slash = root only, not node_modules/**/<file>).
+/docker-compose.yml
+/Dockerfile
+/server.json
+/main.py
+/requirements.txt
+/pyproject.toml
+/package.json
+/package-lock.json
+/README.md
+/PACK.md
+/LICENSE
+/.gitignore
+/.mcpbignore
