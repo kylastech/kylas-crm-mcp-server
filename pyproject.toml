@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kylas-crm-mcp-server"
-version = "1.0.4"
+version = "1.1.0"
 description = "MCP server for Kylas CRM: create/manage leads and deals, search, lookup users/products/pipelines."
 readme = "README.md"
 license = { text = "MIT" }

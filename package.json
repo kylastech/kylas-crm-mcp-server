@@ -1,6 +1,6 @@
 {
   "name": "kylas-crm-mcp-server",
-  "version": "1.0.13",
+  "version": "1.1.0",
   "description": "Claude Desktop extension bridging to the hosted Kylas CRM MCP server",
   "private": true,
   "main": "launcher.js",
