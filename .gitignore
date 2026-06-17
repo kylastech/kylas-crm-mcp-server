@@ -208,3 +208,19 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# MCP bundle builds
+*.mcpb
+*.dxt
+# Node deps + esbuild output (regenerate with `npm run pack`, see PACK.md)
+node_modules/
+proxy.bundled.mjs
+# Unpacked-extension build artifacts (Windows distribution)
+dist-unpacked/
+kylas-crm-unpacked.zip
+
+# Claude Code local settings (contains dev-only permissions)
+.claude/settings.local.json
+
+# macOS
+.DS_Store

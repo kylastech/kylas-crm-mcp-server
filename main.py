@@ -344,7 +344,7 @@ Use **Option ID** (number) from cheat sheet. Exceptions — use **internal name*
 3. **Filter/search:** keep value in user’s timezone; pass `timeZone` in the filter (or omit — server uses it). Do NOT convert filter values to UTC.
 
 ### Never guess IDs — always resolve first
-- **Users** (createdBy, updatedBy, ownerId, assignedTo, etc.): call `lookup_users(query)`. If multiple matches, list them and ask user to pick.
+- **Users** (createdBy, updatedBy, owner, ownerId, assignedTo, conductedBy, etc. - i.e., sales representatives and employees): call `lookup_users(query)`. Never use contact or lead lookup tools for employees/users. If multiple matches, list them and ask user to pick.
 - **Products**: call `lookup_products(query)`. If multiple matches, list and ask.
 - **Entity IDs** (for association filters — associatedLeads, associatedDeals, etc.): search for the entity first to get its real ID. Never invent IDs — this causes hallucinated results.
   - Example: "contacts associated with deals from Acme" → search deals for "Acme" first, confirm which deal, then search contacts by that deal ID.
@@ -441,6 +441,12 @@ OPERATOR_SYMBOL_MAP = {
     "!=": "not_equal",
     "==": "equal",
     "=": "equal",
+    "gte": "greater_or_equal",
+    "lte": "less_or_equal",
+    "gt": "greater",
+    "lt": "less",
+    "ne": "not_equal",
+    "eq": "equal",
 }
 
 # Picklist fields that use internal name (string) in search; all others use Option ID (long)
@@ -710,6 +716,7 @@ Before creating, ask for:
 ```
 
 ### Resolving Entity IDs
+- **Meeting Owner / Conductor (CRM Users / Sales Reps):** ALWAYS use `lookup_users` (never lookup contacts, leads, or companies for sales reps).
 - **Participants/organizer:** `lookup_meeting_related_entity` with `entity_type="invitee"` (pick row with right `entity` — organizer is usually `user`)
 - **relatedTo leads:** `lookup_meeting_related_entity` with `entity_type="lead"` → filter `associatedLeads`
 - **relatedTo contacts:** `lookup_meeting_related_entity` with `entity_type="contact"` → filter `associatedContacts`
@@ -720,8 +727,11 @@ Before creating, ask for:
 ### Search / Filter
 - By associated entity: resolve ID first via lookup tool, then `search_entity("meeting", filters)` with association filter.
 - Presence check: `is_not_null` / `is_null` with value null.
+- By owner: `lookup_users` to resolve the user ID first → `{"field": "owner", "operator": "equal", "value": <user_id>}`.
 - By organizer: `lookup_meeting_related_entity` with `entity_type="invitee"` → `{"field": "organizer", "operator": "equal", "value": <user_id>}`.
 - Status filter: use internal name — "scheduled", "conducted", "missed", "cancelled".
+- By date/time: Use `from` (start datetime), `to` (end datetime), or `conductedAt` (conducted datetime) fields. Do NOT use `scheduledAt`.
+- Sorting: Sort by `from` (e.g., `from,desc`) or `createdAt` (e.g., `createdAt,desc`). Do NOT sort by `scheduledAt`.
 
 ### Cancel vs Delete
 - `cancel_meeting` — sets status to "cancelled" (reversible)
@@ -3142,6 +3152,7 @@ def _build_deal_search_json_rule(
     for i, f in enumerate(filters):
         field_name = f.get("field")
         operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        operator = OPERATOR_SYMBOL_MAP.get(operator, operator)
         value = f.get("value")
         field_type_key = (f.get("type") or "TEXT_FIELD").strip().upper().replace(" ", "_")
 
@@ -3902,6 +3913,7 @@ def _build_company_search_json_rule(
     for i, f in enumerate(filters):
         field_name = f.get("field")
         operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        operator = OPERATOR_SYMBOL_MAP.get(operator, operator)
         value = f.get("value")
         field_type_key = (f.get("type") or "TEXT_FIELD").strip().upper().replace(" ", "_")
 
@@ -4413,7 +4425,10 @@ def _build_meeting_search_json_rule(
     rules = []
     for i, f in enumerate(filters):
         field_name = f.get("field")
+        if field_name == "scheduledAt":
+            field_name = "from"
         operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        operator = OPERATOR_SYMBOL_MAP.get(operator, operator)
         value = f.get("value")
 
         if not field_name:
@@ -4680,10 +4695,67 @@ async def delete_meeting(meeting_id: int) -> str:
 # Unfiltered list matches Kylas web: POST /meetings/search with empty rules (not jsonRule null).
 _MEETING_SEARCH_JSON_RULE_ALL: Dict[str, Any] = {"condition": "AND", "rules": [], "valid": True}
 
+# Meetings API only supports a limited set of sortable fields (e.g. 'from', 'createdAt').
+# LLMs and the generic search dispatcher often send unsupported sort fields like
+# 'updatedAt' or 'scheduledAt', causing 422 errors. This map normalizes them.
+_MEETING_SORT_FIELD_ALIASES: Dict[str, str] = {
+    "scheduledAt": "from",
+    "updatedAt": "from",
+    "startTime": "from",
+    "startDate": "from",
+}
+
+
+def _normalize_meeting_sort(sort: Optional[str]) -> str:
+    """Normalize meeting sort parameter: map unsupported fields to valid ones."""
+    if not sort or not isinstance(sort, str):
+        return "from,desc"
+    parts = sort.split(",", 1)
+    field = parts[0].strip()
+    direction = parts[1].strip() if len(parts) > 1 else "desc"
+    field = _MEETING_SORT_FIELD_ALIASES.get(field, field)
+    return f"{field},{direction}"
+
 
 def _meetings_search_api_page(page_zero_based: int) -> int:
     """POST /meetings/search uses 1-based page; tools stay 0-based."""
     return int(page_zero_based) + 1
+
+
+def _format_meeting_summary_line(m: Dict[str, Any]) -> str:
+    """Format a meeting object into a concise 1-line summary including owner, organizer, and conductor details."""
+    mid = m.get("id", "?")
+    title = m.get("title", "—")
+    status = m.get("status", "—")
+    from_dt = m.get("from", "—")
+    to_dt = m.get("to", "—")
+    location = m.get("location") or "—"
+    
+    # Extract owner
+    owner_val = m.get("owner")
+    owner_name = "—"
+    if isinstance(owner_val, dict):
+        owner_name = owner_val.get("name") or str(owner_val.get("id", "—"))
+    elif owner_val:
+        owner_name = str(owner_val)
+        
+    # Extract organizer
+    organizer_val = m.get("organizer")
+    org_name = "—"
+    if isinstance(organizer_val, dict):
+        org_name = organizer_val.get("name") or organizer_val.get("email") or str(organizer_val.get("id", "—"))
+    elif organizer_val:
+        org_name = str(organizer_val)
+        
+    # Extract conductedBy
+    conducted_val = m.get("conductedBy")
+    conducted_name = "—"
+    if isinstance(conducted_val, dict):
+        conducted_name = conducted_val.get("name") or str(conducted_val.get("id", "—"))
+    elif conducted_val:
+        conducted_name = str(conducted_val)
+        
+    return f"• ID: {mid} | Title: {title} | Status: {status} | From: {from_dt} | To: {to_dt} | Location: {location} | Owner: {owner_name} | Organizer: {org_name} | Conducted By: {conducted_name}"
 
 
 async def search_meetings_logic(
@@ -4712,9 +4784,8 @@ async def search_meetings_logic(
     if err:
         return f"Invalid filters: {err}"
     payload = {"jsonRule": json_rule}
-    params = {"page": _meetings_search_api_page(page), "size": min(size, 100)}
-    if sort:
-        params["sort"] = sort
+    sort = _normalize_meeting_sort(sort)
+    params = {"page": _meetings_search_api_page(page), "size": min(size, 500), "sort": sort}
     logger.info("Searching meetings with %d filter(s)", len(filters))
     async with get_client() as client:
         response = await client.post("/meetings/search", params=params, json=payload)
@@ -4726,13 +4797,7 @@ async def search_meetings_logic(
         return f"No meetings found matching the filters. (Total in DB: {total})"
     lines = [f"Found {len(results)} meeting(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for m in results:
-        mid = m.get("id", "?")
-        title = m.get("title", "—")
-        status = m.get("status", "—")
-        from_dt = m.get("from", "—")
-        to_dt = m.get("to", "—")
-        location = m.get("location", "—") or "—"
-        lines.append(f"• ID: {mid} | Title: {title} | Status: {status} | From: {from_dt} | To: {to_dt} | Location: {location}")
+        lines.append(_format_meeting_summary_line(m))
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -4793,7 +4858,7 @@ async def search_meetings(
       - value: For status use internal name. For associated* equal, numeric id. For participants, list of full objects.
       - timeZone (str, optional): For date/datetime filters.
     page: 0-based page (default 0).
-    size: Page size, max 100 (default 20).
+    size: Page size, max 500 (default 20).
     sort: Sort e.g. "from,desc" (default).
     """
     try:
@@ -5105,6 +5170,7 @@ def _build_call_log_search_json_rule(
     for i, f in enumerate(filters):
         field_name = f.get("field")
         operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
+        operator = OPERATOR_SYMBOL_MAP.get(operator, operator)
         value = f.get("value")
 
         if not field_name:
@@ -5359,7 +5425,13 @@ async def search_leads_by_term_logic(
         return f"No leads found matching '{term}'. (Total in DB: {total})"
     lines = [f"Found {len(results)} lead(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for lead in results:
-        lines.append(_format_lead_for_display(lead))
+        lid = lead.get("id", "?")
+        fn = lead.get("firstName") or ""
+        ln = lead.get("lastName") or ""
+        name = f"{fn} {ln}".strip() or "—"
+        email = _extract_primary_email(lead.get("emails"))
+        phone = _extract_primary_phone(lead.get("phoneNumbers"))
+        lines.append(f"• ID: {lid} | Name: {name} | Email: {email} | Phone: {phone}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -5393,7 +5465,13 @@ async def search_contacts_by_term_logic(
         return f"No contacts found matching '{term}'. (Total in DB: {total})"
     lines = [f"Found {len(results)} contact(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for contact in results:
-        lines.append(_format_contact_for_display(contact))
+        cid = contact.get("id", "?")
+        fn = contact.get("firstName") or ""
+        ln = contact.get("lastName") or ""
+        name = f"{fn} {ln}".strip() or "—"
+        email = _extract_primary_email(contact.get("emails"))
+        phone = _extract_primary_phone(contact.get("phoneNumbers"))
+        lines.append(f"• ID: {cid} | Name: {name} | Email: {email} | Phone: {phone}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -5427,7 +5505,12 @@ async def search_tasks_by_term_logic(
         return f"No tasks found matching '{term}'. (Total in DB: {total})"
     lines = [f"Found {len(results)} task(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for task in results:
-        lines.append(_format_task_for_display(task))
+        tid = task.get("id", "?")
+        name = task.get("name", "—")
+        status = task.get("status", "—")
+        priority = task.get("priority", "—")
+        due_date = task.get("dueDate", "—")
+        lines.append(f"• ID: {tid} | Name: {name} | Status: {status} | Priority: {priority} | Due: {due_date}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -5461,7 +5544,12 @@ async def search_companies_by_term_logic(
         return f"No companies found matching '{term}'. (Total in DB: {total})"
     lines = [f"Found {len(results)} company/ies for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for company in results:
-        lines.append(_format_company_for_display(company))
+        cid = company.get("id", "?")
+        name = company.get("name", "—")
+        website = company.get("website", "—") or "—"
+        email = _extract_primary_email(company.get("emails"))
+        phone = _extract_primary_phone(company.get("phoneNumbers"))
+        lines.append(f"• ID: {cid} | Name: {name} | Website: {website} | Email: {email} | Phone: {phone}")
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -5491,9 +5579,8 @@ async def search_meetings_by_term_logic(
         "valid": True,
     }
     payload = {"jsonRule": json_rule}
-    params = {"page": _meetings_search_api_page(page), "size": min(size, 100)}
-    if sort:
-        params["sort"] = sort
+    sort = _normalize_meeting_sort(sort)
+    params = {"page": _meetings_search_api_page(page), "size": min(size, 500), "sort": sort}
     logger.info("Searching meetings by term (title only): %r", term)
     async with get_client() as client:
         response = await client.post("/meetings/search", params=params, json=payload)
@@ -5505,7 +5592,7 @@ async def search_meetings_by_term_logic(
         return f"No meetings found matching '{term}' in title. (Total in DB: {total})"
     lines = [f"Found {len(results)} meeting(s) with title matching '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for m in results:
-        lines.append(_format_meeting_for_display(m))
+        lines.append(_format_meeting_summary_line(m))
     lines.append("-" * 60)
     return "\n".join(lines)
 
@@ -5703,7 +5790,7 @@ async def search_entity(
     For meeting/call_log: Filters are OPTIONAL (empty = all records).
 
     page: 0-based page for lead/contact/task/deal/company; 1-based for meeting/call_log (default 0).
-    size: Page size, max 100 (default 20).
+    size: Page size, max 100 (max 500 for meeting/call_log) (default 20).
     sort: Sort e.g. "createdAt,desc" (default).
 
     Task association examples (replaces search_tasks_for_* tools):
@@ -5711,6 +5798,10 @@ async def search_entity(
       - search_entity("task", [{"field": "associatedContacts", "operator": "equal", "value": contact_id}])
       - search_entity("task", [{"field": "associatedDeals", "operator": "equal", "value": deal_id}])
       - search_entity("task", [{"field": "associatedCompanies", "operator": "equal", "value": company_id}])
+
+    Meeting owner/organizer examples (DO NOT use search_entity_by_term):
+      - search_entity("meeting", [{"field": "owner", "operator": "equal", "value": user_id}])
+      - search_entity("meeting", [{"field": "organizer", "operator": "equal", "value": user_id}])
     """
     return await search_entity_logic(entity_type, filters, page, size, sort)
 
@@ -5769,11 +5860,11 @@ async def search_entity_by_term(
     Valid entity_type values: lead, contact, task, deal, company, meeting
 
     search_term: A specific term to search across fields (e.g. "John", "acme@corp.com", "Acme Inc").
-      - For meeting: searches 'title' field only.
+      - For meeting: searches 'title' field only. ⚠️ DO NOT use this tool to search/filter meetings by owner or organizer name; instead, look up their user ID and call `search_entity` with an `owner` or `organizer` filter.
       - For others: multi-field search (first name, last name, email, phone, etc.).
 
     page: 0-based page for lead/contact/task/deal/company; 1-based for meeting (default 0).
-    size: Page size, max 100 (default 20).
+    size: Page size, max 100 (max 500 for meeting) (default 20).
     sort: Sort e.g. "updatedAt,desc" (default).
     """
     return await search_entity_by_term_logic(entity_type, search_term, page, size, sort)

@@ -799,7 +799,7 @@ async def test_search_entity_invalid_entity_type():
 
 @pytest.mark.asyncio
 async def test_search_entity_by_term_lead():
-    """search_entity_by_term should search leads by term."""
+    """search_entity_by_term should search leads by term and format concisely."""
     with patch("main.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
@@ -819,17 +819,28 @@ async def test_search_entity_by_term_lead():
         result = await search_leads_by_term_logic("john", page=0, size=20)
         assert isinstance(result, str)
         assert "Found 1" in result
+        assert "• ID: 1 | Name: John Doe | Email: john@example.com | Phone: -" in result
+        assert "LEAD DETAILS" not in result
 
 
 @pytest.mark.asyncio
 async def test_search_entity_by_term_meeting():
-    """search_entity_by_term for meeting should search title field only."""
+    """search_entity_by_term for meeting should search title field and format concisely including owner details."""
     with patch("main.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "content": [
-                {"id": 1, "title": "Standup Meeting", "status": "Scheduled", "from": "2026-04-28T10:00:00Z", "to": "2026-04-28T10:30:00Z"},
+                {
+                    "id": 1,
+                    "title": "Standup Meeting",
+                    "status": "Scheduled",
+                    "from": "2026-04-28T10:00:00Z",
+                    "to": "2026-04-28T10:30:00Z",
+                    "owner": {"id": 12, "name": "John Owner"},
+                    "organizer": {"id": 34, "name": "Alice Organizer"},
+                    "conductedBy": {"id": 56, "name": "Bob Conductor"}
+                },
             ],
             "totalElements": 1,
             "totalPages": 1,
@@ -843,6 +854,11 @@ async def test_search_entity_by_term_meeting():
         result = await search_meetings_by_term_logic("standup", page=0, size=20)
         assert isinstance(result, str)
         assert "Found 1" in result
+        assert "• ID: 1 | Title: Standup Meeting | Status: Scheduled | From: 2026-04-28T10:00:00Z | To: 2026-04-28T10:30:00Z" in result
+        assert "Owner: John Owner" in result
+        assert "Organizer: Alice Organizer" in result
+        assert "Conducted By: Bob Conductor" in result
+        assert "MEETING DETAILS" not in result
 
 
 @pytest.mark.asyncio
@@ -1149,7 +1165,7 @@ def _make_mock_context(client_name: str, client_version: str):
 def test_get_mcp_client_name_with_name_and_version():
     """Returns 'Name(version)' when both client name and version are present."""
     mock_ctx = _make_mock_context("Claude Desktop", "1.2.3")
-    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
         result = main._get_mcp_client_name()
     assert result == "Claude Desktop(1.2.3)"
 
@@ -1157,14 +1173,14 @@ def test_get_mcp_client_name_with_name_and_version():
 def test_get_mcp_client_name_without_version():
     """Returns just the name when version is empty."""
     mock_ctx = _make_mock_context("cursor", "")
-    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
         result = main._get_mcp_client_name()
     assert result == "cursor"
 
 
 def test_get_mcp_client_name_outside_request_context():
     """Returns 'unknown' when called outside a request (get_context raises)."""
-    with patch.object(main.mcp, "get_context", side_effect=LookupError):
+    with patch.object(main.mcp, "get_context", side_effect=LookupError, create=True):
         result = main._get_mcp_client_name()
     assert result == "unknown"
 
@@ -1175,7 +1191,7 @@ def test_get_mcp_client_name_no_client_params():
     mock_session.client_params = None
     mock_ctx = MagicMock()
     mock_ctx.session = mock_session
-    with patch.object(main.mcp, "get_context", return_value=mock_ctx):
+    with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
         result = main._get_mcp_client_name()
     assert result == "unknown"
 
@@ -1449,5 +1465,136 @@ async def test_advance_deal_sequentially_happy_path():
     assert mock_client.put.call_count == 2
 
 
+# ---------------------------------------------------------------------------
+# operator normalization and scheduledAt alias tests
+# ---------------------------------------------------------------------------
+
+def test_operator_normalization_and_scheduled_at_alias_meeting():
+    from main import _build_meeting_search_json_rule
+    filterable_map = {
+        "from": {"type": "DATETIME_PICKER", "standard": True},
+        "title": {"type": "TEXT_FIELD", "standard": True},
+    }
+    filters = [
+        {"field": "title", "operator": "contains", "value": "Demo"},
+        {"field": "scheduledAt", "operator": "gte", "value": "2025-12-15T00:00:00Z"},
+    ]
+    rules, err = _build_meeting_search_json_rule(filters, filterable_map)
+    assert err is None
+    assert len(rules["rules"]) == 2
+    
+    # Check first rule
+    rule0 = rules["rules"][0]
+    assert rule0["id"] == "title"
+    assert rule0["field"] == "title"
+    assert rule0["operator"] == "contains"
+    assert rule0["value"] == "Demo"
+    
+    # Check second rule
+    rule1 = rules["rules"][1]
+    assert rule1["id"] == "from"
+    assert rule1["field"] == "from"
+    assert rule1["operator"] == "greater_or_equal"  # normalized from gte
+    assert rule1["value"] == "2025-12-15T00:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_search_meetings_logic_sort_alias():
+    from main import search_meetings_logic
+    with patch("main.get_client") as mock_get_client, \
+         patch("main._fetch_meeting_fields") as mock_fetch_fields:
+         
+        mock_fetch_fields.return_value = [
+            {"id": 1, "name": "title", "type": "TEXT_FIELD", "active": True, "filterable": True, "standard": True},
+            {"id": 2, "name": "from", "type": "DATETIME_PICKER", "active": True, "filterable": True, "standard": True},
+        ]
+        
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "content": [{"id": 101, "title": "Demo Meeting", "from": "2025-12-15T10:00:00Z"}],
+            "totalElements": 1,
+            "totalPages": 1,
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+        
+        # When querying with scheduledAt,desc sort
+        result = await search_meetings_logic([], page=0, size=10, sort="scheduledAt,desc")
+        
+        assert "Demo Meeting" in result
+        call_args = mock_client.post.call_args
+        params = call_args.kwargs["params"]
+        # scheduledAt,desc should be converted to from,desc
+        assert params["sort"] == "from,desc"
+
+
+def test_operator_normalization_in_general_search_rule_builder():
+    from main import _build_search_json_rule
+    filterable_map = {
+        "firstName": {"type": "TEXT_FIELD", "standard": True},
+        "createdAt": {"type": "DATETIME_PICKER", "standard": True},
+    }
+    filters = [
+        {"field": "firstName", "operator": "eq", "value": "John"},
+        {"field": "createdAt", "operator": "lte", "value": "2026-06-15T00:00:00Z"},
+    ]
+    rules, err = _build_search_json_rule(filters, filterable_map)
+    assert err is None
+    assert len(rules["rules"]) == 2
+    assert rules["rules"][0]["operator"] == "equal"
+    assert rules["rules"][1]["operator"] == "less_or_equal"
+
+
+def test_normalize_meeting_sort():
+    """_normalize_meeting_sort maps unsupported sort fields to valid ones."""
+    from main import _normalize_meeting_sort
+    # Unsupported fields are mapped to 'from'
+    assert _normalize_meeting_sort("updatedAt,desc") == "from,desc"
+    assert _normalize_meeting_sort("scheduledAt,asc") == "from,asc"
+    assert _normalize_meeting_sort("startTime,desc") == "from,desc"
+    assert _normalize_meeting_sort("startDate,asc") == "from,asc"
+    # Valid fields pass through unchanged
+    assert _normalize_meeting_sort("from,desc") == "from,desc"
+    assert _normalize_meeting_sort("createdAt,asc") == "createdAt,asc"
+    # None or empty defaults to from,desc
+    assert _normalize_meeting_sort(None) == "from,desc"
+    assert _normalize_meeting_sort("") == "from,desc"
+    # Missing direction defaults to desc
+    assert _normalize_meeting_sort("updatedAt") == "from,desc"
+
+
+@pytest.mark.asyncio
+async def test_search_meetings_by_term_sort_normalization():
+    """search_meetings_by_term_logic should normalize sort (e.g. updatedAt -> from)."""
+    from main import search_meetings_by_term_logic
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "content": [{"id": 1, "title": "Kylas Demo", "status": "Scheduled", "from": "2026-04-28T10:00:00Z", "to": "2026-04-28T10:30:00Z"}],
+            "totalElements": 1,
+            "totalPages": 1,
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        # Simulate generic dispatcher passing updatedAt,desc (the default)
+        result = await search_meetings_by_term_logic("Kylas Demo", page=0, size=100, sort="updatedAt,desc")
+
+        assert "Kylas Demo" in result
+        call_args = mock_client.post.call_args
+        params = call_args.kwargs["params"]
+        # updatedAt,desc must be normalized to from,desc
+        assert params["sort"] == "from,desc"
+
+
 if __name__ == "__main__":
     asyncio.run(run_manual_tests())
+

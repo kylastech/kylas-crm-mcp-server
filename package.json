@@ -1,0 +1,17 @@
+{
+  "name": "kylas-crm-mcp-server",
+  "version": "1.1.0",
+  "description": "Claude Desktop extension bridging to the hosted Kylas CRM MCP server",
+  "private": true,
+  "main": "launcher.js",
+  "scripts": {
+    "build": "esbuild node_modules/mcp-remote/dist/proxy.js --bundle --platform=node --format=esm --target=node18 --outfile=proxy.bundled.mjs --banner:js=\"import{createRequire as __cr}from'module';const require=__cr(import.meta.url);\"",
+    "pack": "npm run build && npx -y @anthropic-ai/mcpb pack"
+  },
+  "dependencies": {
+    "mcp-remote": "^0.1.29"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}
