@@ -777,6 +777,41 @@ Same as above with `"entity": "deal"` in relatedTo. Optionally link a contact:
 `add_note("CALL_LOG", call_log_id, "note text")`
 """
 
+
+QUOTATION_SYSTEM_INSTRUCTIONS = """
+# Kylas CRM MCP Server - Quotation Operations (READ-ONLY)
+
+A quotation is a priced proposal, usually linked to a deal, made up of line-item products with
+tax/discount and billing/shipping addresses.
+
+Quotations are READ-ONLY here. You can search, view, and report on them — you CANNOT create,
+update, or delete quotations through this server. If the user asks to create/edit a quotation, tell
+them it must be done in the Kylas web app; do not attempt it via create_entity/update_entity
+(those tools do not accept entity_type "quotation").
+
+Available quotation tools (same read surface as lead, minus create/update):
+- `get_quotation_field_instructions` — field cheat sheet (call once per session before filtering).
+- `search_entity("quotation", filters)` — list/filter quotations by field criteria.
+- `search_entity_by_term("quotation", term)` — free-text search across summary, quotation number, and associated deal/company/contact/product names.
+- `search_idle_entities("quotation", days)` — quotations not updated for N days (based on updatedAt; quotations have no activity feed).
+- `get_quotation(quotation_id)` — full details of one quotation (products, totals, deal, company, contacts).
+
+### Field instructions FIRST
+Call `get_quotation_field_instructions` the first time you touch quotations in a session to get
+the field cheat sheet (standard + custom fields, filterable flags, picklist Option IDs).
+
+### Search / Filter
+- Use `search_entity("quotation", filters)`. Only `filterable=true` fields (from the cheat sheet) are allowed.
+- Common filters: `quotationNumber`, `summary`, `status`, `grandTotal`, `associatedDeal`, `updatedAt`.
+- To get all quotations: `[{"field": "summary", "operator": "is_not_empty"}]` (summary is required so this matches all), or an `updatedAt >= last 90 days` filter. Note: the `id` field (type ID) does NOT support is_not_null.
+- Sorting: only sortable fields are accepted; if unsure, omit sort (server defaults to updatedAt,desc).
+
+### Reporting
+When showing multiple quotations, summarize by status or associated deal and total the grand totals
+where useful (values are in the quotation's currency). Use `get_quotation(id)` to drill into one record.
+"""
+
+
 # ---------------------------------------------------------------------------
 # Diagnosis & Reporting Instructions
 # ---------------------------------------------------------------------------
@@ -894,7 +929,8 @@ Key Takeaways:
 _base_instructions = (
     SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" +
     COMPANY_SYSTEM_INSTRUCTIONS + "\n\n" + MEETING_SYSTEM_INSTRUCTIONS + "\n\n" +
-    CALL_LOG_SYSTEM_INSTRUCTIONS + "\n\n" + DIAGNOSIS_AND_REPORTING_INSTRUCTIONS
+    CALL_LOG_SYSTEM_INSTRUCTIONS + "\n\n" + QUOTATION_SYSTEM_INSTRUCTIONS + "\n\n" +
+    DIAGNOSIS_AND_REPORTING_INSTRUCTIONS
 )
 
 
@@ -5598,6 +5634,287 @@ async def search_meetings_by_term_logic(
 
 
 # ---------------------------------------------------------------------------
+# Quotation field instructions / get / search logic
+# ---------------------------------------------------------------------------
+
+async def _fetch_quotation_fields() -> List[Dict[str, Any]]:
+    """Fetch quotation field metadata (GET /quotations/fields). Returns list of active field dicts."""
+    async with get_client() as client:
+        response = await client.get("/quotations/fields", params={"page": 0, "size": 100})
+        data = await handle_api_response(response, "Fetch quotation fields")
+        if isinstance(data, list):
+            fields = data
+        elif isinstance(data, dict):
+            fields = data.get("data", data.get("content", []))
+        else:
+            fields = []
+        return [f for f in fields if f.get("active", True)]
+
+
+
+async def get_quotation_field_instructions_logic() -> str:
+    fields = await _fetch_quotation_fields()
+    standard = [f for f in fields if f.get("standard", False)]
+    custom = [f for f in fields if not f.get("standard", False)]
+    lines = [
+        "=" * 60,
+        "KYLAS CRM - QUOTATION FIELDS CHEAT SHEET",
+        "=" * 60,
+        "",
+        "## STANDARD FIELDS",
+        "-" * 40,
+    ]
+    for f in standard:
+        lines.extend(_format_field(f, include_filterable=True))
+    if custom:
+        lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
+        for f in custom:
+            lines.extend(_format_field(f, include_filterable=True))
+    lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_quotation_field_instructions() -> str:
+    """
+    Get all quotation fields for the current tenant. CALL THIS FIRST before searching or filtering quotations.
+    Returns a cheat sheet with API names (standard fields), Field IDs (custom fields), Picklist Option IDs,
+    and which fields are [FILTERABLE] for search_entity("quotation", ...).
+    """
+    try:
+        _reset_api_call_count()
+        logger.info("Fetching quotation field instructions")
+        return await get_quotation_field_instructions_logic()
+    except KylasAPIError as e:
+        return f"Error: {e.message}"
+    except Exception as e:
+        logger.exception("get_quotation_field_instructions")
+        return f"Unexpected error: {str(e)}"
+
+
+def _format_quotation_for_display(q: Dict[str, Any]) -> str:
+    """Format a quotation object into a readable multi-line string."""
+    def _name_of(obj: Any) -> str:
+        if isinstance(obj, dict):
+            return obj.get("name") or (str(obj.get("id")) if obj.get("id") is not None else "—")
+        return str(obj) if obj is not None else "—"
+
+    lines = ["=" * 60, "QUOTATION DETAILS", "=" * 60]
+    lines.append(f"ID: {q.get('id', '—')}")
+    lines.append(f"Quotation Number: {q.get('quotationNumber', '—')}")
+    lines.append(f"Summary: {q.get('summary', '—')}")
+    status = q.get("status")
+    lines.append(f"Status: {_name_of(status)}")
+
+    def _money(v: Any) -> Any:
+        return v.get("value") if isinstance(v, dict) else (v if v is not None else "—")
+
+    lines.append(f"Sub Total: {_money(q.get('subTotal'))}")
+    lines.append(f"Grand Total: {_money(q.get('grandTotal'))}")
+    lines.append(f"Valid Till: {q.get('validTill', '—')}")
+    lines.append(f"Owner: {_name_of(q.get('owner'))}")
+    lines.append(f"Associated Deal: {_name_of(q.get('associatedDeal'))}")
+    lines.append(f"Associated Company: {_name_of(q.get('associatedCompany'))}")
+    contacts = q.get("associatedContacts") or []
+    if contacts:
+        lines.append("Associated Contacts: " + ", ".join(_name_of(c) for c in contacts))
+    lines.append(f"Created At: {q.get('createdAt', '—')}")
+    lines.append(f"Updated At: {q.get('updatedAt', '—')}")
+    # Products
+    products = q.get("products") or []
+    lines.append("")
+    if products:
+        lines.append(f"Products ({len(products)}):")
+        for prod in products:
+            prod_name = prod.get("name") or f"ID:{prod.get('id', '?')}"
+            qty = prod.get("quantity", "?")
+            price_obj = prod.get("price") or {}
+            unit_price = price_obj.get("value") if isinstance(price_obj, dict) else price_obj
+            total = prod.get("totalAmount")
+            total_val = total.get("value") if isinstance(total, dict) else total
+            lines.append(f"  • {prod_name:<24} qty: {qty}  unit: {unit_price}  total: {total_val}")
+    else:
+        lines.append("Products: —")
+    # Custom fields
+    custom = q.get("customFieldValues") or {}
+    if custom:
+        lines.append("")
+        lines.append("Custom fields:")
+        for k, v in custom.items():
+            lines.append(f"  {k}: {v}")
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+async def get_quotation_logic(quotation_id: int) -> Dict[str, Any]:
+    """Fetch a single quotation by ID (GET /quotations/{id})."""
+    quotation_id = int(quotation_id)
+    async with get_client() as client:
+        response = await client.get(f"/quotations/{quotation_id}")
+        return await handle_api_response(response, "Get quotation")
+
+
+@mcp.tool()
+async def get_quotation(quotation_id: int) -> str:
+    """
+    Get full details of a quotation by ID (GET /quotations/{id}). Use when the user asks for complete
+    quotation info (products, totals, associated deal/company/contacts).
+    quotation_id: The quotation ID (e.g. from search_entity("quotation", ...) results).
+    """
+    try:
+        _reset_api_call_count()
+        q = await get_quotation_logic(quotation_id)
+        return _format_quotation_for_display(q)
+    except KylasAPIError as e:
+        return f"✗ Failed to get quotation: {e.message}\n  Details: {e.response_body}"
+    except Exception as e:
+        logger.exception("get_quotation")
+        return f"✗ Unexpected error: {str(e)}"
+
+
+async def search_quotations_logic(
+    filters: List[Dict[str, Any]],
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """Search quotations with jsonRule (POST /quotations/search); only filterable fields allowed."""
+    fields_list = await _fetch_quotation_fields()
+    filterable_map = _get_filterable_fields_map(fields_list)
+    if not filterable_map:
+        return "No filterable quotation fields found for this tenant."
+    sortable = {f.get("name") for f in fields_list if f.get("sortable") and f.get("name")}
+
+    default_tz = None
+    date_field_types = {"DATETIME_PICKER", "DATE", "DATE_PICKER"}
+    for f in filters:
+        fn = f.get("field")
+        if fn and fn in filterable_map and filterable_map[fn].get("type") in date_field_types and not f.get("timeZone"):
+            try:
+                user = await _fetch_current_user()
+                default_tz = user.get("timezone") or DEFAULT_TIMEZONE
+            except Exception:
+                default_tz = DEFAULT_TIMEZONE
+            break
+
+    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    if err:
+        return f"Invalid filters: {err}"
+    payload = {"jsonRule": json_rule}
+    params: Dict[str, Any] = {"page": page, "size": min(size, 100)}
+    # Only pass sort if the field is sortable; otherwise let the server apply its default.
+    if sort:
+        sort_by = sort.split(",")[0].strip()
+        if sort_by in sortable:
+            params["sort"] = sort
+    logger.info("Searching quotations with %d filter(s)", len(filters))
+    async with get_client() as client:
+        response = await client.post("/quotations/search", params=params, json=payload)
+        data = await handle_api_response(response, "Search quotations")
+    results = data.get("content", data.get("data", [])) if isinstance(data, dict) else []
+    total = data.get("totalElements", data.get("total", len(results))) if isinstance(data, dict) else len(results)
+    total_pages = data.get("totalPages", 1) if isinstance(data, dict) else 1
+    if not results:
+        return f"No quotations found matching the filters. (Total in DB: {total})"
+    lines = [f"Found {len(results)} quotation(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for q in results:
+        qid = q.get("id", "?")
+        number = q.get("quotationNumber", "—")
+        summary = q.get("summary", "—")
+        status = q.get("status")
+        status_str = status.get("name", "—") if isinstance(status, dict) else (status or "—")
+        gt = q.get("grandTotal")
+        grand_total = gt.get("value") if isinstance(gt, dict) else (gt if gt is not None else "—")
+        deal = q.get("associatedDeal")
+        deal_str = deal.get("name", deal.get("id", "—")) if isinstance(deal, dict) else "—"
+        lines.append(
+            f"• ID: {qid} | No: {number} | Summary: {summary} | Status: {status_str} | Grand Total: {grand_total} | Deal: {deal_str}"
+        )
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+async def search_quotations_by_term_logic(
+    search_term: str,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """
+    Search quotations by a free-text term across summary, quotation number, and the associated
+    deal / company / contact / product names (POST /quotations/search with a multi_field jsonRule).
+    """
+    term = (search_term or "").strip()
+    if not term:
+        return "Error: search_term cannot be empty."
+    # Determine sortable fields so we only pass a valid sort (server rejects non-sortable sorts).
+    fields_list = await _fetch_quotation_fields()
+    sortable = {f.get("name") for f in fields_list if f.get("sortable") and f.get("name")}
+    payload = {"jsonRule": _multi_field_json_rule(term)}
+    params: Dict[str, Any] = {"page": page, "size": min(size, 100)}
+    if sort and sort.split(",")[0].strip() in sortable:
+        params["sort"] = sort
+    logger.info("Searching quotations by term: %r", term)
+    async with get_client() as client:
+        response = await client.post("/quotations/search", params=params, json=payload)
+        data = await handle_api_response(response, "Search quotations by term")
+    results = data.get("content", data.get("data", [])) if isinstance(data, dict) else []
+    total = data.get("totalElements", data.get("total", len(results))) if isinstance(data, dict) else len(results)
+    total_pages = data.get("totalPages", 1) if isinstance(data, dict) else 1
+    if not results:
+        return f"No quotations found for '{term}'. (Total in DB: {total})"
+    lines = [f"Found {len(results)} quotation(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
+    for q in results:
+        qid = q.get("id", "?")
+        number = q.get("quotationNumber", "—")
+        summary = q.get("summary", "—")
+        status = q.get("status")
+        status_str = status.get("name", "—") if isinstance(status, dict) else (status or "—")
+        gt = q.get("grandTotal")
+        grand_total = gt.get("value") if isinstance(gt, dict) else (gt if gt is not None else "—")
+        deal = q.get("associatedDeal")
+        deal_str = deal.get("name", deal.get("id", "—")) if isinstance(deal, dict) else "—"
+        lines.append(
+            f"• ID: {qid} | No: {number} | Summary: {summary} | Status: {status_str} | Grand Total: {grand_total} | Deal: {deal_str}"
+        )
+    lines.append("-" * 60)
+    return "\n".join(lines)
+
+
+async def search_idle_quotations_logic(
+    days: int,
+    time_zone: Optional[str] = None,
+    page: int = 0,
+    size: int = 20,
+    sort: Optional[str] = "updatedAt,desc",
+) -> str:
+    """
+    Find quotations with no update for at least `days` days (updatedAt on or before now - days).
+    Quotations have no activity feed, so idleness is based on updatedAt only.
+    If time_zone is not provided, uses the current user's timezone.
+    """
+    if time_zone:
+        tz = time_zone
+    else:
+        try:
+            user = await _fetch_current_user()
+            tz = user.get("timezone") or DEFAULT_TIMEZONE
+        except Exception:
+            tz = DEFAULT_TIMEZONE
+    threshold_iso = _threshold_iso_days_ago(days, tz)
+    fields_list = await _fetch_quotation_fields()
+    filterable_map = _get_filterable_fields_map(fields_list)
+    base = {"operator": "less_or_equal", "value": threshold_iso, "timeZone": tz}
+    filters = []
+    for name in ("updatedAt", "latestActivityCreatedAt"):
+        if name in filterable_map:
+            filters.append({"field": name, **base})
+    if not filters:
+        return "Error: 'updatedAt' is not filterable for quotations in this tenant. Check get_quotation_field_instructions."
+    return await search_quotations_logic(filters, page=page, size=size, sort=sort)
+
+
+# ---------------------------------------------------------------------------
 # Entity Configuration Dictionary for Generic Search Tool Dispatch
 # ---------------------------------------------------------------------------
 
@@ -5678,6 +5995,17 @@ _ENTITY_CONFIG = {
         "search_rule_builder": _build_call_log_search_json_rule,
         "normalize": False,
         "field_fmt": "meeting",
+    },
+    "quotation": {
+        "search_fn": search_quotations_logic,
+        "by_term_fn": search_quotations_by_term_logic,
+        "idle_fn": search_idle_quotations_logic,
+        "search_fields": ["id", "quotationNumber", "summary", "status", "grandTotal", "associatedDeal", "updatedAt"],
+        "search_endpoint": "/quotations/search",
+        "search_page_offset": 0,
+        "search_rule_builder": _build_search_json_rule,
+        "normalize": True,
+        "field_fmt": "standard",
     },
 }
 
@@ -5777,7 +6105,7 @@ async def search_entity(
     Search/filter any entity type (lead, contact, task, deal, company, meeting, call_log).
     Use this tool instead of entity-specific search tools.
 
-    Valid entity_type values: lead, contact, task, deal, company, meeting, call_log
+    Valid entity_type values: lead, contact, task, deal, company, meeting, call_log, quotation
 
     filters: List of filter objects. Each must have:
       - field (str): Field internal/API name (e.g. firstName, country, source, createdAt).
@@ -5857,10 +6185,11 @@ async def search_entity_by_term(
     ⚠️ NEVER use this tool when the user asks for "all" records (e.g. "show all leads", "list all contacts").
        → For "all" / "list" queries, use `search_entity` with a date filter (e.g. updatedAt >= last 90 days).
 
-    Valid entity_type values: lead, contact, task, deal, company, meeting
+    Valid entity_type values: lead, contact, task, deal, company, meeting, quotation
 
     search_term: A specific term to search across fields (e.g. "John", "acme@corp.com", "Acme Inc").
       - For meeting: searches 'title' field only. ⚠️ DO NOT use this tool to search/filter meetings by owner or organizer name; instead, look up their user ID and call `search_entity` with an `owner` or `organizer` filter.
+      - For quotation: searches summary, quotation number, and the associated deal / company / contact / product names.
       - For others: multi-field search (first name, last name, email, phone, etc.).
 
     page: 0-based page for lead/contact/task/deal/company; 1-based for meeting (default 0).
@@ -5919,7 +6248,8 @@ async def search_idle_entities(
     Search entities that have been idle (no recent activity) for N days.
     Use this tool to find stale or neglected records.
 
-    Valid entity_type values: lead, deal, company
+    Valid entity_type values: lead, deal, company, quotation
+    (quotation has no activity feed, so idleness is based on updatedAt only.)
 
     days: Number of days of inactivity (e.g., 30 = last updated >30 days ago).
     time_zone: Timezone for date calculation (optional; defaults to current user's timezone or server default).
