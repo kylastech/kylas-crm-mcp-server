@@ -34,6 +34,12 @@ from main import (
     search_leads_by_term_logic,
     search_meetings_by_term_logic,
     _format_entity_labels_for_instructions,
+    get_quotation_field_instructions_logic,
+    get_quotation_logic,
+    _format_quotation_for_display,
+    search_quotations_logic,
+    search_quotations_by_term_logic,
+    search_idle_quotations_logic,
 )
 
 
@@ -1593,6 +1599,441 @@ async def test_search_meetings_by_term_sort_normalization():
         params = call_args.kwargs["params"]
         # updatedAt,desc must be normalized to from,desc
         assert params["sort"] == "from,desc"
+
+
+# ---------------------------------------------------------------------------
+# Quotation Tests
+# ---------------------------------------------------------------------------
+
+MOCK_QUOTATION_FIELDS_RESPONSE = [
+    {
+        "id": 80001,
+        "displayName": "Quotation Number",
+        "name": "quotationNumber",
+        "type": "TEXT_FIELD",
+        "standard": True,
+        "active": True,
+        "required": False,
+        "filterable": True,
+        "sortable": True,
+    },
+    {
+        "id": 80002,
+        "displayName": "Summary",
+        "name": "summary",
+        "type": "TEXT_FIELD",
+        "standard": True,
+        "active": True,
+        "required": True,
+        "filterable": True,
+        "sortable": True,
+    },
+    {
+        "id": 80003,
+        "displayName": "Status",
+        "name": "status",
+        "type": "PICK_LIST",
+        "standard": True,
+        "active": True,
+        "required": False,
+        "filterable": True,
+        "sortable": False,
+        "picklist": {
+            "values": [
+                {"id": 9001, "displayName": "Draft"},
+                {"id": 9002, "displayName": "Sent"},
+                {"id": 9003, "displayName": "Accepted"},
+            ]
+        },
+    },
+    {
+        "id": 80004,
+        "displayName": "Grand Total",
+        "name": "grandTotal",
+        "type": "MONETARY",
+        "standard": True,
+        "active": True,
+        "required": False,
+        "filterable": True,
+        "sortable": True,
+    },
+    {
+        "id": 80005,
+        "displayName": "Updated At",
+        "name": "updatedAt",
+        "type": "DATETIME_PICKER",
+        "standard": True,
+        "active": True,
+        "required": False,
+        "filterable": True,
+        "sortable": True,
+    },
+    {
+        "id": 80100,
+        "displayName": "Region",
+        "name": "cfRegion",
+        "type": "PICK_LIST",
+        "standard": False,
+        "active": True,
+        "required": False,
+        "filterable": True,
+        "sortable": False,
+        "picklist": {
+            "values": [
+                {"id": 50001, "displayName": "North"},
+                {"id": 50002, "displayName": "South"},
+            ]
+        },
+    },
+]
+
+MOCK_QUOTATION_DETAIL = {
+    "id": 7001,
+    "quotationNumber": "QT-0042",
+    "summary": "Annual subscription",
+    "status": {"id": 9001, "name": "Draft"},
+    "subTotal": {"currencyId": 1, "value": 10000},
+    "grandTotal": {"currencyId": 1, "value": 11800},
+    "validTill": "2026-08-31",
+    "owner": {"id": 101, "name": "Yugal Owner"},
+    "associatedDeal": {"id": 201, "name": "Big Deal"},
+    "associatedCompany": {"id": 301, "name": "Acme Corp"},
+    "associatedContacts": [
+        {"id": 401, "name": "John Contact"},
+        {"id": 402, "name": "Jane Contact"},
+    ],
+    "createdAt": "2026-07-01T10:00:00Z",
+    "updatedAt": "2026-07-05T15:30:00Z",
+    "products": [
+        {
+            "id": 501,
+            "name": "Widget Pro",
+            "quantity": 5,
+            "price": {"currencyId": 1, "value": 2000},
+            "totalAmount": {"currencyId": 1, "value": 10000},
+        },
+    ],
+    "customFieldValues": {"cfRegion": "North"},
+}
+
+MOCK_QUOTATION_SEARCH_RESPONSE = {
+    "content": [
+        {
+            "id": 7001,
+            "quotationNumber": "QT-0042",
+            "summary": "Annual subscription",
+            "status": {"id": 9001, "name": "Draft"},
+            "grandTotal": {"currencyId": 1, "value": 11800},
+            "associatedDeal": {"id": 201, "name": "Big Deal"},
+            "updatedAt": "2026-07-05T15:30:00Z",
+        },
+        {
+            "id": 7002,
+            "quotationNumber": "QT-0043",
+            "summary": "Monthly plan",
+            "status": {"id": 9002, "name": "Sent"},
+            "grandTotal": {"currencyId": 1, "value": 500},
+            "associatedDeal": None,
+            "updatedAt": "2026-07-04T12:00:00Z",
+        },
+    ],
+    "totalElements": 2,
+    "totalPages": 1,
+}
+
+
+@pytest.mark.asyncio
+async def test_get_quotation_field_instructions_success():
+    """get_quotation_field_instructions_logic returns a cheat sheet with standard and custom fields."""
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await get_quotation_field_instructions_logic()
+
+        assert "KYLAS CRM - QUOTATION FIELDS CHEAT SHEET" in result
+        assert "[STANDARD]" in result
+        assert "'Summary'" in result
+        assert "'quotationNumber'" in result
+        assert "Draft (ID: 9001)" in result
+        assert "## CUSTOM FIELDS" in result
+        assert "'Region'" in result
+        assert "North (ID: 50001)" in result
+
+
+def test_format_quotation_for_display_full():
+    """_format_quotation_for_display renders all fields including products and custom fields."""
+    result = _format_quotation_for_display(MOCK_QUOTATION_DETAIL)
+
+    assert "QUOTATION DETAILS" in result
+    assert "ID: 7001" in result
+    assert "Quotation Number: QT-0042" in result
+    assert "Summary: Annual subscription" in result
+    assert "Status: Draft" in result
+    assert "Sub Total: 10000" in result
+    assert "Grand Total: 11800" in result
+    assert "Valid Till: 2026-08-31" in result
+    assert "Owner: Yugal Owner" in result
+    assert "Associated Deal: Big Deal" in result
+    assert "Associated Company: Acme Corp" in result
+    assert "John Contact" in result
+    assert "Jane Contact" in result
+    assert "Products (1):" in result
+    assert "Widget Pro" in result
+    assert "qty: 5" in result
+    assert "cfRegion: North" in result
+
+
+def test_format_quotation_for_display_no_products():
+    """Quotation with no products shows 'Products: —'."""
+    q = {"id": 100, "quotationNumber": "QT-0001", "summary": "Test", "products": []}
+    result = _format_quotation_for_display(q)
+    assert "Products: —" in result
+
+
+def test_format_quotation_for_display_no_contacts():
+    """Quotation with no associated contacts omits the contacts line."""
+    q = {"id": 100, "quotationNumber": "QT-0001", "summary": "Test", "associatedContacts": []}
+    result = _format_quotation_for_display(q)
+    assert "Associated Contacts" not in result
+
+
+@pytest.mark.asyncio
+async def test_get_quotation_logic():
+    """get_quotation_logic fetches a single quotation by ID."""
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = MOCK_QUOTATION_DETAIL
+        mock_response.raise_for_status = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await get_quotation_logic(7001)
+
+        assert result["id"] == 7001
+        assert result["quotationNumber"] == "QT-0042"
+        mock_client.get.assert_called_once_with("/quotations/7001")
+
+
+@pytest.mark.asyncio
+async def test_search_quotations_logic_with_filters():
+    """search_quotations_logic returns formatted results when filters match."""
+    with patch("main.get_client") as mock_get_client, \
+         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+
+        mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = MOCK_QUOTATION_SEARCH_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await search_quotations_logic(
+            [{"field": "summary", "operator": "is_not_empty"}]
+        )
+
+        assert "Found 2 quotation(s)" in result
+        assert "QT-0042" in result
+        assert "Annual subscription" in result
+        assert "Draft" in result
+        assert "11800" in result
+        assert "Big Deal" in result
+        assert "QT-0043" in result
+        assert "Monthly plan" in result
+
+        # Verify POST was called to /quotations/search
+        call_args = mock_client.post.call_args
+        assert "/quotations/search" in str(call_args)
+        assert call_args.kwargs["json"]["jsonRule"]["condition"] == "AND"
+
+
+@pytest.mark.asyncio
+async def test_search_quotations_logic_no_results():
+    """search_quotations_logic returns a 'no results' message when nothing matches."""
+    with patch("main.get_client") as mock_get_client, \
+         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+
+        mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"content": [], "totalElements": 0, "totalPages": 0}
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await search_quotations_logic(
+            [{"field": "summary", "operator": "equal", "value": "nonexistent"}]
+        )
+
+        assert "No quotations found" in result
+
+
+@pytest.mark.asyncio
+async def test_search_quotations_by_term_logic():
+    """search_quotations_by_term_logic searches by free-text term."""
+    with patch("main.get_client") as mock_get_client, \
+         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+
+        mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "content": [
+                {
+                    "id": 7001,
+                    "quotationNumber": "QT-0042",
+                    "summary": "Annual subscription",
+                    "status": {"id": 9001, "name": "Draft"},
+                    "grandTotal": {"currencyId": 1, "value": 11800},
+                    "associatedDeal": {"id": 201, "name": "Big Deal"},
+                },
+            ],
+            "totalElements": 1,
+            "totalPages": 1,
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await search_quotations_by_term_logic("Annual")
+
+        assert isinstance(result, str)
+        assert "Found 1 quotation(s)" in result
+        assert "Annual subscription" in result
+        assert "QT-0042" in result
+        assert "Big Deal" in result
+
+
+@pytest.mark.asyncio
+async def test_search_quotations_by_term_empty_term():
+    """search_quotations_by_term_logic rejects empty search term."""
+    result = await search_quotations_by_term_logic("")
+    assert "Error" in result
+    assert "empty" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_idle_quotations_logic():
+    """search_idle_quotations_logic finds quotations not updated for N days."""
+    with patch("main.get_client") as mock_get_client, \
+         patch("main._fetch_quotation_fields") as mock_fetch_fields, \
+         patch("main._fetch_current_user") as mock_user:
+
+        mock_user.return_value = {"timezone": "Asia/Calcutta"}
+        mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = MOCK_QUOTATION_SEARCH_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await search_idle_quotations_logic(days=30)
+
+        assert isinstance(result, str)
+        assert "Found" in result or "No quotations" in result
+
+
+@pytest.mark.asyncio
+async def test_search_entity_quotation_via_dispatcher():
+    """search_entity("quotation", ...) dispatches to search_quotations_logic."""
+    from main import _ENTITY_CONFIG
+    with patch.dict(_ENTITY_CONFIG, {"quotation": {
+        "search_fn": AsyncMock(return_value="Found 3 quotation(s)"),
+        "search_page_offset": 0,
+    }}):
+        filters = [{"field": "summary", "operator": "is_not_empty"}]
+        result = await search_entity_logic("quotation", filters, page=0, size=20)
+        assert "Found" in result
+
+
+@pytest.mark.asyncio
+async def test_search_entity_by_term_quotation_via_dispatcher():
+    """search_entity_by_term("quotation", ...) dispatches to search_quotations_by_term_logic."""
+    from main import _ENTITY_CONFIG
+    with patch.dict(_ENTITY_CONFIG, {"quotation": {
+        "by_term_fn": AsyncMock(return_value="Found 1 quotation(s) for 'Annual'"),
+        "search_page_offset": 0,
+    }}):
+        result = await search_entity_by_term_logic("quotation", "Annual", page=0, size=20)
+        assert "Found" in result
+        assert "Annual" in result
+
+
+def test_quotation_not_in_crud_config():
+    """Quotation must NOT be in _ENTITY_CRUD_CONFIG (read-only entity)."""
+    from main import _ENTITY_CRUD_CONFIG
+    assert "quotation" not in _ENTITY_CRUD_CONFIG, (
+        "Quotation is read-only and must not have a CRUD config entry"
+    )
+
+
+def test_quotation_in_entity_config():
+    """Quotation must be registered in _ENTITY_CONFIG for search dispatch."""
+    from main import _ENTITY_CONFIG
+    cfg = _ENTITY_CONFIG.get("quotation")
+    assert cfg is not None, "quotation must be in _ENTITY_CONFIG"
+    assert cfg["search_fn"] is not None
+    assert cfg["by_term_fn"] is not None
+    assert cfg["idle_fn"] is not None
+    assert cfg["search_endpoint"] == "/quotations/search"
+    assert cfg["search_page_offset"] == 0
+
+
+@pytest.mark.asyncio
+async def test_search_quotations_sort_validation():
+    """search_quotations_logic only passes sort if the field is sortable."""
+    with patch("main.get_client") as mock_get_client, \
+         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+
+        mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
+
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = MOCK_QUOTATION_SEARCH_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        # Sort by updatedAt (sortable=True) — should be included
+        await search_quotations_logic(
+            [{"field": "summary", "operator": "is_not_empty"}],
+            sort="updatedAt,desc",
+        )
+        call_args = mock_client.post.call_args
+        assert call_args.kwargs["params"]["sort"] == "updatedAt,desc"
+
+        # Sort by status (sortable=False) — should NOT be included
+        await search_quotations_logic(
+            [{"field": "summary", "operator": "is_not_empty"}],
+            sort="status,desc",
+        )
+        call_args2 = mock_client.post.call_args
+        assert "sort" not in call_args2.kwargs["params"]
 
 
 if __name__ == "__main__":
