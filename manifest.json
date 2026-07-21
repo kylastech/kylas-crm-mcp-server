@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "kylas-crm-mcp-server",
   "display_name": "Kylas",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "MCP server to interact with Kylas CRM: create/manage leads, deals, contacts, tasks, companies, and meetings.",
   "long_description": "Connect Claude to your Kylas CRM account to create and manage leads, deals, contacts, tasks, companies, and meetings — all from natural language.",
   "author": {
@@ -26,16 +26,16 @@
       "command": "node",
       "args": ["${__dirname}/launcher.js"],
       "env": {
-        "KYLAS_API_KEY": "${user_config.api_key}"
+        "KYLAS_MCP_URL": "${user_config.server_url}"
       }
     }
   },
   "user_config": {
-    "api_key": {
+    "server_url": {
       "type": "string",
-      "title": "Kylas API Key",
-      "description": "Your Kylas CRM API Key",
-      "sensitive": true,
+      "title": "Kylas MCP Server URL",
+      "description": "URL of your Kylas MCP server (OAuth). Sign-in happens in your browser on first connect \u2014 no API key needed.",
+      "default": "http://localhost:8000/mcp",
       "required": true
     }
   }
