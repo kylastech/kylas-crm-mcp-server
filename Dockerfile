@@ -8,7 +8,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Application
-COPY main.py kylas_oauth.py ./
+COPY main.py .
 
 ENV PYTHONUNBUFFERED=1
 ENV MCP_TRANSPORT=streamable-http

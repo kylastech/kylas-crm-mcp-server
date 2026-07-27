@@ -1204,7 +1204,7 @@ def test_get_mcp_client_name_no_client_params():
 
 def test_throttled_client_context_user_agent_format():
     """User-Agent header must be 'kylas_mcp_server({version}) on {client}'."""
-    with patch("main._resolve_auth_headers", return_value={"api-key": "test-key"}), \
+    with patch("main._resolve_api_key", return_value="test-key"), \
          patch("main._get_mcp_client_name", return_value="Claude Desktop(1.2.3)"):
         ctx = main._ThrottledClientContext()
         ua = ctx._raw.headers.get("user-agent")

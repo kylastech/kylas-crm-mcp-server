@@ -65,15 +65,6 @@ logger = logging.getLogger("kylas-mcp")
 
 BASE_URL = os.getenv("KYLAS_BASE_URL", "https://api.kylas.io/v1")
 API_KEY = os.getenv("KYLAS_API_KEY")
-KYLAS_CLIENT_ID = os.getenv("KYLAS_CLIENT_ID")
-KYLAS_CLIENT_SECRET = os.getenv("KYLAS_CLIENT_SECRET")
-MCP_SERVER_BASE_URL = os.getenv("MCP_SERVER_BASE_URL", "http://localhost:8000")
-# Positive-verification cache TTL (seconds). FastMCP verifies the token on every request;
-# a short cache avoids calling Kylas /users/me for every call. 0 disables the cache.
-KYLAS_TOKEN_CACHE_TTL_SECONDS = float(os.getenv("KYLAS_TOKEN_CACHE_TTL", "30"))
-
-# Populated when OAuth is configured; referenced by the lifespan for clean shutdown.
-_kylas_token_verifier = None  # type: ignore[var-annotated]
 try:
     SERVER_VERSION = _pkg_version("kylas-crm-mcp-server")
 except PackageNotFoundError:
@@ -96,13 +87,7 @@ def _mask_api_key(api_key: Optional[str]) -> str:
 async def _log_request(request: httpx.Request) -> None:
     """Log request details in a readable format."""
     api_key = request.headers.get("api-key")
-    auth_header = request.headers.get("Authorization")
-
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1]
-        masked_auth = f"Bearer {_mask_api_key(token)}"
-    else:
-        masked_auth = f"api-key: {_mask_api_key(api_key)}" if api_key else "None"
+    masked_key = _mask_api_key(api_key)
 
     payload = "None"
     if request.content:
@@ -117,7 +102,7 @@ async def _log_request(request: httpx.Request) -> None:
         f"{'-'*60}\n"
         f"Method:   {request.method}\n"
         f"URL:      {request.url}\n"
-        f"Auth:     {masked_auth}\n"
+        f"API Key:  {masked_key}\n"
         f"Payload:\n{payload}\n"
         f"{'='*60}"
     )
@@ -560,40 +545,22 @@ def _get_mcp_client_name() -> str:
     return "unknown"
 
 
-def _resolve_auth_headers() -> Dict[str, str]:
-    """Resolve authentication headers:
-    1. FastMCP OAuth Bearer token (if user is authenticated via OAuth)
-    2. Per-request x-api-key header (if passed in the HTTP request)
-    3. Environment variable fallback (KYLAS_API_KEY)
-    """
-    # 1. Try FastMCP OAuth access token
-    try:
-        from fastmcp.server.dependencies import get_access_token
-        access_token = get_access_token()
-        if access_token and access_token.token:
-            logger.debug("Resolved OAuth Bearer token authentication")
-            return {"Authorization": f"Bearer {access_token.token}"}
-    except Exception as e:
-        logger.debug("Could not resolve OAuth token: %s", e)
-
-    # 2. Try per-request x-api-key HTTP header
+def _resolve_api_key() -> str:
+    """Resolve API key: per-request x-api-key header → env var fallback."""
+    # Try per-request HTTP header (available in fastmcp 3.x)
     try:
         from fastmcp.server.dependencies import get_http_request
         request = get_http_request()
         header_key = request.headers.get("x-api-key")
         if header_key:
-            logger.debug("Resolved x-api-key header authentication")
-            return {"api-key": header_key}
+            return header_key
     except Exception:
         pass
-
-    # 3. Fall back to env var
+    # Fall back to env var (single-tenant deployments)
     if API_KEY:
-        logger.debug("Resolved environment KYLAS_API_KEY authentication")
-        return {"api-key": API_KEY}
-
+        return API_KEY
     raise KylasAPIError(
-        "No authentication provided. Pass x-api-key header, set KYLAS_API_KEY, or configure Kylas OAuth."
+        "API key not provided. Pass x-api-key header or set KYLAS_API_KEY environment variable."
     )
 
 
@@ -601,18 +568,17 @@ class _ThrottledClientContext:
     """Async context manager: wraps httpx.AsyncClient and yields _ThrottledClient for 100–500 ms delay between calls."""
 
     def __init__(self) -> None:
-        auth_headers = _resolve_auth_headers()
+        api_key = _resolve_api_key()
         client_name = _get_mcp_client_name()
         user_agent = f"kylas_mcp_server({SERVER_VERSION}) on {client_name}"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": user_agent,
-        }
-        headers.update(auth_headers)
         self._raw = httpx.AsyncClient(
             base_url=BASE_URL,
-            headers=headers,
+            headers={
+                "api-key": api_key,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": user_agent,
+            },
             timeout=30.0,
             event_hooks={
                 "request": [_log_request],
@@ -1087,28 +1053,9 @@ async def _app_lifespan(app: FastMCP):
             await refresh_task
         except asyncio.CancelledError:
             pass
-        # Release the pooled HTTP client held by the token verifier.
-        if _kylas_token_verifier is not None:
-            try:
-                await _kylas_token_verifier.aclose()
-            except Exception as _exc:  # shutdown must not raise
-                logger.debug("Error closing token verifier: %s", _exc)
 
 
-# OAuth (multi-user) is wired in kylas_oauth.py. It returns the provider and the
-# verifier (closed by the lifespan); both are None when OAuth isn't configured.
-from kylas_oauth import create_kylas_auth
-
-auth_provider, _kylas_token_verifier = create_kylas_auth(
-    base_url=BASE_URL,
-    client_id=KYLAS_CLIENT_ID,
-    client_secret=KYLAS_CLIENT_SECRET,
-    mcp_server_base_url=MCP_SERVER_BASE_URL,
-    token_cache_ttl_seconds=KYLAS_TOKEN_CACHE_TTL_SECONDS,
-)
-
-
-mcp = FastMCP("Kylas CRM", instructions=_base_instructions, lifespan=_app_lifespan, auth=auth_provider)
+mcp = FastMCP("Kylas CRM", instructions=_base_instructions, lifespan=_app_lifespan)
 mcp.add_middleware(_EnsureEntityLabelsMiddleware())
 
 

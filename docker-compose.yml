@@ -12,14 +12,6 @@ services:
       # Optional: fallback API key for single-user / testing
       # - KYLAS_API_KEY=${KYLAS_API_KEY}
       - KYLAS_BASE_URL=${KYLAS_BASE_URL:-https://api.kylas.io/v1}
-      - KYLAS_CLIENT_ID=${KYLAS_CLIENT_ID}
-      - KYLAS_CLIENT_SECRET=${KYLAS_CLIENT_SECRET}
-      - MCP_SERVER_BASE_URL=${MCP_SERVER_BASE_URL}
     ports:
       - "8000:8000"
-    volumes:
-      - fastmcp-data:/root/.local/share/fastmcp
     restart: unless-stopped
-
-volumes:
-  fastmcp-data:
