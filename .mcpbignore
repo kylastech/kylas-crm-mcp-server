@@ -1,4 +1,10 @@
 .git
+# Secrets & server-side source must NEVER ship in the client bundle
+.env
+.env.*
+main.py
+kylas_oauth.py
+requirements.txt
 .venv
 .idea
 .pytest_cache

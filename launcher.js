@@ -77,8 +77,19 @@ for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
 }
 
 // Run mcp-remote in-process. It reads its config from process.argv.slice(2), so set
-// argv as if it had been invoked as `node proxy.bundled.mjs <MCP_URL>`.
-process.argv = [process.execPath, mcpRemoteEntry, MCP_URL];
+// argv as if it had been invoked as `node proxy.bundled.mjs <MCP_URL> [--header ...]`.
+// If the user configured an API key, forward it as `x-api-key` so the server skips
+// OAuth (the server allows api-key requests through). If no key is set, mcp-remote
+// runs the normal OAuth browser login on first connect.
+const apiKey = (process.env.KYLAS_API_KEY || '').trim();
+const proxyArgs = [MCP_URL];
+if (apiKey) {
+  proxyArgs.push('--header', `x-api-key: ${apiKey}`);
+  log('auth mode: x-api-key header (no browser login)');
+} else {
+  log('auth mode: OAuth (browser login on first connect)');
+}
+process.argv = [process.execPath, mcpRemoteEntry, ...proxyArgs];
 log('loading mcp-remote in-process');
 import(pathToFileURL(mcpRemoteEntry).href)
   .then(() => log('mcp-remote running in-process'))

@@ -23,8 +23,15 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastmcp.server.auth import AccessToken, OAuthProxy, TokenVerifier
+from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser, BearerAuthBackend
+from starlette.authentication import AuthCredentials
+from starlette.middleware import Middleware
+from starlette.middleware.authentication import AuthenticationMiddleware
 
 logger = logging.getLogger("kylas-mcp.oauth")
+
+_API_KEY_HEADER = "x-api-key"
 
 _OAUTH_AUTHORIZE_PATH = "/oauth/authorize"
 _OAUTH_TOKEN_PATH = "/oauth/token"
@@ -147,14 +154,56 @@ class KylasTokenVerifier(TokenVerifier):
             self._cache.pop(next(iter(self._cache)), None)
 
 
+class _ApiKeyAwareBearerBackend(BearerAuthBackend):
+    """Bearer-token auth, plus a legacy escape hatch for the ``x-api-key`` flow.
+
+    OAuth clients still authenticate exactly as before (Bearer token → verifier).
+    Additionally, a request carrying a non-empty ``x-api-key`` header is allowed
+    through the auth gate WITHOUT OAuth: it gets a synthetic authenticated user whose
+    access token is empty, so ``main._resolve_auth_headers`` skips the OAuth branch and
+    falls through to the ``x-api-key`` header (which Kylas validates on the real API
+    call). This keeps pre-OAuth API-key clients working while OAuth is enabled — clients
+    that send neither a Bearer token nor an api-key still get 401 and must log in.
+    """
+
+    def __init__(self, provider: "KylasOAuthProxy") -> None:
+        super().__init__(provider)
+        self._provider = provider
+
+    async def authenticate(self, conn):
+        # Real OAuth Bearer token wins whenever present and valid.
+        result = await super().authenticate(conn)
+        if result is not None:
+            return result
+        api_key = next(
+            (conn.headers.get(k) for k in conn.headers if k.lower() == _API_KEY_HEADER), None
+        )
+        if not api_key:
+            return None
+        scopes = list(getattr(self._provider, "required_scopes", None) or [])
+        # token="" so the tool layer uses the x-api-key path, not a Bearer header.
+        synthetic = AccessToken(token="", client_id="kylas-x-api-key", scopes=scopes)
+        logger.debug("Request authenticated via x-api-key header (OAuth gate bypassed)")
+        return AuthCredentials(scopes), AuthenticatedUser(synthetic)
+
+
 class KylasOAuthProxy(OAuthProxy):
     """OAuthProxy tailored for Kylas.
 
-    Its only customization is scope handling: MCP clients request the standard OIDC
-    scopes, but Kylas' OAuth server doesn't recognise them, so we drop them at each
-    point the base proxy sends scopes upstream (authorize / token / refresh). With no
-    scope sent, Kylas grants the app's own registered scopes.
+    Customizations:
+      * scope handling — MCP clients request the standard OIDC scopes, but Kylas' OAuth
+        server doesn't recognise them, so we drop them at each point the base proxy sends
+        scopes upstream (authorize / token / refresh); with no scope sent, Kylas grants
+        the app's own registered scopes.
+      * ``get_middleware`` swaps in :class:`_ApiKeyAwareBearerBackend` so existing
+        ``x-api-key`` clients keep working with OAuth enabled.
     """
+
+    def get_middleware(self) -> list:
+        return [
+            Middleware(AuthenticationMiddleware, backend=_ApiKeyAwareBearerBackend(self)),
+            Middleware(AuthContextMiddleware),
+        ]
 
     def _drop_oidc_scopes(self, scopes: list[str]) -> list[str]:
         return [s for s in scopes if s not in _KYLAS_OIDC_SCOPES]
