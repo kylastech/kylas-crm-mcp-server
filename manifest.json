@@ -26,7 +26,8 @@
       "command": "node",
       "args": ["${__dirname}/launcher.js"],
       "env": {
-        "KYLAS_MCP_URL": "${user_config.server_url}"
+        "KYLAS_MCP_URL": "${user_config.server_url}",
+        "KYLAS_API_KEY": "${user_config.api_key}"
       }
     }
   },
@@ -34,9 +35,16 @@
     "server_url": {
       "type": "string",
       "title": "Kylas MCP Server URL",
-      "description": "URL of your Kylas MCP server (OAuth). Sign-in happens in your browser on first connect \u2014 no API key needed.",
-      "default": "http://localhost:8000/mcp",
+      "description": "URL of your Kylas MCP server.",
+      "default": "https://sea-turtle-app-x4h8l.ondigitalocean.app/mcp",
       "required": true
+    },
+    "api_key": {
+      "type": "string",
+      "title": "Kylas API Key (optional)",
+      "description": "Paste your Kylas API key to connect without a browser sign-in. Leave blank to use OAuth (sign in via your browser on first connect).",
+      "sensitive": true,
+      "required": false
     }
   }
 }
