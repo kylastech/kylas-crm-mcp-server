@@ -1277,9 +1277,9 @@ def _build_search_json_rule(
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
-        # DATETIME_PICKER fields: convert date values from user's timezone to UTC
+        # Date/datetime fields: convert date values from user's timezone to UTC
         # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
-        if api_type == "DATETIME_PICKER" and value is not None:
+        if rule_type == "date" and value is not None:
             filter_tz = f.get("timeZone") or tz_for_date
             value = _convert_date_value_to_utc(value, filter_tz)
 
