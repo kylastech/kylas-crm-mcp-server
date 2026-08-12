@@ -179,6 +179,44 @@ def _threshold_iso_days_ago(days: int, time_zone: str) -> str:
     return threshold.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _convert_date_value_to_utc(value: Any, timezone_str: str) -> Any:
+    """
+    Convert date/datetime filter value(s) from user's local timezone to UTC.
+    Handles single ISO string, list of ISO strings (for between operator), or None.
+    Strips trailing 'Z' before parsing so the value is treated as local time.
+    """
+    if value is None:
+        return value
+
+    try:
+        tz = ZoneInfo(timezone_str)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    utc = ZoneInfo("UTC")
+
+    def _convert_single(v: str) -> str:
+        if not isinstance(v, str):
+            return v
+        # Strip trailing Z so we treat it as naive local time
+        clean = v.rstrip("Z").rstrip("z")
+        try:
+            # Try parsing with milliseconds first
+            try:
+                dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S.%f")
+            except ValueError:
+                dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S")
+            # Attach the user's timezone, then convert to UTC
+            local_dt = dt.replace(tzinfo=tz)
+            utc_dt = local_dt.astimezone(utc)
+            return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc_dt.microsecond // 1000:03d}Z"
+        except Exception:
+            return v  # Return as-is if parsing fails
+
+    if isinstance(value, list):
+        return [_convert_single(v) for v in value]
+    return _convert_single(value)
+
+
 def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) -> str:
     """
     Format entity labels as action-oriented routing rules for system instructions.
@@ -1239,7 +1277,11 @@ def _build_search_json_rule(
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
-        # Date rules: value left as-is (user's timezone); API uses timeZone for interpretation — do not convert to UTC
+        # DATETIME_PICKER fields: convert date values from user's timezone to UTC
+        # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
+        if api_type == "DATETIME_PICKER" and value is not None:
+            filter_tz = f.get("timeZone") or tz_for_date
+            value = _convert_date_value_to_utc(value, filter_tz)
 
         # Custom fields: API expects field path "customFieldValues.cfFruits" or "customFieldValues.cfDateField"; standard fields use field name only
         is_custom = not meta.get("standard", True)
