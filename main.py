@@ -3307,6 +3307,11 @@ def _build_deal_search_json_rule(
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
+        # Date/datetime fields: convert date values from user's timezone to UTC
+        # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
+        if rule_type == "date" and value is not None:
+            filter_tz = f.get("timeZone") or tz_for_date
+            value = _convert_date_value_to_utc(value, filter_tz)
 
         is_custom = not meta.get("standard", True)
         rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
@@ -4068,6 +4073,11 @@ def _build_company_search_json_rule(
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
+        # Date/datetime fields: convert date values from user's timezone to UTC
+        # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
+        if rule_type == "date" and value is not None:
+            filter_tz = f.get("timeZone") or tz_for_date
+            value = _convert_date_value_to_utc(value, filter_tz)
 
         is_custom = not meta.get("standard", True)
         rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
@@ -4589,6 +4599,11 @@ def _build_meeting_search_json_rule(
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
+        # Date/datetime fields: convert date values from user's timezone to UTC
+        # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
+        if rule_type == "date" and value is not None:
+            filter_tz = f.get("timeZone") or tz_for_date
+            value = _convert_date_value_to_utc(value, filter_tz)
 
         is_custom = not meta.get("standard", True)
         rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
@@ -5324,6 +5339,11 @@ def _build_call_log_search_json_rule(
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
+        # Date/datetime fields: convert date values from user's timezone to UTC
+        # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
+        if rule_type == "date" and value is not None:
+            filter_tz = f.get("timeZone") or tz_for_date
+            value = _convert_date_value_to_utc(value, filter_tz)
 
         is_custom = not meta.get("standard", True)
         rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
