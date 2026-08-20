@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import time
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, quote
 
 import httpx
 from fastmcp.server.auth import AccessToken, OAuthProxy, TokenVerifier
@@ -199,6 +199,10 @@ class KylasOAuthProxy(OAuthProxy):
         ``x-api-key`` clients keep working with OAuth enabled.
     """
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._client_names: Dict[str, str] = {}
+
     def get_middleware(self) -> list:
         return [
             Middleware(AuthenticationMiddleware, backend=_ApiKeyAwareBearerBackend(self)),
@@ -208,9 +212,27 @@ class KylasOAuthProxy(OAuthProxy):
     def _drop_oidc_scopes(self, scopes: list[str]) -> list[str]:
         return [s for s in scopes if s not in _KYLAS_OIDC_SCOPES]
 
+    async def register_client(self, client_info: Any) -> None:
+        await super().register_client(client_info)
+        name = getattr(client_info, "client_name", None)
+        if name:
+            self._client_names[client_info.client_id] = name
+
     def _build_upstream_authorize_url(self, txn_id: str, transaction: dict[str, Any]) -> str:
         scopes = self._drop_oidc_scopes(transaction.get("scopes") or [])
-        return super()._build_upstream_authorize_url(txn_id, {**transaction, "scopes": scopes})
+        url = super()._build_upstream_authorize_url(txn_id, {**transaction, "scopes": scopes})
+
+        client_name = self._client_names.get(transaction.get("client_id"))
+        if not client_name:
+            logger.info(
+                "No client_name for client_id=%s (not sent at DCR, or server restarted "
+                "since); omitting from upstream authorize URL",
+                transaction.get("client_id"),
+            )
+            return url
+
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}client_name={quote(client_name)}"
 
     def _prepare_scopes_for_token_exchange(self, scopes: list[str]) -> list[str]:
         return super()._prepare_scopes_for_token_exchange(self._drop_oidc_scopes(scopes))

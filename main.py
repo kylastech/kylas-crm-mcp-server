@@ -3307,6 +3307,11 @@ def _build_deal_search_json_rule(
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
+        # Date/datetime fields: convert date values from user's timezone to UTC
+        # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
+        if rule_type == "date" and value is not None:
+            filter_tz = f.get("timeZone") or tz_for_date
+            value = _convert_date_value_to_utc(value, filter_tz)
 
         is_custom = not meta.get("standard", True)
         rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
@@ -4068,6 +4073,11 @@ def _build_company_search_json_rule(
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
+        # Date/datetime fields: convert date values from user's timezone to UTC
+        # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
+        if rule_type == "date" and value is not None:
+            filter_tz = f.get("timeZone") or tz_for_date
+            value = _convert_date_value_to_utc(value, filter_tz)
 
         is_custom = not meta.get("standard", True)
         rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
@@ -4589,6 +4599,11 @@ def _build_meeting_search_json_rule(
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
+        # Date/datetime fields: convert date values from user's timezone to UTC
+        # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
+        if rule_type == "date" and value is not None:
+            filter_tz = f.get("timeZone") or tz_for_date
+            value = _convert_date_value_to_utc(value, filter_tz)
 
         is_custom = not meta.get("standard", True)
         rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
@@ -5225,8 +5240,13 @@ async def get_call_logs(entity_id: int, entity_type: str, page: int = 0, size: i
 
         async with get_client() as client:
             response = await client.get(
-                f"/call-logs/{entity_id}",
-                params={"relatedToType": entity_type_lower, "page": page, "size": min(size, 100)}
+                "/call-logs",
+                params={
+                    "relatedToId": entity_id,
+                    "relatedToType": entity_type_lower,
+                    "page": int(page) + 1,  # Kylas call-logs listing is 1-based
+                    "size": min(size, 100),
+                },
             )
             data = await handle_api_response(response, "Get call logs")
 
@@ -5260,16 +5280,10 @@ async def get_call_logs(entity_id: int, entity_type: str, page: int = 0, size: i
         lines.append("CALL LOGS")
         lines.append("=" * 60)
         lines.append(f"Found {len(results)} call log(s) (total {total})")
-        lines.append("-" * 60)
+        lines.append("")
         for log in results:
-            lid = log.get("id", "?")
-            call_type = log.get("callType", "—")
-            outcome = log.get("outcome", "—")
-            phone = log.get("phoneNumber", "—")
-            start = log.get("startTime", "—")
-            duration = log.get("duration", "—")
-            lines.append(f"• ID: {lid} | Type: {call_type} | Outcome: {outcome} | Phone: {phone} | Start: {start} | Duration: {duration}s")
-        lines.append("-" * 60)
+            lines.append(_format_call_log_for_display(log))
+            lines.append("")
         return "\n".join(lines)
     except KylasAPIError as e:
         return f"✗ Failed to get call logs: {e.message}\n  Details: {e.response_body}"
@@ -5324,6 +5338,11 @@ def _build_call_log_search_json_rule(
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
                 value = value
+        # Date/datetime fields: convert date values from user's timezone to UTC
+        # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
+        if rule_type == "date" and value is not None:
+            filter_tz = f.get("timeZone") or tz_for_date
+            value = _convert_date_value_to_utc(value, filter_tz)
 
         is_custom = not meta.get("standard", True)
         rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
@@ -5457,8 +5476,9 @@ async def search_call_logs_logic(
     if not results:
         return f"No call logs found matching the filters. (Total in DB: {total})"
     lines = [f"Found {len(results)} call log(s) (page {page + 1} of {total_pages}, total {total})", ""]
-    lines.append(_format_call_logs_table(results))
-    lines.append("")
+    for log in results:
+        lines.append(_format_call_log_for_display(log))
+        lines.append("")
     lines.append("💡 HINT: For call logs showing 'Related: contact#123' or 'lead#456', use:")
     lines.append("  • get_call_logs(entity_id=123, entity_type='contact') to see full contact details with their call logs")
     return "\n".join(lines)

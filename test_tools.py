@@ -454,7 +454,8 @@ def test_build_search_json_rule_date_datetime():
     )
     assert err2 is None
     assert rules2["rules"][0]["type"] == "date"
-    assert rules2["rules"][0]["value"] == ["2026-02-01T10:00:00.000Z", "2026-02-06T10:00:00.000Z"]
+    # Server converts local (Asia/Calcutta, UTC+5:30) → UTC, so each value shifts −5:30
+    assert rules2["rules"][0]["value"] == ["2026-02-01T04:30:00.000Z", "2026-02-06T04:30:00.000Z"]
     assert rules2["rules"][0]["timeZone"] == "Asia/Calcutta"
 
     # is_not_null: value null (uses default timeZone)
@@ -487,7 +488,8 @@ def test_build_search_json_rule_custom_date_field():
     assert rules["rules"][0]["id"] == "cfDateField"
     assert rules["rules"][0]["field"] == "customFieldValues.cfDateField"
     assert rules["rules"][0]["type"] == "date"
-    assert rules["rules"][0]["value"] == "2026-02-02T18:30:00.000Z"
+    # Server converts local (Asia/Calcutta, UTC+5:30) → UTC: 18:30 − 5:30 = 13:00
+    assert rules["rules"][0]["value"] == "2026-02-02T13:00:00.000Z"
     assert rules["rules"][0]["timeZone"] == "Asia/Calcutta"
 
 
@@ -1501,7 +1503,29 @@ def test_operator_normalization_and_scheduled_at_alias_meeting():
     assert rule1["id"] == "from"
     assert rule1["field"] == "from"
     assert rule1["operator"] == "greater_or_equal"  # normalized from gte
-    assert rule1["value"] == "2025-12-15T00:00:00Z"
+    # No timeZone in filter → default Asia/Calcutta (UTC+5:30); local midnight → prev day 18:30 UTC
+    assert rule1["value"] == "2025-12-14T18:30:00.000Z"
+
+
+def test_build_deal_search_json_rule_date_converted_to_utc():
+    """Regression: deal date filters convert local value → UTC (the original timezone bug)."""
+    from main import _build_deal_search_json_rule
+    filterable_map = {"createdAt": {"type": "DATETIME_PICKER", "standard": True}}
+    filters = [
+        {
+            "field": "createdAt",
+            "operator": "greater_or_equal",
+            "value": "2026-08-04T00:00:00.000Z",
+            "timeZone": "Asia/Calcutta",
+        }
+    ]
+    rules, err = _build_deal_search_json_rule(filters, filterable_map)
+    assert err is None
+    rule = rules["rules"][0]
+    assert rule["type"] == "date"
+    # Local midnight Asia/Calcutta (UTC+5:30) → previous day 18:30 UTC
+    assert rule["value"] == "2026-08-03T18:30:00.000Z"
+    assert rule["timeZone"] == "Asia/Calcutta"
 
 
 @pytest.mark.asyncio
