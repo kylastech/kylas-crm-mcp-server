@@ -40,11 +40,13 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
+from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
 import phonenumbers
+import yaml
 from dateutil import parser as dateutil_parser
 from fastmcp.server import FastMCP
 from fastmcp.server.middleware import Middleware, MiddlewareContext
@@ -6035,6 +6037,7 @@ async def search_idle_quotations_logic(
 
 _ENTITY_CONFIG = {
     "lead": {
+        "get_fn": get_lead_logic,
         "search_fn": search_leads_logic,
         "by_term_fn": search_leads_by_term_logic,
         "idle_fn": search_idle_leads_logic,
@@ -6046,6 +6049,7 @@ _ENTITY_CONFIG = {
         "field_fmt": "standard",
     },
     "contact": {
+        "get_fn": get_contact_logic,
         "search_fn": search_contacts_logic,
         "by_term_fn": search_contacts_by_term_logic,
         "idle_fn": None,
@@ -6166,6 +6170,33 @@ _ENTITY_CRUD_CONFIG: Dict[str, Dict[str, Any]] = {
         "name_fn": lambda r: f"{r.get('callType', '')} / {r.get('outcome', '')}",
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Generic Get Router
+#
+# Mirrors search_entity_logic's shape (entity_type -> _ENTITY_CONFIG lookup ->
+# real per-entity function), added so execute_request has a single generic
+# router to call for "get" intents too, the same pattern as search/create/
+# update. Scoped to whichever buckets have a "get_fn" wired in _ENTITY_CONFIG
+# (currently lead, contact) — add one line there to extend to more buckets.
+#
+# Deliberately does NOT swallow exceptions into a formatted string the way
+# search_entity_logic/search_entity_by_term_logic/search_idle_entities_logic
+# do — get_lead_logic/get_contact_logic themselves already raise on failure
+# rather than returning an error string, so this stays a thin,
+# exception-propagating pass-through to match them, and to give
+# execute_request a real signal to build its ok/error envelope from.
+# ---------------------------------------------------------------------------
+
+async def get_entity_logic(entity_type: str, entity_id: int) -> Any:
+    cfg = _ENTITY_CONFIG.get(entity_type)
+    if not cfg:
+        raise ValueError(f"Unknown entity_type '{entity_type}'. Valid: {', '.join(_ENTITY_CONFIG.keys())}")
+    get_fn = cfg.get("get_fn")
+    if not get_fn:
+        raise ValueError(f"Entity type '{entity_type}' does not support get.")
+    return await get_fn(entity_id)
 
 
 # ---------------------------------------------------------------------------
@@ -6378,6 +6409,37 @@ async def search_idle_entities(
 # ---------------------------------------------------------------------------
 # Generic CRUD Tools
 # ---------------------------------------------------------------------------
+#
+# create_entity_logic/update_entity_logic are the actual dispatch logic that
+# used to live only inline inside the create_entity/update_entity tool
+# bodies below. Extracted so execute_request can call the SAME dispatch
+# (bucket -> _ENTITY_CRUD_CONFIG -> real create_fn/update_fn) directly and
+# get the raw created/updated record back, instead of going through the
+# tool's own "✓ ... created successfully" string formatting. The tools below
+# now call these too, so there is exactly one real implementation of this
+# dispatch, not two. Raises ValueError on an unknown entity_type (the tools'
+# own "✗ Unknown entity_type" message, as an exception instead of a string)
+# so a real caller needing an ok/fail signal — execute_request — gets one,
+# without the tools' user-facing string format changing at all.
+# ---------------------------------------------------------------------------
+
+async def create_entity_logic(entity_type: str, field_values: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = _ENTITY_CRUD_CONFIG.get(entity_type)
+    if not cfg:
+        valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
+        raise ValueError(f"Unknown entity_type '{entity_type}'. Valid: {valid}")
+    _reset_api_call_count()
+    return await cfg["create_fn"](field_values)
+
+
+async def update_entity_logic(entity_type: str, entity_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = _ENTITY_CRUD_CONFIG.get(entity_type)
+    if not cfg:
+        valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
+        raise ValueError(f"Unknown entity_type '{entity_type}'. Valid: {valid}")
+    _reset_api_call_count()
+    return await cfg["update_fn"](entity_id, field_values)
+
 
 @mcp.tool()
 async def create_entity(entity_type: str, field_values: Dict[str, Any]) -> str:
@@ -6449,12 +6511,8 @@ async def create_entity(entity_type: str, field_values: Dict[str, Any]) -> str:
        "notes": [{"description": "Discussed pricing"}]} ← optional
     """
     cfg = _ENTITY_CRUD_CONFIG.get(entity_type)
-    if not cfg:
-        valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
-        return f"✗ Unknown entity_type '{entity_type}'. Valid: {valid}"
     try:
-        _reset_api_call_count()
-        result = await cfg["create_fn"](field_values)
+        result = await create_entity_logic(entity_type, field_values)
         entity_id = result.get("id", "?")
         name = cfg["name_fn"](result)
         label = entity_type.replace("_", " ").title()
@@ -6508,12 +6566,8 @@ async def update_entity(entity_type: str, entity_id: int, field_values: Dict[str
     phone or phoneNumbers is in field_values. Never assume a default country.
     """
     cfg = _ENTITY_CRUD_CONFIG.get(entity_type)
-    if not cfg:
-        valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
-        return f"✗ Unknown entity_type '{entity_type}'. Valid: {valid}"
     try:
-        _reset_api_call_count()
-        result = await cfg["update_fn"](entity_id, field_values)
+        result = await update_entity_logic(entity_type, entity_id, field_values)
         eid = result.get("id", entity_id)
         name = cfg["name_fn"](result)
         label = entity_type.replace("_", " ").title()
@@ -6525,6 +6579,787 @@ async def update_entity(entity_type: str, entity_id: int, field_values: Dict[str
     except Exception as e:
         logger.exception("update_entity")
         return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Generic Registry (list_tool / build_payload) — 3-tool architecture POC
+#
+# Step 1 of 3: registry + discovery + schema-detail only. No execute_request
+# yet, no _meta bucket yet. Additive — does not touch or replace any of the
+# 36 tools above. See TOOL_CONSOLIDATION_DESIGN.md and
+# YAML_REGISTRY_SCHEMA_PLAN.md for the full design this validates.
+# ---------------------------------------------------------------------------
+
+_REGISTRY_DIR = Path(__file__).parent / "registry"
+_REGISTRY_REQUIRED_FIELDS = ["id", "bucket", "intent", "method", "path", "description"]
+
+
+class RegistryError(Exception):
+    """Raised when the YAML registry fails validation. Must prevent server startup."""
+
+
+def _load_registry(registry_dir: Path = _REGISTRY_DIR) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    """
+    Load and validate registry_dir/index.yaml + registry_dir/*.yaml (all files
+    except index.yaml). Returns (index, entries) where entries is {id: entry_dict}.
+    Raises RegistryError, naming the offending file/id, on any problem. Called at
+    module import time (not lazily) — a broken registry must stop the server from
+    starting at all, not fail on the first tool call.
+    """
+    index_path = registry_dir / "index.yaml"
+    if not index_path.exists():
+        raise RegistryError(f"Registry index not found: {index_path}")
+    with open(index_path, "r", encoding="utf-8") as f:
+        index = yaml.safe_load(f) or {}
+    valid_buckets = set(index.get("buckets") or [])
+    valid_intents = set(index.get("intents") or [])
+    if not valid_buckets:
+        raise RegistryError(f"{index_path}: 'buckets' must be a non-empty list.")
+    if not valid_intents:
+        raise RegistryError(f"{index_path}: 'intents' must be a non-empty list.")
+
+    entries: Dict[str, Dict[str, Any]] = {}
+
+    for yml_path in sorted(registry_dir.glob("*.yaml")):
+        if yml_path.name == "index.yaml":
+            continue
+        with open(yml_path, "r", encoding="utf-8") as f:
+            content = yaml.safe_load(f)
+        if not isinstance(content, list):
+            raise RegistryError(
+                f"{yml_path}: expected a YAML list of entries, got {type(content).__name__}."
+            )
+        for i, entry in enumerate(content):
+            if not isinstance(entry, dict):
+                raise RegistryError(f"{yml_path}: entry #{i + 1} is not a mapping.")
+            entry_id = entry.get("id")
+            label = entry_id or f"entry #{i + 1} (no id)"
+            missing = [f for f in _REGISTRY_REQUIRED_FIELDS if not entry.get(f)]
+            if missing:
+                raise RegistryError(
+                    f"{yml_path}: '{label}' is missing required field(s): {', '.join(missing)}"
+                )
+            if entry_id in entries:
+                raise RegistryError(
+                    f"{yml_path}: duplicate id '{entry_id}' "
+                    f"(already defined in {entries[entry_id]['_source_file']})"
+                )
+            if entry["bucket"] not in valid_buckets:
+                raise RegistryError(
+                    f"{yml_path}: '{entry_id}' has bucket '{entry['bucket']}' which is not in "
+                    f"index.yaml's buckets list ({sorted(valid_buckets)})"
+                )
+            if entry["intent"] not in valid_intents:
+                raise RegistryError(
+                    f"{yml_path}: '{entry_id}' has intent '{entry['intent']}' which is not in "
+                    f"index.yaml's intents list ({sorted(valid_intents)})"
+                )
+            entry = dict(entry)
+            entry["_source_file"] = yml_path.name
+            entries[entry_id] = entry
+
+    if not entries:
+        raise RegistryError(
+            f"No registry entries found under {registry_dir} — refusing to start with an empty registry."
+        )
+
+    logger.info(
+        "📋 Loaded %d registry entries from %s: %s",
+        len(entries), registry_dir, sorted(entries.keys()),
+    )
+    return index, entries
+
+
+# Loaded once at import time — see docstring above for why this isn't lazy.
+_REGISTRY_INDEX, _REGISTRY = _load_registry()
+
+
+@mcp.tool()
+def list_tool(
+    bucket: Optional[str] = None,
+    intent: Optional[str] = None,
+) -> str:
+    """
+    Step 1 of 3 in the generic CRM tool flow (list_tool -> build_payload ->
+    execute_request): find which endpoint id you need, before knowing anything
+    about its shape.
+
+    Returns ONLY a short summary row per match:
+      {"results": [{"id": "...", "bucket": "...", "intent": "...", "description": "..."}]}
+    Never method, path, a parameter schema, or an example — no matter how specific
+    bucket/intent are. That level of detail is build_payload(id)'s job alone.
+    This tool exists purely to narrow the full registry down to the one id you
+    actually need, without paying the cost of every endpoint's full schema.
+
+    It is always safe and cheap to call this with NO arguments to see everything
+    currently registered — do that first if you're not sure what's available, then
+    narrow with bucket/intent once you have a sense of what you're looking for.
+
+    Registry contents right now (this will grow — always confirm here rather than
+    assuming an id exists):
+      buckets: lead, contact
+      intents: get, search, create
+      (each bucket currently has exactly one endpoint per intent, e.g. "lead.get")
+
+    bucket: restrict to one bucket (e.g. "lead", "contact"). Omit to search every bucket.
+    intent: restrict to one intent — "get", "search", or "create". Omit to match any.
+
+    Example: list_tool(bucket="lead") returns the 3 lead.* rows (get/search/create),
+    each with its own id and one-line description — nothing more.
+    """
+    results = []
+    for entry in _REGISTRY.values():
+        if bucket and entry["bucket"] != bucket:
+            continue
+        if intent and entry["intent"] != intent:
+            continue
+        results.append({
+            "id": entry["id"],
+            "bucket": entry["bucket"],
+            "intent": entry["intent"],
+            "description": entry.get("description", ""),
+        })
+    return json.dumps({"results": results}, indent=2)
+
+
+# Maps a bucket name to the existing per-entity field-metadata fetcher it
+# should use — same functions the original get_*_field_instructions tools
+# already call (_fetch_lead_fields, _fetch_contact_fields, ...). Add one line
+# per new bucket; nothing else about the fold/build_payload logic changes.
+_BUCKET_FIELD_FETCHERS: Dict[str, Any] = {
+    "lead": _fetch_lead_fields,
+    "contact": _fetch_contact_fields,
+}
+
+# Maps a bucket to the real, original get_* tool whose inputSchema
+# build_payload copies verbatim for that bucket's ".get" entry.
+_REGISTRY_BUCKET_TO_GET_TOOL: Dict[str, str] = {
+    "lead": "get_lead",
+    "contact": "get_contact",
+}
+
+
+async def _fold_field_metadata_into_schema(
+    base_schema: Dict[str, Any], fetch_fields_fn: Any, for_search: bool
+) -> Dict[str, Any]:
+    """
+    Fetch this tenant's real field metadata for one bucket (via whichever
+    existing _fetch_*_fields() function fetch_fields_fn is) and fold it into a
+    COPY of base_schema — never mutates the registry's own dict. Bucket-
+    agnostic on purpose: was hardcoded to lead only until "contact" was added;
+    kept generic from here so a 3rd/4th bucket is just one more
+    _BUCKET_FIELD_FETCHERS entry, not a new copy of this function.
+    for_search=True: adds tenant_filterable_fields (name/type/standard) for building
+    filters. for_search=False (create/update): adds tenant_fields.standard/custom,
+    each field including its live picklist option id/label pairs where applicable.
+    """
+    schema = json.loads(json.dumps(base_schema))  # cheap deep copy, no extra dependency
+    fields = await fetch_fields_fn()
+
+    if for_search:
+        schema["tenant_filterable_fields"] = [
+            {
+                "name": f.get("name"),
+                "displayName": f.get("displayName"),
+                "type": f.get("type"),
+                "standard": f.get("standard", False),
+            }
+            for f in fields
+            if f.get("filterable", False)
+        ]
+        return schema
+
+    def _field_summary(f: Dict[str, Any]) -> Dict[str, Any]:
+        summary = {
+            "name": f.get("name"),
+            "displayName": f.get("displayName"),
+            "type": f.get("type"),
+            "required": f.get("required", False),
+            "standard": f.get("standard", False),
+        }
+        if f.get("type") in ("PICK_LIST", "MULTI_PICKLIST"):
+            picklist = f.get("picklist") or {}
+            values = picklist.get("values") or picklist.get("picklistValues") or []
+            summary["options"] = [
+                {"id": v.get("id"), "label": v.get("displayName") or v.get("label") or v.get("name")}
+                for v in values if isinstance(v, dict)
+            ]
+        return summary
+
+    schema["tenant_fields"] = {
+        "standard": [_field_summary(f) for f in fields if f.get("standard", False)],
+        "custom": [_field_summary(f) for f in fields if not f.get("standard", False)],
+    }
+
+    # Override the static YAML's "required" guess with the REAL required-field
+    # list from this tenant's live metadata (same `required` flag the original
+    # get_*_field_instructions tools already read via _format_field) — a static
+    # required list authored by hand can be, and was, simply wrong: e.g. this
+    # registry originally hardcoded lead.create's required as
+    # [firstName, lastName, email], but Kylas actually accepted a real create
+    # with no email at all. Live data is the only real source of truth here.
+    live_required = [f.get("name") for f in fields if f.get("standard", False) and f.get("required", False)]
+    if live_required:
+        schema["required"] = live_required
+
+    return schema
+
+
+@mcp.tool()
+async def build_payload(id: str) -> str:
+    """
+    Step 2 of 3 in the generic CRM tool flow: get everything about the ONE
+    endpoint you already picked via list_tool. Takes ONLY that id — nothing
+    else — and never sees or checks the values you're about to send; that only
+    happens (if at all) in execute_request, described there.
+
+    Returns a JSON object with these fields:
+      id             - the id you asked for, echoed back.
+      method, path   - the real Kylas HTTP method and path for this endpoint,
+                       path params written as "{name}" (e.g. "/leads/{lead_id}").
+      usage_notes    - the ACTUAL rules for this one endpoint only: shorthand
+                       field formats, which picklist fields use a name instead
+                       of an Option ID, which fields must be resolved through
+                       another endpoint first, and any other constraint specific
+                       to it. Read this before building anything — it is not
+                       decorative, it is the real, load-bearing documentation
+                       for this endpoint (the same rules that used to live in
+                       this server's old global instructions, now scoped to
+                       exactly the one endpoint they apply to).
+      schema         - required/properties for the payload you need to build.
+                       If a field's own entry contains "resolve_via": "<other
+                       id>", do NOT invent a value for it — go run the full
+                       list_tool/build_payload/execute_request cycle on
+                       <other id> first, then use the real value it returns.
+      example        - one concrete, valid example payload for this endpoint.
+      dynamic_fields - true if this endpoint's real shape depends on THIS
+                       tenant's own custom fields/picklist options, which can
+                       only be known by asking Kylas directly (never static).
+      fetched_live   - true only if that tenant-specific data was actually
+                       fetched successfully on this call.
+      tenant_fields / tenant_filterable_fields - present only when
+                       dynamic_fields and fetched_live are both true: this
+                       tenant's REAL custom fields (with real picklist option
+                       id/label pairs) for create/update, or the real
+                       filterable-field list for search. Never placeholder data.
+      live_fetch_error - present only when dynamic_fields is true and the live
+                       fetch failed (e.g. no credentials configured yet). When
+                       this is present, everything else above — method, path,
+                       usage_notes, example — is still the real, correct static
+                       shape; only the tenant-specific enrichment is missing.
+                       Don't treat this field's presence as the whole call
+                       having failed.
+
+    This tool never validates the payload you build from this. Call
+    execute_request(id, payload) next to actually send it — a malformed payload
+    is caught there (or by Kylas itself), never here.
+
+    id: an endpoint id from list_tool (e.g. "lead.create", "contact.search").
+    """
+    entry = _REGISTRY.get(id)
+    if not entry:
+        return json.dumps({
+            "ok": False,
+            "error": f"Unknown endpoint id '{id}'. Call list_tool first to find a valid id.",
+        })
+
+    # Schema comes from the REAL original tool's own inputSchema
+    # (get_lead/get_contact/search_entity/create_entity), never a
+    # hand-authored one — see _real_get_schema/_real_search_schema/
+    # _real_create_schema and the snapshot mechanism above.
+    if entry["intent"] == "get":
+        original_get_tool = _REGISTRY_BUCKET_TO_GET_TOOL.get(entry["bucket"])
+        schema = _real_get_schema(original_get_tool) if original_get_tool else (entry.get("schema") or {})
+    elif entry["intent"] == "search":
+        schema = _real_search_schema()
+    elif entry["intent"] == "search_by_term":
+        schema = _real_search_by_term_schema()
+    elif entry["intent"] == "search_idle":
+        schema = _real_idle_schema()
+    elif entry["intent"] == "create":
+        schema = _real_create_schema()
+    elif entry["intent"] == "update":
+        schema = _real_update_schema()
+    elif entry["intent"] == "lookup":
+        schema = _real_get_schema(_REGISTRY_ID_TO_META_TOOL.get(id, ""))
+    else:
+        schema = entry.get("schema") or {}
+
+    fetched_live = False
+    live_fetch_error = None
+    if entry.get("dynamic_fields"):
+        fetch_fields_fn = _BUCKET_FIELD_FETCHERS.get(entry["bucket"])
+        if fetch_fields_fn is None:
+            live_fetch_error = f"No field-metadata fetcher wired for bucket '{entry['bucket']}' yet."
+        else:
+            try:
+                schema = await _fold_field_metadata_into_schema(
+                    schema, fetch_fields_fn, for_search=(entry["intent"] == "search")
+                )
+                fetched_live = True
+            except KylasAPIError as e:
+                # Don't fail the whole call for this — method/path/usage_notes/example
+                # need no network access at all and are still genuinely useful on
+                # their own; only the live tenant field/picklist enrichment is missing.
+                live_fetch_error = e.message
+
+    result = {
+        "id": entry["id"],
+        "method": entry["method"],
+        "path": entry["path"],
+        "usage_notes": entry.get("usage_notes", ""),
+        "schema": schema,
+        "example": entry.get("example"),
+        "dynamic_fields": bool(entry.get("dynamic_fields")),
+        "fetched_live": fetched_live,
+    }
+    if live_fetch_error:
+        result["live_fetch_error"] = (
+            f"Could not fetch this tenant's live custom fields/picklist options: "
+            f"{live_fetch_error}. The schema/usage_notes/example above are still the "
+            f"real static shape — only the live tenant-specific enrichment is missing."
+        )
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# execute_request — step 3. Routes purely by (bucket, intent) read straight
+# off the registry entry into the SAME generic Python routers every other
+# entity-agnostic tool already uses — get_entity_logic / search_entity_logic /
+# search_entity_by_term_logic / search_idle_entities_logic / create_entity_logic
+# / update_entity_logic — never a hardcoded per-id mapping, and never a
+# reimplemented Kylas call. Adding a new bucket to the registry (e.g. "deal")
+# needs a "get_fn"/"search_fn"/etc. entry in _ENTITY_CONFIG/_ENTITY_CRUD_CONFIG
+# (if not already there) and nothing else here — no new Python per id.
+#
+# Known, deliberate asymmetry, not a bug: get_entity_logic/create_entity_logic/
+# update_entity_logic return a raw dict (clean, structured "data"); the three
+# search_*_logic routers return a pre-FORMATTED STRING (they already build
+# "Found N lead(s)/contact(s)..." text themselves, same as the old
+# search_leads/search_contacts tools did) — reused exactly as-is rather than
+# changed, so every search/search_by_term/search_idle id's "data" is a
+# display string, not a dict, unlike *.get/*.create/*.update. A related,
+# still-open point: those same three search_*_logic routers catch their own
+# KylasAPIError internally and return it as a "✗ ..." string rather than
+# raising — execute_request's try/except below can't see that failure, so
+# "ok" currently reads true even when the underlying search actually failed.
+# Not fixed here; flagging it exactly where it now lives.
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def execute_request(id: str, payload: Dict[str, Any]) -> str:
+    """
+    Step 3 of 3 in the generic CRM tool flow: actually perform the call for the
+    payload you built via build_payload, using the SAME id you called it with.
+    Runs this repo's existing, already-tested implementation for that specific
+    endpoint — e.g. "lead.create" runs the exact same create_lead_logic() the
+    original create_lead tool already used — never a newly written or
+    reimplemented HTTP call.
+
+    build_payload does not validate anything about your payload, so this is
+    where a malformed one is caught first (or, if it's shaped correctly but
+    semantically wrong, by Kylas's own API). Always returns a normalized JSON
+    envelope, never a raw exception and never an unhandled crash:
+      success: {"ok": true, "status": 200, "data": <result>}
+      failure: {"ok": false, "error": {"code": "<CODE>", "message": "<why>"}}
+
+    "data" on success is whatever that endpoint's real underlying logic already
+    returns — do not assume it is always the same shape across ids. For *.get
+    and *.create ids today, that's a structured dict (the real record). For
+    *.search ids today, that's a pre-formatted, human-readable string (e.g.
+    "Found 3 lead(s)..."), because that is genuinely what the reused search
+    logic already returns — reused exactly as-is, not restructured.
+
+    error.code values you may see:
+      "UNKNOWN_ID"  - this id isn't in the registry at all — call
+                      list_tool to find a real one.
+      "NOT_WIRED"   - the id exists but has no execute_request handler yet.
+      "BAD_PAYLOAD" - the payload was missing a required field or had the
+                      wrong type for it — since build_payload never validates,
+                      this is often the FIRST place that surfaces.
+      anything else - Kylas's own HTTP status code, or "KYLAS_ERROR" for a
+                      connection/auth failure reaching Kylas at all.
+
+    id: an endpoint id from list_tool/build_payload (e.g. "lead.create").
+    payload: the request body/args you built by hand from that SAME id's
+        build_payload schema. Never send a payload built for one id against
+        a different id — the two are not interchangeable even if they look
+        similar (e.g. lead.create vs contact.create).
+    """
+    entry = _REGISTRY.get(id)
+    if not entry:
+        return json.dumps({
+            "ok": False,
+            "error": {"code": "UNKNOWN_ID", "message": f"Unknown endpoint id '{id}'. Call list_tool first."},
+        }, indent=2)
+
+    bucket = entry["bucket"]
+    intent = entry["intent"]
+    payload = payload or {}
+
+    try:
+        if intent == "get":
+            # The id-field name genuinely differs per bucket (lead_id vs
+            # contact_id) — derived from the same real snapshot build_payload
+            # already uses for this bucket's schema, not a second hardcoded map.
+            original_get_tool = _REGISTRY_BUCKET_TO_GET_TOOL.get(bucket)
+            id_field = (_ORIGINAL_TOOL_PARAMETERS.get(original_get_tool, {}).get("required") or ["entity_id"])[0]
+            result = await get_entity_logic(bucket, payload[id_field])
+        elif intent == "search":
+            result = await search_entity_logic(
+                entity_type=bucket,
+                filters=payload.get("filters", []),
+                page=payload.get("page", 0),
+                size=payload.get("size", 20),
+                sort=payload.get("sort", "createdAt,desc"),
+            )
+        elif intent == "search_by_term":
+            result = await search_entity_by_term_logic(
+                entity_type=bucket,
+                search_term=payload["search_term"],
+                page=payload.get("page", 0),
+                size=payload.get("size", 20),
+                sort=payload.get("sort", "updatedAt,desc"),
+            )
+        elif intent == "search_idle":
+            result = await search_idle_entities_logic(
+                entity_type=bucket,
+                days=payload["days"],
+                time_zone=payload.get("time_zone"),
+                page=payload.get("page", 0),
+                size=payload.get("size", 20),
+                sort=payload.get("sort", "createdAt,desc"),
+            )
+        elif intent == "create":
+            result = await create_entity_logic(bucket, payload)
+        elif intent == "update":
+            update_payload = dict(payload)
+            entity_id = update_payload.pop("entity_id")
+            result = await update_entity_logic(bucket, entity_id, update_payload)
+        elif intent == "lookup":
+            router = _META_LOOKUP_ROUTERS.get(id)
+            if not router:
+                return json.dumps({
+                    "ok": False,
+                    "error": {"code": "NOT_WIRED", "message": f"'{id}' has no execute_request router wired yet."},
+                }, indent=2)
+            result = await router(payload)
+        else:
+            return json.dumps({
+                "ok": False,
+                "error": {"code": "NOT_WIRED", "message": f"intent '{intent}' has no execute_request router yet."},
+            }, indent=2)
+        return json.dumps({"ok": True, "status": 200, "data": result}, default=str, indent=2)
+    except KylasAPIError as e:
+        return json.dumps({
+            "ok": False,
+            "error": {"code": str(e.status_code or "KYLAS_ERROR"), "message": e.message},
+        }, indent=2)
+    except (KeyError, ValueError, TypeError) as e:
+        # Missing/malformed payload field (e.g. lead.get called without "lead_id") —
+        # never let this surface as a raw traceback to the client.
+        return json.dumps({
+            "ok": False,
+            "error": {"code": "BAD_PAYLOAD", "message": f"{type(e).__name__}: {e}"},
+        }, indent=2)
+    except Exception as e:
+        logger.exception("execute_request(%s)", id)
+        return json.dumps({
+            "ok": False,
+            "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+        }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Registry-only mode toggle
+#
+# MCP_TOOL_MODE=registry advertises ONLY the generic registry tools (and a
+# short, matching set of instructions) to a connecting client instead of all
+# 38 tools + the full SYSTEM_INSTRUCTIONS block. This is additive and fully
+# reversible: no function above is deleted or edited by this, only what gets
+# ADVERTISED at connection time changes. Default ("all", or the var unset)
+# keeps today's exact behavior — every existing user is unaffected unless
+# this is explicitly set.
+# ---------------------------------------------------------------------------
+
+_MCP_TOOL_MODE = os.getenv("MCP_TOOL_MODE", "all").strip().lower()
+
+# The only tools kept when MCP_TOOL_MODE=registry.
+_REGISTRY_ONLY_TOOL_NAMES = {"list_tool", "build_payload", "execute_request"}
+
+_REGISTRY_MODE_INSTRUCTIONS = """
+# Kylas CRM MCP Server — Generic Registry Mode
+
+This server used to expose one dedicated tool per CRM operation, each with its
+own always-visible instructions. It does not do that anymore. Those old
+instructions do not apply here and must not be assumed or recalled — every
+CRM operation is now reached through exactly 3 generic tools, and everything
+you need to use any of them correctly is either below or returned by the
+tools themselves, on demand.
+
+## The 3-step flow
+
+1. list_tool(bucket?, intent?)
+   Find the id of the endpoint you need. Returns only a short
+   id/bucket/intent/description row per match — never a schema. Call it with
+   no arguments first if you don't know what's available yet; narrow with
+   bucket/intent once you have a sense of what you're looking for.
+
+2. build_payload(id)
+   Get everything about the ONE endpoint you picked: its real HTTP method and
+   path, usage_notes (the actual field-shape rules for that specific
+   endpoint — read these, they are load-bearing, not decorative), a
+   parameter schema, and a worked example. For endpoints whose real shape
+   depends on this tenant's own custom fields/picklist options, this makes a
+   genuine live call to fetch them and folds the real data into the schema —
+   check the returned "fetched_live" / "live_fetch_error" fields to know
+   whether that actually succeeded; if it didn't, the rest of the response
+   (method/path/usage_notes/example) is still correct and usable, only the
+   tenant-specific enrichment is missing. This tool never sees or validates
+   the payload you go on to build from it.
+
+3. execute_request(id, payload)
+   Send the exact payload you built, using the SAME id you called
+   build_payload with. Always returns {"ok": true, "status", "data"} on
+   success or {"ok": false, "error": {"code", "message"}} on failure — never
+   a raw exception. A malformed payload is caught HERE, not earlier —
+   build_payload does no validation of its own, on purpose.
+
+## What's registered right now (call list_tool to confirm, don't assume)
+Buckets: lead, contact. Intents: get, search, create. Each bucket currently
+has exactly one endpoint per intent (e.g. "lead.get", "contact.search").
+This registry is expected to grow over time.
+
+## Rules that apply across every endpoint, not just one
+- Always call list_tool first if you don't already know the exact id
+  you need — never guess an id, and never assume one from a previous session
+  still exists.
+- Never guess a method, path, field name, or field value shape for ANY
+  endpoint — call build_payload and read its schema and usage_notes before
+  constructing anything, every time, even for an id you've used before in
+  this same conversation.
+- If a field in a schema carries "resolve_via": "<other_id>", you must
+  resolve that value through the named endpoint first — run the full
+  list_tool -> build_payload -> execute_request cycle on <other_id>,
+  take the real value it returns, and only then use it. Never invent a
+  plausible-looking id/value for a field that says resolve_via.
+- For *.search endpoints: fetch one page, show the user what came back, and
+  only fetch further pages if they ask for more — don't loop and fetch
+  everything automatically.
+- Never tell the user an action succeeded (a record was created, updated, or
+  found) unless execute_request's own envelope actually said
+  {"ok": true, ...}. If it returned {"ok": false, ...}, relay the real
+  error message — don't retry silently, don't fabricate a different outcome,
+  and don't paper over the failure.
+- None of these 3 tools take an entity's own field names as their own
+  top-level arguments (e.g. execute_request never takes "firstName" or
+  "email" directly) — that level of detail only ever exists inside the
+  "payload" argument, shaped exactly as build_payload's schema for that
+  specific id describes.
+"""
+
+
+def _plain_component_name(key: str) -> str:
+    """
+    FastMCP's internal `_components` dict keys aren't always plain function
+    names — different versions have stored them as e.g. "build_payload" or
+    "tool:build_payload@..." / "resource:<uri>@...". Strip any "<kind>:" prefix
+    and any "@..." suffix so this keeps working across that difference (verified
+    against fastmcp 3.4.7 here; requirements.txt pins 3.2.4 for the real deploy —
+    don't assume they key it the same way without checking again if either changes).
+    """
+    name = key.split(":", 1)[1] if ":" in key else key
+    return name.split("@", 1)[0] if "@" in name else name
+
+
+# ---------------------------------------------------------------------------
+# Snapshot the REAL, original tools' own inputSchema — captured HERE, before
+# _apply_tool_mode() below potentially removes them from what's advertised —
+# so build_payload can literally reuse them instead of a hand-authored
+# schema. get_lead/get_contact's real schemas are entity-specific and copied
+# as-is. search_entity/create_entity's real schemas are what ACTUALLY backed
+# every lead/contact search & create in the old system (standalone
+# search_leads/create_lead never existed as registered tools) — their
+# "filters"/"field_values" properties are copied as-is too; only their
+# "entity_type" property is dropped per bucket entry, since a registry id
+# like "lead.create" already fixes the entity type that "entity_type" would
+# otherwise redundantly ask for.
+# ---------------------------------------------------------------------------
+
+_ORIGINAL_TOOL_PARAMETERS: Dict[str, Dict[str, Any]] = {}
+
+
+def _snapshot_original_tool_parameters(tool_name: str) -> None:
+    for key, component in mcp.local_provider._components.items():
+        if _plain_component_name(key) == tool_name:
+            _ORIGINAL_TOOL_PARAMETERS[tool_name] = component.parameters
+            return
+
+
+for _name in (
+    "get_lead", "get_contact",
+    "search_entity", "search_entity_by_term", "search_idle_entities",
+    "create_entity", "update_entity",
+    "lookup_users", "lookup_products", "lookup_pipelines",
+):
+    _snapshot_original_tool_parameters(_name)
+
+# Maps a registry id in the bucket-less "_meta" group to the real old tool
+# whose inputSchema build_payload copies verbatim for it (reuses
+# _real_get_schema — that function just returns a snapshot verbatim, nothing
+# lead/contact-specific about it despite the name).
+_REGISTRY_ID_TO_META_TOOL: Dict[str, str] = {
+    "user.lookup": "lookup_users",
+    "product.lookup": "lookup_products",
+    "pipeline.lookup": "lookup_pipelines",
+}
+
+
+async def _lookup_users_router(payload: Dict[str, Any]) -> str:
+    # Real schema's public param is "return_all" (lookup_users tool's own
+    # name for it) — translated here to "fetch_all_pages", the name
+    # lookup_users_logic itself actually takes. Not a new rule, just naming
+    # the same real thing the tool wrapper already renames internally.
+    return await lookup_users_logic(
+        query=payload.get("query", "name:"),
+        page=payload.get("page", 0),
+        size=payload.get("size", 50),
+        fetch_all_pages=payload.get("return_all", False),
+    )
+
+
+async def _lookup_products_router(payload: Dict[str, Any]) -> str:
+    # lookup_products_logic's own param names match the real lookup_products
+    # tool's schema exactly — no renaming needed here, unlike users above.
+    return await lookup_products_logic(
+        query=payload.get("query", ""),
+        page=payload.get("page", 0),
+        size=payload.get("size", 50),
+    )
+
+
+async def _lookup_pipelines_router(payload: Dict[str, Any]) -> str:
+    # Same — lookup_pipelines_logic's params (query/entity_type/page/size)
+    # match the real lookup_pipelines tool's schema as-is.
+    return await lookup_pipelines_logic(
+        query=payload.get("query", ""),
+        entity_type=payload.get("entity_type", "LEAD"),
+        page=payload.get("page", 0),
+        size=payload.get("size", 50),
+    )
+
+
+# "_meta" entries are NOT entity-CRUD-shaped like lead/contact — each one is
+# its own standalone old tool with its own real signature, so (unlike
+# get/search/create/update) there's no single generic _ENTITY_CONFIG-style
+# router to reuse for "lookup" intents; the old system never had one either
+# (lookup_users/lookup_products/lookup_pipelines were always separate,
+# unrelated tools). One small explicit map, one line per id, is the honest
+# shape here — add a line per new "_meta" id, same as any other dict-based
+# dispatch already in this file.
+_META_LOOKUP_ROUTERS: Dict[str, Any] = {
+    "user.lookup": _lookup_users_router,
+    "product.lookup": _lookup_products_router,
+    "pipeline.lookup": _lookup_pipelines_router,
+}
+
+
+def _without_entity_type(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop the "entity_type" property/requirement — redundant once a registry id fixes it."""
+    props = schema.get("properties", {})
+    props.pop("entity_type", None)
+    schema["required"] = [f for f in schema.get("required", []) if f != "entity_type"]
+    return schema
+
+
+def _real_get_schema(tool_name: str) -> Dict[str, Any]:
+    """get_lead/get_contact's real inputSchema, copied verbatim."""
+    return json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get(tool_name, {})))
+
+
+def _real_search_schema() -> Dict[str, Any]:
+    """
+    search_entity's real inputSchema, with "entity_type" removed (redundant —
+    the registry id already fixes it) and "page"/"size"/"sort" kept exactly
+    as search_entity actually declares them, defaults included.
+    """
+    schema = json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get("search_entity", {})))
+    return _without_entity_type(schema)
+
+
+def _real_search_by_term_schema() -> Dict[str, Any]:
+    """search_entity_by_term's real inputSchema, "entity_type" removed."""
+    schema = json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get("search_entity_by_term", {})))
+    return _without_entity_type(schema)
+
+
+def _real_idle_schema() -> Dict[str, Any]:
+    """search_idle_entities's real inputSchema, "entity_type" removed."""
+    schema = json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get("search_idle_entities", {})))
+    return _without_entity_type(schema)
+
+
+def _real_create_schema() -> Dict[str, Any]:
+    """
+    create_entity's real "field_values" property, unwrapped to the top level.
+    The real create_entity schema is {entity_type, field_values: {type:
+    object, additionalProperties: true}} — no field names anywhere; that
+    open-object shape (never firstName/lastName/email) IS the real old
+    system's schema, copied as-is. Unwrapped (not nested under
+    "field_values") because that's how execute_request's payload for these
+    ids actually is structured — a flat object, matching what
+    create_lead_logic/create_contact_logic themselves take.
+    """
+    schema = json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get("create_entity", {})))
+    field_values_schema = schema.get("properties", {}).get("field_values", {"type": "object", "additionalProperties": True})
+    return field_values_schema
+
+
+def _real_update_schema() -> Dict[str, Any]:
+    """
+    update_entity's real inputSchema is {entity_type, entity_id, field_values:
+    {type: object, additionalProperties: true}}. "entity_type" is dropped
+    (redundant, same as elsewhere); "entity_id" is KEPT as its real name
+    (not renamed to "lead_id") — a real naming inconsistency inherited
+    as-is from the old system (get_lead's own real schema calls the same
+    concept "lead_id"), not smoothed over here. "field_values" is unwrapped
+    to the top level via additionalProperties, same reasoning as
+    _real_create_schema — the payload here is flat, matching what
+    update_lead_logic/update_contact_logic actually take (id + field dict).
+    """
+    schema = json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get("update_entity", {})))
+    schema = _without_entity_type(schema)
+    props = schema.get("properties", {})
+    props.pop("field_values", None)
+    return {
+        "type": "object",
+        "properties": {"entity_id": props.get("entity_id", {"type": "integer"})},
+        "required": ["entity_id"],
+        "additionalProperties": True,
+    }
+
+
+def _apply_tool_mode() -> None:
+    """
+    If MCP_TOOL_MODE=registry: remove every registered tool/resource except
+    _REGISTRY_ONLY_TOOL_NAMES from what gets advertised, and swap in the lean
+    registry-mode instructions in place of the full SYSTEM_INSTRUCTIONS block.
+    No-op (today's exact behavior) for any other value, including unset.
+    """
+    if _MCP_TOOL_MODE != "registry":
+        return
+    components = mcp.local_provider._components
+    removed = [k for k in components if _plain_component_name(k) not in _REGISTRY_ONLY_TOOL_NAMES]
+    for k in removed:
+        del components[k]
+    mcp._mcp_server.instructions = _REGISTRY_MODE_INSTRUCTIONS
+    logger.info(
+        "MCP_TOOL_MODE=registry — advertising only %s (%d component(s) hidden, %d remain)",
+        sorted(_REGISTRY_ONLY_TOOL_NAMES), len(removed), len(components),
+    )
+
+
+_apply_tool_mode()
 
 
 # ---------------------------------------------------------------------------
