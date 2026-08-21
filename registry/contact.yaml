@@ -59,6 +59,14 @@
 # main.py) — contacts never had idle-search support at all, unlike leads.
 # Not an omission; adding one would be inventing a capability that never
 # existed.
+#
+# NOTE on "schema": there is deliberately no schema: block per entry anymore.
+# build_payload now copies the REAL schema straight from the actual old
+# tools (get_contact/search_entity/search_entity_by_term/create_entity/
+# update_entity) at call time — see _real_*_schema in main.py. A schema:
+# block here would be dead, unread config exactly like the
+# search_page_offset bug found earlier in this project — better to have
+# none than a copy that can silently drift from the real thing.
 
 - id: contact.get
   bucket: contact
