@@ -1,0 +1,77 @@
+# registry/_meta.yaml
+#
+# Bucket-less shared reference lookups — added specifically to close a real
+# 
+# that id existed anywhere in the registry, so that hint pointed nowhere.
+#
+# description/usage_notes copied from the real, currently-running old
+# lookup_users tool's own docstring — not written from scratch. Real
+# endpoint (GET /users/lookup) confirmed from lookup_users_logic's own
+# docstring in main.py.
+#
+# product.lookup and pipeline.lookup follow the exact same pattern as
+# user.lookup above — description/usage_notes copied from the real,
+# currently-running lookup_products/lookup_pipelines tools' own docstrings,
+# real endpoints confirmed from lookup_products_logic/lookup_pipelines_logic.
+
+- id: user.lookup
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /users/lookup
+  dynamic_fields: false
+  description: "Look up users by name, or list all users in the system."
+  usage_notes: >
+    Use return_all=True (with query "name:" or empty) to fetch all users in
+    one response (all pages combined). For name search: query in
+    field:value form (e.g. "firstName:last", "name:Last"). If one user is
+    found, use that ID for the field you were resolving (e.g. ownerId); if
+    multiple, list them and ask the user which one they mean — never guess.
+
+    query: Search string (e.g. "firstName:last", "name:Last"). Use "name:"
+    or leave default to list all when return_all=True. page: 0-based
+    (default 0), ignored when return_all=True. size: max 50 (default 50),
+    used per page when return_all=True. return_all: if True, fetch all
+    pages and return every user in one response (cap 500).
+  example: {query: "firstName:John"}
+
+- id: product.lookup
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /products/lookup
+  dynamic_fields: false
+  description: "Look up products by name. Use this BEFORE filtering leads or deals by product when the user gives a product name."
+  usage_notes: >
+    If one product is found, use that product's ID when filtering leads or
+    deals (e.g. filter field "products", operator "equal", value <id> — works
+    for both leads and deals). If multiple products are found, ask the user
+    which product they mean (list the options), then use the chosen
+    product's ID — never guess.
+
+    query: Search string. Use "name:<product_name>" (e.g. "name:Widget") or
+    just the product name (e.g. "Widget"); if no ":" is present the server
+    sends it as name:value to the API. page: 0-based (default 0). size: max
+    50 (default 50).
+  example: {query: "name:Widget"}
+
+- id: pipeline.lookup
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /pipelines/lookup
+  dynamic_fields: false
+  description: "Look up pipelines by name for leads or deals. Use when the user asks for items by stage (e.g. open/closed/won) but does not specify which pipeline."
+  usage_notes: >
+    Call this first; do NOT look up pipeline stages until after the user has
+    confirmed the pipeline. Present the pipeline(s) (id and name) and ask the
+    user which pipeline they mean — even if only one is found, still ask for
+    confirmation. Only after confirmation, look up that pipeline's stages,
+    then map user intent (open/closed/won/lost) to stage id(s) for
+    search/update.
+
+    query: Search string. Use "name:<pipeline_name>" or just the pipeline
+    name; empty string returns all pipelines for the entity. entity_type:
+    "LEAD" (default) or "DEAL". page: 0-based (default 0). size: max 50
+    (default 50).
+  example: {query: "", entity_type: "LEAD"}

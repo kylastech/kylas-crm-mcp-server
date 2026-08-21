@@ -1,0 +1,22 @@
+# registry/index.yaml
+#
+# Closed enums the startup validator checks every registry entry against.
+# Adding a new bucket or intent means adding it here FIRST — an entry that
+# references a bucket/intent not listed here fails validation loudly at
+# import time, before the server accepts any connection.
+#
+# Further buckets (deal, task, company, ...) come in a later step.
+
+buckets:
+  - lead
+  - contact
+  - _meta
+
+intents:
+  - get
+  - search
+  - search_by_term
+  - search_idle
+  - create
+  - update
+  - lookup
