@@ -1,8 +1,47 @@
 # registry/_meta.yaml
 #
 # Bucket-less shared reference lookups — added specifically to close a real
-# 
+#
 # that id existed anywhere in the registry, so that hint pointed nowhere.
+#
+# ARCHITECTURE — what lives here vs. what lives in main.py
+# ---------------------------------------------------------------------------
+# Each entry below is static operation metadata and LLM-facing guidance only:
+# id, bucket, intent, method, path, dynamic_fields, description, usage_notes,
+# example. There is deliberately no "schema:" block for the request/input
+# shape here either, for the same reason as every other bucket file in this
+# registry: duplicating a schema that already exists elsewhere can silently
+# drift from the real thing (see the search_page_offset bug found earlier in
+# this project as a concrete example of exactly that failure mode).
+#
+# Instead, build_payload (main.py) resolves the real input schema at request
+# time via _real_get_schema, applied to whichever real original tool
+# _REGISTRY_ID_TO_META_TOOL maps this id's bucket-less id to — lookup_users
+# for user.lookup, lookup_products for product.lookup, lookup_pipelines for
+# pipeline.lookup — copying that tool's actual inputSchema verbatim, never
+# re-authored here. All three entries below have dynamic_fields: false, so
+# unlike the lead/contact/meeting/call_log bucket files, there is no live
+# tenant field/picklist enrichment step for _meta entries — the schema
+# build_payload returns is exactly that snapshotted tool schema, nothing
+# folded in on top of it. execute_request then dispatches each id to its own
+# small router in _META_LOOKUP_ROUTERS (main.py), which calls that same real
+# tool's underlying *_logic function.
+#
+# The sources of truth are intentionally kept separate, on purpose:
+#   - YAML (this file)       -> what the operation is, how to route it, and
+#                                how an LLM should use it (usage_notes/example).
+#   - Runtime Python schemas -> the authoritative request/input shape
+#                                (_ORIGINAL_TOOL_PARAMETERS / _real_get_schema).
+#   - Python logic           -> validation, normalization, and the actual
+#                                Kylas API call (lookup_users_logic/
+#                                lookup_products_logic/lookup_pipelines_logic
+#                                in main.py, dispatched via
+#                                _META_LOOKUP_ROUTERS).
+# In short: YAML describes what the operation is and how the LLM should use
+# it; runtime Python provides the authoritative request schema and execution
+# behavior. Nothing here should ever try to re-describe the request shape —
+# that description belongs to main.py alone, so there is exactly one place
+# it can drift from reality, and it isn't this file.
 #
 # description/usage_notes copied from the real, currently-running old
 # lookup_users tool's own docstring — not written from scratch. Real
