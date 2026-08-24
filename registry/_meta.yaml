@@ -74,11 +74,23 @@
     found, use that ID for the field you were resolving (e.g. ownerId); if
     multiple, list them and ask the user which one they mean — never guess.
 
-    query: Search string (e.g. "firstName:last", "name:Last"). Use "name:"
-    or leave default to list all when return_all=True. page: 0-based
-    (default 0), ignored when return_all=True. size: max 50 (default 50),
-    used per page when return_all=True. return_all: if True, fetch all
-    pages and return every user in one response (cap 500).
+    IMPORTANT — "name:" only matches a SINGLE token, never a full "First
+    Last" name (confirmed live: "name:Janardan" and "name:Borse" each
+    match, but "name:Janardan Borse" matches nothing at all — Kylas's own
+    query parser breaks on the space, it is not a case-sensitivity issue).
+    If the user gives a full name, do NOT build "name:<first> <last>" —
+    either use "firstName:<first>" (matches first name only, most
+    reliable for a full name given by the user) or "name:<one token>"
+    (last name alone also works under "name:"). Never silently drop half
+    the name and call it a match without telling the user which token was
+    actually searched.
+
+    query: Search string (e.g. "firstName:last", "name:Last") — value must
+    be a single token, see above. Use "name:" or leave default to list all
+    when return_all=True. page: 0-based (default 0), ignored when
+    return_all=True. size: max 50 (default 50), used per page when
+    return_all=True. return_all: if True, fetch all pages and return every
+    user in one response (cap 500).
   example: {query: "firstName:John"}
 
 - id: product.lookup

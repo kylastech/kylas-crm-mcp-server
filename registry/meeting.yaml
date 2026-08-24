@@ -268,4 +268,12 @@
 
     query (str): lookup search string (e.g. "firstName:John" or
     "comp:Acme"). Leave empty for a default broad listing.
+
+    IMPORTANT for entity_type="invitee": "name:" only matches a SINGLE
+    token, never a full "First Last" name — confirmed live: "name:Janardan"
+    matches, "name:Janardan Borse" matches nothing at all (Kylas's query
+    parser breaks on the space; same root cause as user.lookup's "name:"
+    field). If the user gives a full name, search on just the first name
+    or last name, not both together, and tell the user which token you
+    actually searched.
   example: {entity_type: "invitee", query: "firstName:John"}
