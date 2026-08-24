@@ -1,0 +1,153 @@
+# registry/quotation.yaml
+#
+# Registry entries for the "quotation" bucket — same approach as lead.yaml/contact.yaml.
+#
+# ARCHITECTURE — what lives here vs. what lives in main.py
+# ---------------------------------------------------------------------------
+# Each entry below is static operation metadata and LLM-facing guidance only:
+# id, bucket, intent, method, path, dynamic_fields, description, usage_notes,
+# example. There is deliberately no "schema:" block for the request/input
+# shape — that would duplicate a schema that already exists elsewhere in this
+# codebase, and a duplicate copy can silently drift from the real thing (see
+# the search_page_offset bug found earlier in this project as a concrete
+# example of exactly that failure mode).
+#
+# Instead, build_payload (main.py) resolves the real input schema at request
+# time from the original, already-registered MCP tool schemas it snapshots
+# into _ORIGINAL_TOOL_PARAMETERS, via the _real_get_schema / _real_search_schema
+# / _real_search_by_term_schema / _real_idle_schema helpers — for quotation
+# specifically: get_quotation's, search_entity's, search_entity_by_term's,
+# and search_idle_entities's actual inputSchema, copied verbatim, never
+# re-authored here (quotation has no create/update entries, so
+# _real_create_schema/_real_update_schema are never invoked for this
+# bucket — see below for why). For entries where dynamic_fields is true,
+# build_payload additionally fetches this tenant's live field metadata (via
+# _fetch_quotation_fields) and folds the real custom fields and picklist
+# option id/label pairs into that schema before returning it — so the
+# request shape a caller actually sees is always live, tenant-accurate data,
+# not a static guess baked into this file.
+#
+# The sources of truth are intentionally kept separate, on purpose:
+#   - YAML (this file)       -> what the operation is, how to route it, and
+#                                how an LLM should use it (usage_notes/example).
+#   - Runtime Python schemas -> the authoritative request/input shape
+#                                (_ORIGINAL_TOOL_PARAMETERS / _real_*_schema).
+#   - Live tenant metadata   -> this tenant's own custom fields and
+#                                picklist/option values, fetched on demand.
+#   - Python logic           -> validation, normalization, dispatch, and the
+#                                actual Kylas API call (quotation.get/search/
+#                                search_by_term/search_idle's real *_logic
+#                                functions in main.py).
+# In short: YAML describes what the operation is and how the LLM should use
+# it; runtime Python provides the authoritative request schema and execution
+# behavior. Nothing here should ever try to re-describe the request shape —
+# that description belongs to main.py alone, so there is exactly one place
+# it can drift from reality, and it isn't this file.
+#
+# usage_notes below are VERBATIM/assembled from the real, currently-running
+# old system's own text — get_quotation's actual docstring, the generic
+# search_entity/search_entity_by_term/search_idle_entities tools' own
+# docstrings, and QUOTATION_SYSTEM_INSTRUCTIONS' own sections. Nothing here
+# is paraphrased or invented.
+#
+# Deliberately has NO quotation.create or quotation.update entries: quotations
+# are READ-ONLY in the old system by explicit design — confirmed directly in
+# main.py (_ENTITY_CRUD_CONFIG has no "quotation" key at all, so
+# create_entity_logic/update_entity_logic raise "Unknown entity_type" for
+# it) and stated outright in QUOTATION_SYSTEM_INSTRUCTIONS: "Quotations are
+# READ-ONLY here. You CANNOT create, update, or delete quotations through
+# this server." Not an omission; adding create/update entries would be
+# inventing a capability that was deliberately never built.
+
+- id: quotation.get
+  bucket: quotation
+  intent: get
+  method: GET
+  path: /quotations/{quotation_id}
+  dynamic_fields: false
+  description: "Get full details of a quotation by ID (GET /quotations/{id})."
+  usage_notes: >
+    Use when the user asks for complete quotation info (products, totals,
+    associated deal/company/contacts).
+    quotation_id: The quotation ID (e.g. from search results).
+  example: {quotation_id: 12345}
+
+- id: quotation.search
+  bucket: quotation
+  intent: search
+  method: POST
+  path: /quotations/search
+  dynamic_fields: true
+  description: "Filter/search quotations by field criteria."
+  usage_notes: >
+    filters: List of filter objects. Each must have: field (str) — Field
+    internal/API name; operator (str) — one of the allowed operators for
+    that field type; value — type depends on field type; timeZone (str,
+    optional) — for date/datetime filters; type (str, optional) — field
+    type, inferred from schema if omitted. Filters are REQUIRED (non-empty)
+    for quotation. page: 0-based (default 0). size: page size, max 100
+    (default 20). sort: only sortable fields are accepted — if unsure, omit
+    sort entirely and the server defaults to updatedAt,desc.
+
+    Only [FILTERABLE] fields (from the live tenant_filterable_fields below)
+    are allowed. Common filters: quotationNumber, summary, status,
+    grandTotal, associatedDeal, updatedAt. The id field (type ID) does NOT
+    support is_not_null.
+
+    To get all quotations: filter on {"field": "summary", "operator":
+    "is_not_empty"} (summary is required so this matches every record), or
+    an updatedAt >= last 90 days filter instead.
+
+    When showing multiple quotations, summarize by status or associated
+    deal and total the grand totals.
+
+    Pagination: always use the largest page size available. Do NOT
+    auto-fetch all pages sequentially — fetch page 1, show results, then ask
+    if the user wants more. If you receive a 429 error: stop, wait at least
+    5 seconds, then retry once.
+
+    Quotations are READ-ONLY through this server — you can search, view,
+    and report on them, but CANNOT create, update, or delete them here. If
+    the user asks to create/edit a quotation, tell them it must be done in
+    the Kylas web app.
+  example:
+    filters: [{field: "status", operator: "equal", value: "APPROVED"}]
+
+- id: quotation.search_by_term
+  bucket: quotation
+  intent: search_by_term
+  method: POST
+  path: /quotations/search
+  dynamic_fields: false
+  description: "Search/filter quotations by a free-text search term."
+  usage_notes: >
+    Use this ONLY when the user provides a specific search term. NEVER use
+    this tool with wildcard characters ("*"), empty strings, or blank terms.
+    NEVER use this tool when the user asks for "all" quotations — for
+    "all"/"list" queries, use quotation.search instead.
+
+    search_term: A specific term searched across summary, quotation number,
+    and the associated deal / company / contact / product names.
+
+    page: 0-based (default 0). size: page size, max 100 (default 20). sort:
+    only sortable fields are accepted — if unsure, omit sort entirely.
+  example: {search_term: "Acme"}
+
+- id: quotation.search_idle
+  bucket: quotation
+  intent: search_idle
+  method: POST
+  path: /quotations/search
+  dynamic_fields: false
+  description: "Search quotations that have had no update for N days."
+  usage_notes: >
+    Quotations have no activity feed, so idleness is based on updatedAt
+    only (unlike lead/deal/company, which also consider
+    latestActivityCreatedAt).
+
+    days: Number of days since the last update (e.g., 30 = not updated in
+    over 30 days). time_zone: Timezone for date calculation (optional;
+    defaults to current user's timezone or server default). page: 0-based
+    (default 0). size: page size, max 100 (default 20). sort: only sortable
+    fields are accepted — if unsure, omit sort entirely.
+  example: {days: 30}

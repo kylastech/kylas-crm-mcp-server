@@ -55,7 +55,11 @@
 # get_call_logs(entity_id, entity_type), which lists call logs FOR a lead/
 # contact/deal, not a single call log by its own ID (confirmed: no
 # get_call_log_logic exists in main.py). Not an omission; adding a .get
-# entry would be inventing a capability that never existed.
+# entry would be inventing a capability that never existed. That real
+# by-entity read path IS represented below, though — as call_log.by_entity,
+# a "lookup" intent entry (same pattern as _meta's lookups/pipeline.details
+# and meeting.lookup_related), since it resolves records by an entity
+# relation rather than a single call log's own ID.
 #
 # Deliberately has NO call_log.search_by_term entry: the old system's real
 # _ENTITY_CONFIG["call_log"]["by_term_fn"] is None (confirmed directly in
@@ -194,3 +198,22 @@
     startTime: "2026-05-10T08:00:00.000Z"
     phoneNumber: "9876543210"
     relatedTo: {id: 12345, entity: "lead", phoneNumber: "9876543210"}
+
+- id: call_log.by_entity
+  bucket: call_log
+  intent: lookup
+  method: GET
+  path: /call-logs
+  dynamic_fields: false
+  description: "Get call logs for a specific lead, contact, or deal, including that entity's own details."
+  usage_notes: >
+    Use this instead of paging through call_log.search results one at a
+    time when you already know which lead/contact/deal you're interested
+    in — this fetches that entity's own details together with its call
+    logs in one call, which call_log.search's "relatedTo" field alone does
+    not give you.
+
+    entity_id: the ID of the lead, contact, or deal.
+    entity_type: "lead", "contact", or "deal" — no other value is valid.
+    page: 0-based (default 0). size: page size, max 100 (default 20).
+  example: {entity_id: 12345, entity_type: "lead"}

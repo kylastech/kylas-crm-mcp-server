@@ -239,3 +239,33 @@
     meeting.create's usage_notes for the full rules; not repeated verbatim
     here to avoid duplicating the same text twice.
   example: {entity_id: 111, participants: [{id: 7236, entity: "user"}]}
+
+- id: meeting.lookup_related
+  bucket: meeting
+  intent: lookup
+  method: GET
+  path: "/search/{lead|contact|deal}/lookup, or /companies/lookup?view=meeting, or /search/meeting-invitee/lookup (varies by entity_type — see usage_notes)"
+  dynamic_fields: false
+  description: "Resolve invitees or related leads/contacts/deals/companies for meeting association or search filters."
+  usage_notes: >
+    Call this FIRST when the user wants a meeting linked to a specific
+    entity or person by name, or wants to add a participant by name.
+
+    entity_type (str): one of "lead", "contact", "deal", "company", or
+    "invitee" — each hits a genuinely different real endpoint (GET
+    /search/lead/lookup, /search/contact/lookup, /search/deal/lookup,
+    /companies/lookup?view=meeting&q=, /search/meeting-invitee/lookup
+    respectively), not one shared path — that's a real property of the old
+    system, not smoothed into a single fake endpoint here.
+
+    For lead/contact/deal/company: use the returned ID with meeting.search
+    on field associatedLeads/associatedContacts/associatedDeals/
+    associatedCompanies. For invitee: use the FULL returned object (e.g.
+    {"id": 123, "entity": "lead", "name": "...", "emails": [...]}) — as a
+    meeting.create/meeting.update participant, or with meeting.search on
+    the "participants" field with operator "in". Organizer is usually the
+    invitee row with entity="user".
+
+    query (str): lookup search string (e.g. "firstName:John" or
+    "comp:Acme"). Leave empty for a default broad listing.
+  example: {entity_type: "invitee", query: "firstName:John"}

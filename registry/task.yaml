@@ -1,0 +1,266 @@
+# registry/task.yaml
+#
+# Registry entries for the "task" bucket — same approach as lead.yaml/contact.yaml.
+#
+# ARCHITECTURE — what lives here vs. what lives in main.py
+# ---------------------------------------------------------------------------
+# Each entry below is static operation metadata and LLM-facing guidance only:
+# id, bucket, intent, method, path, dynamic_fields, description, usage_notes,
+# example. There is deliberately no "schema:" block for the request/input
+# shape — that would duplicate a schema that already exists elsewhere in this
+# codebase, and a duplicate copy can silently drift from the real thing (see
+# the search_page_offset bug found earlier in this project as a concrete
+# example of exactly that failure mode).
+#
+# Instead, build_payload (main.py) resolves the real input schema at request
+# time from the original, already-registered MCP tool schemas it snapshots
+# into _ORIGINAL_TOOL_PARAMETERS, via the _real_get_schema / _real_search_schema
+# / _real_search_by_term_schema / _real_create_schema / _real_update_schema
+# helpers — for task specifically: get_task's, search_entity's,
+# search_entity_by_term's, create_entity's, and update_entity's actual
+# inputSchema, copied verbatim, never re-authored here. For entries where
+# dynamic_fields is true, build_payload additionally fetches this tenant's
+# live field metadata (via _fetch_task_fields) and folds the real custom
+# fields and picklist option id/label pairs into that schema before
+# returning it — so the request shape a caller actually sees is always live,
+# tenant-accurate data, not a static guess baked into this file.
+#
+# The sources of truth are intentionally kept separate, on purpose:
+#   - YAML (this file)       -> what the operation is, how to route it, and
+#                                how an LLM should use it (usage_notes/example).
+#   - Runtime Python schemas -> the authoritative request/input shape
+#                                (_ORIGINAL_TOOL_PARAMETERS / _real_*_schema).
+#   - Live tenant metadata   -> this tenant's own custom fields and
+#                                picklist/option values, fetched on demand.
+#   - Python logic           -> validation, normalization, dispatch, and the
+#                                actual Kylas API call (task.create/update/
+#                                get/search/search_by_term's real *_logic
+#                                functions in main.py).
+# In short: YAML describes what the operation is and how the LLM should use
+# it; runtime Python provides the authoritative request schema and execution
+# behavior. Nothing here should ever try to re-describe the request shape —
+# that description belongs to main.py alone, so there is exactly one place
+# it can drift from reality, and it isn't this file.
+#
+# usage_notes below are VERBATIM/assembled from the real, currently-running
+# old system's own text — get_task's actual docstring, the generic
+# search_entity/search_entity_by_term/create_entity/update_entity tools' own
+# docstrings (the real registered tools that handle every task operation —
+# standalone search_tasks_with_any_relation and lookup_entity_for_task ARE
+# real, separately registered tools, not dead code, but see the note below
+# on why they aren't modeled as their own registry entries), and
+# SYSTEM_INSTRUCTIONS' "Task Operations" section. Nothing here is paraphrased
+# or invented.
+#
+# Deliberately has NO task.search_idle entry: the old system's real
+# _ENTITY_CONFIG["task"]["idle_fn"] is None (confirmed directly in main.py)
+# — tasks never had idle-search support at all. Not an omission; adding one
+# would be inventing a capability that never existed.
+#
+# NOTE on task.lookup_entity: this bucket-scoped "lookup" entry was added in
+# a later pass than the rest of this file — initially, lookup_entity_for_task
+# was left as a standalone tool outside the registry entirely (bucket-scoped
+# "lookup" entries were "new plumbing" the first pass didn't add, unlike
+# _meta's bucket-less lookups). It's since been proven out (see
+# meeting.lookup_related in meeting.yaml, added the same way), so it's wired
+# in below instead of left standalone.
+#
+# NOTE on search_tasks_with_any_relation: still NOT represented as its own
+# registry entry, and this one is not just a scope choice — it genuinely
+# cannot fit. It makes 4 parallel is_not_null calls (one per association
+# field: associatedLeads/associatedContacts/associatedDeals/
+# associatedCompanies) and dedupes the combined result — an OR across 4
+# fields that a single jsonRule-based filter set (what task.search's payload
+# actually is) cannot express. It remains a standalone tool, documented as
+# guidance in task.search's usage_notes below, not silently dropped.
+#
+# NOTE: task.get required BOTH extracting a new get_task_logic(task_id)
+# function in main.py (the real, registered get_task tool inlined its GET
+# call directly — it never had its own "_logic" helper the way get_lead/
+# get_contact/get_meeting/get_deal/get_company all do) AND adding
+# "get_fn": get_task_logic to _ENTITY_CONFIG["task"] (which, like meeting's
+# and deal's original _ENTITY_CONFIG entries, only had search_fn/by_term_fn/
+# idle_fn wired, no get_fn at all). get_task itself was refactored to call
+# the new get_task_logic so there is exactly one real implementation of this
+# GET, not two — same reasoning as every other *_logic extraction in main.py.
+
+- id: task.get
+  bucket: task
+  intent: get
+  method: GET
+  path: /tasks/{task_id}
+  dynamic_fields: false
+  description: "Get full details of a task by ID (GET /tasks/{id})."
+  # The real old get_task tool's docstring was exactly this one line and
+  # nothing else — no param note, same asymmetry as contact.get. Left short
+  # on purpose; not smoothed over by inventing parity with lead.get. The
+  # diagnosis guidance below is a separate, later addition (from
+  # DIAGNOSIS_AND_REPORTING_INSTRUCTIONS), not part of that original
+  # docstring.
+  usage_notes: >
+    Diagnosis (verbatim from the old system's DIAGNOSIS_AND_REPORTING_INSTRUCTIONS,
+    which applied this after showing ANY entity — deal, lead, or task):
+    after showing this task, append a diagnosis block in this exact format
+    (skip severity levels with no signals; always include at least one 💡 line):
+    "── Diagnosis ──────────────────────────────────────────
+    🔴 <critical issue>
+    🟡 <warning>
+    🟢 <healthy signal>
+    💡 Suggested: <next step>
+    ───────────────────────────────────────────────────────"
+
+    Task signals: 🔴 due date is in the past → "Overdue by X days" (💡
+    "Complete, reschedule, or reassign this task"). 🟡 no associated entity
+    → "Not linked to any lead, deal, or contact" (💡 "Associate with a lead
+    or deal for context"). 🟢 due date is in the future → "Due in X days".
+  example: {task_id: 12345}
+
+- id: task.search
+  bucket: task
+  intent: search
+  method: POST
+  path: /tasks/search
+  dynamic_fields: true
+  description: "Filter/search tasks by field criteria."
+  usage_notes: >
+    filters: List of filter objects. Each must have: field (str) — Field
+    internal/API name; operator (str) — one of the allowed operators for
+    that field type; value — type depends on field type; timeZone (str,
+    optional) — for date/datetime filters; type (str, optional) — field
+    type, inferred from schema if omitted. Filters are REQUIRED (non-empty)
+    for task. page: 0-based (default 0). size: page size, max 100
+    (default 20). sort: e.g. "createdAt,desc" (default).
+
+    No pipeline, pipelineStage, emails, or phoneNumbers fields exist for
+    tasks. Only [FILTERABLE] fields (from the live tenant_filterable_fields
+    below) are allowed, plus these association fields (filterable even if
+    not marked so in tenant metadata): associatedLeads, associatedContacts,
+    associatedDeals, associatedCompanies (type LOOK_UP).
+
+    Filter tasks by a specific entity: {"field": "associatedLeads",
+    "operator": "equal", "value": <lead_id>} (same pattern for
+    associatedContacts/associatedDeals/associatedCompanies with the
+    matching id). Resolve the entity's real ID first via
+    lookup_entity_for_task(entity_type, search_term) — a real, separately
+    registered tool (entity_type: "lead"/"contact"/"deal"/"company";
+    returns matching entities with IDs) — never invent an ID.
+
+    Tasks with ANY relation present, regardless of which entity: use the
+    separately registered search_tasks_with_any_relation() tool instead of
+    trying to express this as a filter here — it makes 4 parallel
+    is_not_null calls (one per association field) and returns a
+    deduplicated, unified list; the single-filter-set shape this tool takes
+    cannot express an OR across those 4 association fields.
+
+    Never guess IDs — always resolve first: Users (assignedTo, createdBy,
+    updatedBy, etc.) — call lookup_users(query); if multiple matches, list
+    them and ask user to pick.
+
+    Pagination: always use the largest page size available. Do NOT
+    auto-fetch all pages sequentially — fetch page 1, show results, then ask
+    if the user wants more. If you receive a 429 error: stop, wait at least
+    5 seconds, then retry once.
+  example:
+    filters: [{field: "status", operator: "equal", value: "OPEN"}]
+
+- id: task.create
+  bucket: task
+  intent: create
+  method: POST
+  path: /tasks
+  dynamic_fields: true
+  description: "Create a new task."
+  usage_notes: >
+    No pipeline, pipelineStage, emails, or phoneNumbers fields exist for
+    tasks.
+
+    Association (link the task to an entity): "relation":
+    [{"targetEntityId": <id>, "targetEntityType": "LEAD|CONTACT|DEAL|COMPANY",
+    "targetEntityName": "<name>"}]. Resolve the entity first via
+    lookup_entity_for_task(entity_type, search_term) — entity_type is the
+    internal type ("lead"/"contact"/"deal"/"company"), not the tenant's
+    display name — never invent an ID or name for this field.
+
+    Build field_values from user input only — no defaults, no extras. Keys:
+    API name for standard fields, or field ID string for custom fields;
+    custom fields go under "customFieldValues": {"<internalName>": <value>} —
+    never use field ID as the key.
+
+    Date / datetime fields (e.g. dueDate): call get_current_user to get the
+    user's timezone, then call parse_datetime_to_utc_iso_tool(datetime_string,
+    timezone) and use the returned UTC ISO string in field_values.
+
+    Never guess IDs: assignedTo and any other user reference — call
+    lookup_users(query) first; if multiple matches, list them and ask the
+    user to pick.
+  example:
+    name: "Follow up"
+    dueDate: "2026-05-01T18:29:59.999Z"
+    relation: [{targetEntityId: 12345, targetEntityType: "LEAD", targetEntityName: "Jane Doe"}]
+
+- id: task.search_by_term
+  bucket: task
+  intent: search_by_term
+  method: POST
+  path: /tasks/search
+  dynamic_fields: false
+  description: "Search/filter tasks by a free-text search term."
+  usage_notes: >
+    Use this ONLY when the user provides a specific search term. NEVER use
+    this tool with wildcard characters ("*"), empty strings, or blank terms.
+    NEVER use this tool when the user asks for "all" tasks — for
+    "all"/"list" queries, use task.search with a date filter instead.
+
+    search_term: A specific term to search across multiple fields (name,
+    etc.).
+
+    page: 0-based (default 0). size: page size, max 100 (default 20). sort:
+    e.g. "updatedAt,desc" (default).
+  example: {search_term: "Follow up"}
+
+- id: task.update
+  bucket: task
+  intent: update
+  method: PUT
+  path: /tasks/{task_id}
+  dynamic_fields: true
+  description: "Update an existing task."
+  usage_notes: >
+    entity_id: pass the task ID from search results (this bucket's real
+    parameter name is "entity_id", not "task_id" — inherited as-is from the
+    old update_entity tool that actually handled this; task.get's own real
+    schema uses "task_id" instead — that inconsistency is real, from the old
+    system, not smoothed over here).
+
+    Fields are merged over the existing record — other fields are left
+    unchanged, this is not a full replace.
+
+    All the same rules as task.create apply to any field being changed here
+    (relation/association resolution, customFieldValues internal-name rule,
+    date/datetime UTC conversion, never guessing assignedTo) — see
+    task.create's usage_notes for the full rules; not repeated verbatim
+    here to avoid duplicating the same text twice.
+  example: {entity_id: 12345, status: "COMPLETED"}
+
+- id: task.lookup_entity
+  bucket: task
+  intent: lookup
+  method: "GET|POST"
+  path: "/search/lead/lookup (GET), /search/contact/associated-with-entity, /search/deal/associated-with-entity, /search/company/associated-with-entity (all POST, view=task) — varies by entity_type, see usage_notes"
+  dynamic_fields: false
+  description: "Look up a lead, contact, deal, or company to associate with a task."
+  usage_notes: >
+    Use this BEFORE task.create or task.update when the user specifies an
+    entity by name instead of by ID.
+
+    entity_type: "lead", "contact", "deal", or "company" (internal type,
+    not the tenant's display name) — each hits a genuinely different real
+    endpoint with a different HTTP method (lead is a GET, the other three
+    are POST with a "view=task" filter) — that's a real property of the old
+    system, not smoothed into one shared shape here.
+    search_term: optional name to filter results (e.g. "John", "Acme").
+
+    Returns top matching entities with IDs. Use the returned id in task's
+    "relation" field: {"targetEntityId": <id>, "targetEntityType":
+    "LEAD|CONTACT|DEAL|COMPANY", "targetEntityName": "<name>"}.
+  example: {entity_type: "lead", search_term: "John"}

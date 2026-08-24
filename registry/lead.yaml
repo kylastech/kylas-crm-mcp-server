@@ -64,6 +64,25 @@
     Use when the user asks for complete lead info, lead details, or to view a
     specific lead.
     lead_id: The lead ID (e.g. from search_leads or search_leads_by_term results).
+
+    Diagnosis (verbatim from the old system's DIAGNOSIS_AND_REPORTING_INSTRUCTIONS,
+    which applied this after showing ANY entity — deal, lead, or task):
+    after showing this lead, append a diagnosis block in this exact format
+    (skip severity levels with no signals; always include at least one 💡 line):
+    "── Diagnosis ──────────────────────────────────────────
+    🔴 <critical issue>
+    🟡 <warning>
+    🟢 <healthy signal>
+    💡 Suggested: <next step>
+    ───────────────────────────────────────────────────────"
+
+    Lead signals: 🔴 no activity for >30 days → "Stagnant for X days — at
+    risk of going cold" (💡 "Follow up immediately or reassign to another
+    owner"). 🟡 no associated contact or company → "No contact or company
+    linked" (💡 "Create or link a contact for this lead"). 🟡 no products →
+    "No products associated". 🟡 no owner assigned → "Unassigned — no owner
+    set" (💡 "Assign to a sales rep"). 🟢 active within 7 days → "Recently
+    active".
   example: {lead_id: 12345}
 
 - id: lead.search
