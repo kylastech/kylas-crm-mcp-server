@@ -10,6 +10,8 @@
 buckets:
   - lead
   - contact
+  - meeting
+  - call_log
   - _meta
 
 intents:

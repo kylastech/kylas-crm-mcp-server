@@ -1,0 +1,163 @@
+# registry/call_log.yaml
+#
+# Registry entries for the "call_log" bucket — same approach as lead.yaml/
+# contact.yaml/meeting.yaml.
+#
+# usage_notes below are VERBATIM/assembled from the real, currently-running
+# old system's own text — create_call_log_logic's/update_call_log_logic's own
+# required-field checks, the generic search_entity tool's own docstring, and
+# CALL_LOG_SYSTEM_INSTRUCTIONS' own sections. Nothing here is paraphrased or
+# invented.
+#
+# Deliberately has NO call_log.get entry: there is no get-a-single-call-log-
+# by-id endpoint anywhere in the old system — the only real read path is
+# get_call_logs(entity_id, entity_type), which lists call logs FOR a lead/
+# contact/deal, not a single call log by its own ID (confirmed: no
+# get_call_log_logic exists in main.py). Not an omission; adding a .get
+# entry would be inventing a capability that never existed.
+#
+# Deliberately has NO call_log.search_by_term entry: the old system's real
+# _ENTITY_CONFIG["call_log"]["by_term_fn"] is None (confirmed directly in
+# main.py) — call logs never had free-text search support at all.
+#
+# Deliberately has NO call_log.search_idle entry: same reasoning —
+# _ENTITY_CONFIG["call_log"]["idle_fn"] is None.
+#
+# Like meeting (and unlike lead/contact), call_log.search's filters are
+# OPTIONAL (empty rules = all records, confirmed via the entity_type not in
+# ("meeting", "call_log") check in search_entity_logic) — called out
+# explicitly below rather than smoothed into the lead/contact wording.
+#
+# NOTE on "schema": there is deliberately no schema: block per entry anymore.
+# build_payload now copies the REAL schema straight from the actual old
+# tools (search_entity/create_entity/update_entity) at call time — see
+# _real_*_schema in main.py. A schema: block here would be dead, unread
+# config exactly like the search_page_offset bug found earlier in this
+# project — better to have none than a copy that can silently drift from
+# the real thing.
+
+- id: call_log.search
+  bucket: call_log
+  intent: search
+  method: POST
+  path: /call-logs/search
+  dynamic_fields: true
+  description: "Filter/search call logs by field criteria."
+  usage_notes: >
+    filters: List of filter objects. Each must have: field (str) — Field
+    internal/API name; operator (str) — one of the allowed operators for
+    that field type; value — type depends on field type; timeZone (str,
+    optional) — for date/datetime filters; type (str, optional) — field
+    type, inferred from schema if omitted.
+
+    Unlike lead/contact/task/deal/company, filters are OPTIONAL for
+    call_log — an empty filter list returns all call logs, it does not
+    error.
+
+    Only [FILTERABLE] fields (from get_call_log_field_instructions) are
+    allowed. Picklist fields that use internal name (string) instead of
+    Option ID: outcome, callType, overallSentiment, callDisposition,
+    customerEmotion.
+
+    page: 0-based (default 0). size: page size, max 100 (default 20). sort:
+    e.g. "createdAt,desc" (default).
+
+    Date/datetime fields (filter/search): keep the value in the user's
+    timezone; pass timeZone in the filter (or omit — server uses it). Do NOT
+    convert filter values to UTC.
+
+    Never guess IDs — always resolve first: Users (createdBy, updatedBy,
+    owner, etc.) — call lookup_users(query); if multiple matches, list them
+    and ask user to pick. Entity IDs (for relatedTo filters) — search for
+    the lead/contact/deal first to get its real ID; never invent IDs.
+
+    Each result's "relatedTo" shows which lead/contact/deal the call belongs
+    to — to see full details of that entity together with all its call
+    logs, use get_call_logs(entity_id, entity_type) instead of paging
+    through call_log.search results one at a time.
+
+    Pagination: always use the largest page size available. Do NOT
+    auto-fetch all pages sequentially — fetch page 1, show results, then ask
+    if the user wants more. If you receive a 429 error: stop, wait at least
+    5 seconds, then retry once.
+  example:
+    filters: [{field: "callType", operator: "equal", value: "outgoing"}]
+
+- id: call_log.create
+  bucket: call_log
+  intent: create
+  method: POST
+  path: /call-logs/
+  dynamic_fields: true
+  description: "Create a new call log."
+  usage_notes: >
+    Required: outcome, startTime, phoneNumber, callType, relatedTo — the
+    real create_call_log_logic rejects the call with a specific message
+    naming whichever of these is missing, before ever reaching Kylas.
+
+    Before creating, ask for: which entity (lead, contact, or deal — search
+    to get its real ID); phone number; call type (incoming/outgoing);
+    outcome (connected/rejected/busy/no_answer/missed_call/in_progress);
+    start time (convert to UTC via get_current_user +
+    parse_datetime_to_utc_iso_tool). Duration (seconds) and notes are
+    optional.
+
+    Payload — lead or contact:
+    {"outcome": "connected", "callType": "outgoing",
+    "startTime": "<UTC ISO>", "phoneNumber": "9618488578", "duration": 420,
+    "relatedTo": {"id": <entity_id>, "entity": "lead|contact",
+    "phoneNumber": "..."}, "notes": [{"description": "..."}]}
+
+    Payload — deal: same as above with "entity": "deal" in relatedTo.
+    Optionally link a contact via:
+    "associatedTo": [{"id": <contact_id>, "entity": "contact",
+    "phoneNumber": "..."}]
+
+    callRecording (optional): {"url": "https://...", "fileName": "call.mp3",
+    "data": ""}.
+
+    Never guess IDs: relatedTo's entity id must come from actually searching
+    for that lead/contact/deal first — never invent one. Picklist fields
+    (outcome, callType, overallSentiment, callDisposition, customerEmotion)
+    use internal name (string), not Option ID.
+  example:
+    outcome: "connected"
+    callType: "outgoing"
+    startTime: "2026-05-10T08:00:00.000Z"
+    phoneNumber: "9876543210"
+    relatedTo: {id: 12345, entity: "lead", phoneNumber: "9876543210"}
+
+- id: call_log.update
+  bucket: call_log
+  intent: update
+  method: PUT
+  path: /call-logs/{call_log_id}
+  dynamic_fields: true
+  description: "Update an existing call log."
+  usage_notes: >
+    entity_id: pass the call log ID from search results (this bucket's real
+    parameter name is "entity_id", inherited as-is from the old
+    update_entity tool that actually handled this).
+
+    UNLIKE every other bucket in this registry, call_log update is a FULL
+    REPLACE, not a merge — update_call_log_logic sends field_values straight
+    through as the entire PUT body with no GET-then-merge step first.
+    field_values MUST include every required field again (outcome,
+    startTime, phoneNumber, callType, relatedTo), not just the ones being
+    changed, or Kylas will receive an incomplete record.
+
+    Example: field_values = {"outcome": "connected", "callType": "outgoing",
+    "startTime": "2026-05-10T08:00:00.000Z", "phoneNumber": "9876543210",
+    "relatedTo": {"id": <lead_id>, "entity": "lead", "phoneNumber":
+    "9876543210"}}.
+
+    Same picklist-internal-name and never-guess-IDs rules as call_log.create
+    apply — see call_log.create's usage_notes for the full rules; not
+    repeated verbatim here to avoid duplicating the same text twice.
+  example:
+    entity_id: 321
+    outcome: "connected"
+    callType: "outgoing"
+    startTime: "2026-05-10T08:00:00.000Z"
+    phoneNumber: "9876543210"
+    relatedTo: {id: 12345, entity: "lead", phoneNumber: "9876543210"}
