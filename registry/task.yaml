@@ -261,7 +261,22 @@
     endpoint with a different HTTP method (lead is a GET, the other three
     are POST with a "view=task" filter) — that's a real property of the old
     system, not smoothed into one shared shape here.
-    search_term: optional name to filter results (e.g. "John", "Acme").
+
+    IMPORTANT — search_term must be a SINGLE token (a first name, a last
+    name, or a company/deal name with no spaces), never a full "First
+    Last" name. Confirmed live: for entity_type="contact" (which searches
+    on "name:<search_term>" internally), "test_cont" matches but
+    "test_cont c1" (the contact's real full name) matches nothing at all —
+    same root cause as user.lookup's "name:" field (Kylas's query parser
+    breaks on the space, not a case issue). For entity_type="lead" (which
+    searches on "firstName:<search_term>" internally), a two-word
+    search_term fails for the same reason plus a second one: firstName
+    alone never contains a full "First Last" value to match in the first
+    place. If the user gives a full name, try just the first name (or last
+    name) as search_term, not the whole thing, and tell the user which
+    token you actually searched.
+    search_term: optional name to filter results (e.g. "John", "Acme") —
+    single token, see above.
 
     IMPORTANT — search_term must be a SINGLE token (a first name, a last
     name, or a company/deal name with no spaces), never a full "First
