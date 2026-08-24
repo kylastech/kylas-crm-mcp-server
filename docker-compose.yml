@@ -9,10 +9,6 @@ services:
       - MCP_TRANSPORT=streamable-http
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8000
-      # Optional: "registry" advertises ONLY list_endpoints/build_payload (+ a
-      # short matching instructions block) to a connecting client instead of
-      # the full 36-tool surface. Unset (default) = today's exact behavior.
-      - MCP_TOOL_MODE=${MCP_TOOL_MODE:-all}
       # Optional: fallback API key for single-user / testing
       # - KYLAS_API_KEY=${KYLAS_API_KEY}
       - KYLAS_BASE_URL=${KYLAS_BASE_URL:-https://api.kylas.io/v1}

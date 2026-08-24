@@ -20,6 +20,10 @@ buckets:
   - contact
   - meeting
   - call_log
+  - deal
+  - task
+  - company
+  - quotation
   - _meta
 
 intents:

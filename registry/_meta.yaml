@@ -34,9 +34,9 @@
 #                                (_ORIGINAL_TOOL_PARAMETERS / _real_get_schema).
 #   - Python logic           -> validation, normalization, and the actual
 #                                Kylas API call (lookup_users_logic/
-#                                lookup_products_logic/lookup_pipelines_logic
-#                                in main.py, dispatched via
-#                                _META_LOOKUP_ROUTERS).
+#                                lookup_products_logic/lookup_pipelines_logic/
+#                                get_pipeline_details_logic in main.py,
+#                                dispatched via _META_LOOKUP_ROUTERS).
 # In short: YAML describes what the operation is and how the LLM should use
 # it; runtime Python provides the authoritative request schema and execution
 # behavior. Nothing here should ever try to re-describe the request shape —
@@ -52,6 +52,13 @@
 # user.lookup above — description/usage_notes copied from the real,
 # currently-running lookup_products/lookup_pipelines tools' own docstrings,
 # real endpoints confirmed from lookup_products_logic/lookup_pipelines_logic.
+#
+# pipeline.details is a different real tool (get_pipeline_details_logic) that
+# happens to also be pipeline-related and bucket-less, so it lives here
+# alongside pipeline.lookup rather than inventing a "pipeline" bucket for a
+# single entry. Call pipeline.lookup FIRST to resolve which pipeline the user
+# means; only call pipeline.details once that's confirmed — it returns one
+# already-known pipeline's stages and closing reasons, not a search.
 
 - id: user.lookup
   bucket: _meta
@@ -114,3 +121,30 @@
     "LEAD" (default) or "DEAL". page: 0-based (default 0). size: max 50
     (default 50).
   example: {query: "", entity_type: "LEAD"}
+
+- id: pipeline.details
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /pipelines/{pipeline_id}
+  dynamic_fields: false
+  description: "Get one pipeline's full details — stages and closing reasons — by pipeline ID."
+  usage_notes: >
+    Call pipeline.lookup FIRST and get user confirmation on which pipeline
+    they mean — only call this once that's settled, never to browse
+    pipelines. Returns: pipeline name, stages (id, name, position,
+    forecastingType, ordered by position), sequentialStageFlow flag (if
+    true, stages must be moved one at a time in order — a create/update
+    that jumps ahead is handled automatically server-side, not something
+    you need to work around), unqualifiedReasons (for Closed Unqualified),
+    and lostReasons (for Closed Lost).
+
+    Map user intent (open/closed/won/lost) to a stage id from the returned
+    list for create/update/search. When moving a lead or deal to Closed
+    Lost or Closed Unqualified: show the exact reason strings from
+    lostReasons/unqualifiedReasons, ask the user to pick one, then pass
+    that EXACT string as pipelineStageReason alongside the target
+    pipelineStage id.
+
+    pipeline_id: the pipeline's ID, from pipeline.lookup's results.
+  example: {pipeline_id: 12345}
