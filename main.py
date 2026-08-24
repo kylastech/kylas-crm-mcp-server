@@ -6526,8 +6526,20 @@ async def _fold_field_metadata_into_schema(
         if f.get("type") in ("PICK_LIST", "MULTI_PICKLIST"):
             picklist = f.get("picklist") or {}
             values = picklist.get("values") or picklist.get("picklistValues") or []
+            # "name" (the internal name string, e.g. "ACCOUNTING") was missing here
+            # entirely — only "id" and "label" were ever surfaced. That's fine for
+            # most picklist fields (Option ID is the correct value), but for the
+            # documented exceptions (requirementCurrency, companyBusinessType,
+            # country, timezone, companyIndustry — see this bucket's usage_notes),
+            # the internal name is the ONLY value Kylas accepts, and it can differ
+            # from the label in both case and format (e.g. companyIndustry's
+            # "Accounting" label has internal name "ACCOUNTING"; companyBusinessType's
+            # "Analyst" label has internal name "analyst"). Without "name" here, a
+            # caller had no way to ever produce the correct value for those 5 fields —
+            # confirmed live, every value tried for companyIndustry/companyBusinessType
+            # failed because none of them could be the real internal name.
             summary["options"] = [
-                {"id": v.get("id"), "label": v.get("displayName") or v.get("label") or v.get("name")}
+                {"id": v.get("id"), "name": v.get("name"), "label": v.get("displayName") or v.get("label") or v.get("name")}
                 for v in values if isinstance(v, dict)
             ]
         return summary
@@ -6707,7 +6719,18 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
     semantically wrong, by Kylas's own API). Always returns a normalized JSON
     envelope, never a raw exception and never an unhandled crash:
       success: {"ok": true, "status": 200, "data": <result>}
-      failure: {"ok": false, "error": {"code": "<CODE>", "message": "<why>"}}
+      failure: {"ok": false, "error": {"code": "<CODE>", "message": "<why>",
+                "details": <Kylas's own real error body, when Kylas rejected
+                the request>}}
+
+    ALWAYS read "error.details" when present, before concluding anything
+    about why a request failed — "error.message" alone is often just
+    "<Operation> failed: <status code>" with no real information, while
+    "details" carries Kylas's own specific reason (e.g. a duplicate-value
+    rejection, a required-field validation message, a business-rule lock).
+    Treating a bare message + status code as the full picture is how a
+    genuine data collision (e.g. "phone number already exists") gets
+    misdiagnosed as a payload-building bug — check details FIRST.
 
     "data" on success is whatever that endpoint's real underlying logic already
     returns — do not assume it is always the same shape across ids. For *.get
@@ -6797,10 +6820,20 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
             }, indent=2)
         return json.dumps({"ok": True, "status": 200, "data": result}, default=str, indent=2)
     except KylasAPIError as e:
-        return json.dumps({
-            "ok": False,
-            "error": {"code": str(e.status_code or "KYLAS_ERROR"), "message": e.message},
-        }, indent=2)
+        error_obj = {"code": str(e.status_code or "KYLAS_ERROR"), "message": e.message}
+        # e.response_body is Kylas's own raw error body (set by handle_api_response) —
+        # previously dropped here entirely, leaving only a bare "<op> failed: <code>"
+        # message with zero diagnostic value. Surface it as "details", parsed to a dict
+        # when it's real JSON (the common case) so a caller can read e.g. details.code /
+        # details.message directly, falling back to the raw string otherwise. Absent
+        # (key omitted) when there's no response body at all — e.g. a connection/auth
+        # failure that never reached Kylas.
+        if e.response_body:
+            try:
+                error_obj["details"] = json.loads(e.response_body)
+            except (json.JSONDecodeError, TypeError):
+                error_obj["details"] = e.response_body
+        return json.dumps({"ok": False, "error": error_obj}, indent=2)
     except (KeyError, ValueError, TypeError) as e:
         # Missing/malformed payload field (e.g. lead.get called without "lead_id") —
         # never let this surface as a raw traceback to the client.
