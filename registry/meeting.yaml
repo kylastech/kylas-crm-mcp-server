@@ -1,0 +1,203 @@
+# registry/meeting.yaml
+#
+# Registry entries for the "meeting" bucket — same approach as lead.yaml/contact.yaml.
+#
+# usage_notes below are VERBATIM/assembled from the real, currently-running
+# old system's own text — get_meeting's actual docstring, the generic
+# search_entity/search_entity_by_term/create_entity/update_entity tools'
+# own docstrings (the real registered tools that handle every meeting
+# operation — standalone search_meetings is DEAD CODE, never decorated with
+# @mcp.tool(), never actually registered), and MEETING_SYSTEM_INSTRUCTIONS'
+# own sections. Nothing here is paraphrased or invented.
+#
+# Deliberately has NO meeting.search_idle entry: the old system's real
+# _ENTITY_CONFIG["meeting"]["idle_fn"] is None (confirmed directly in
+# main.py) — meetings never had idle-search support at all. Not an
+# omission; adding one would be inventing a capability that never existed.
+#
+# Unlike lead/contact, meeting.search's filters are OPTIONAL (empty rules =
+# all records, confirmed via _ENTITY_CONFIG entity_type not in ("meeting",
+# "call_log") check in search_entity_logic) — called out explicitly below
+# rather than smoothed into the same wording lead/contact use.
+#
+# NOTE on "schema": there is deliberately no schema: block per entry anymore.
+# build_payload now copies the REAL schema straight from the actual old
+# tools (get_meeting/search_entity/search_entity_by_term/create_entity/
+# update_entity) at call time — see _real_*_schema in main.py. A schema:
+# block here would be dead, unread config exactly like the
+# search_page_offset bug found earlier in this project — better to have
+# none than a copy that can silently drift from the real thing.
+
+- id: meeting.get
+  bucket: meeting
+  intent: get
+  method: GET
+  path: /meetings/{meeting_id}
+  dynamic_fields: false
+  description: "Get full details of a meeting by ID (GET /meetings/{id})."
+  # The real old get_meeting tool's docstring was exactly this one line plus
+  # the param note below — nothing more, same short shape as lead.get.
+  usage_notes: >
+    meeting_id: The meeting ID.
+  example: {meeting_id: 111}
+
+- id: meeting.search
+  bucket: meeting
+  intent: search
+  method: POST
+  path: /meetings/search
+  dynamic_fields: true
+  description: "Filter/search meetings by field criteria."
+  usage_notes: >
+    filters: List of filter objects. Each must have: field (str) — e.g. title,
+    status, from, owner, associatedLeads, participants; operator (str) — e.g.
+    equal, contains, in; value — for status use internal name, for
+    associated* equal use numeric id, for participants use a list containing
+    the FULL participant object from lookup_meeting_related_entity;
+    timeZone (str, optional) — for date/datetime filters.
+
+    Unlike lead/contact/task/deal/company, filters are OPTIONAL for meeting —
+    an empty filter list returns all meetings, it does not error.
+
+    page: 0-based (default 0). size: page size, max 500 (default 20). sort:
+    e.g. "from,desc" (default). Do NOT sort by "scheduledAt" or "updatedAt" —
+    the meetings API only supports a limited set of sortable fields (from,
+    createdAt); those two get silently normalized to "from" internally, but
+    don't rely on that — pass "from,desc" or "createdAt,desc" directly.
+
+    Only [FILTERABLE] fields (from get_meeting_field_instructions) are
+    allowed, plus these synthetic fields the search endpoint accepts even
+    though field metadata omits them: associatedLeads, associatedContacts,
+    associatedDeals, associatedCompanies (type long; equal / is_null /
+    is_not_null) and participants (type participants_lookup; in / not_in
+    only). Status filter values use internal name — "scheduled", "conducted",
+    "missed", "cancelled". Use "from" (start datetime), "to" (end datetime),
+    or "conductedAt" (conducted datetime) for date/time filtering — do NOT
+    use "scheduledAt", it does not exist as a real field (silently mapped to
+    "from" internally, but don't rely on that).
+
+    Never guess IDs — always resolve first: call
+    lookup_meeting_related_entity(entity_type, query) before filtering by
+    associatedLeads/associatedContacts/associatedDeals/associatedCompanies
+    (entity_type: "lead", "contact", "deal", or "company" — use the returned
+    numeric id) or by participants (entity_type="invitee" — use the FULL
+    returned object, e.g. {"id": 123, "entity": "lead", "name": "...",
+    "emails": [...]}, not just the id). For owner: resolve the user via
+    lookup_users(query) first, then filter {"field": "owner", "operator":
+    "equal", "value": <user_id>}. For organizer: resolve via
+    lookup_meeting_related_entity(entity_type="invitee", query) first, then
+    filter {"field": "organizer", "operator": "equal", "value": <user_id>}.
+    Never use search_entity_by_term to search meetings by owner or organizer
+    name — it only searches the title field.
+
+    Pagination: always use the largest page size available. Do NOT
+    auto-fetch all pages sequentially — fetch page 1, show results, then ask
+    if the user wants more. If you receive a 429 error: stop, wait at least
+    5 seconds, then retry once.
+  example:
+    filters: [{field: "status", operator: "equal", value: "scheduled"}]
+
+- id: meeting.create
+  bucket: meeting
+  intent: create
+  method: POST
+  path: /meetings
+  dynamic_fields: true
+  description: "Create a new meeting."
+  usage_notes: >
+    Required: title, from, to (UTC ISO datetime strings), and participants
+    (at least one user, e.g. [{"id": <user_id>, "entity": "user"}]).
+
+    Before creating, ask the user for: title (required); start/end datetime
+    (required — convert to UTC via get_current_user +
+    parse_datetime_to_utc_iso_tool); participants (required — resolve via
+    lookup_meeting_related_entity with entity_type="invitee", pick the row
+    with the correct entity type); related entities (optional — resolve IDs
+    first via the same lookup tool); location and allDay (optional).
+
+    CRITICAL RULES FOR INVITEES: only leads/contacts with a VALID EMAIL can
+    be added as invitees (check the emails array from the lookup result).
+    Deals CANNOT be added as invitees — if the user asks to add a deal as an
+    invitee, do NOT include it in participants and inform them of this
+    restriction; the server also strips any participant with
+    "entity": "deal" and rejects the create entirely if none remain.
+
+    Payload shape:
+    {"title": "...", "from": "<UTC ISO>", "to": "<UTC ISO>", "allDay": false,
+    "timezone": {"id": <tz_picklist_id>, "name": "Asia/Calcutta"},
+    "participants": [{"id": <user_id>, "entity": "user|lead|contact|external"}],
+    "relatedTo": [{"id": <entity_id>, "entity": "lead|contact|deal|company"}],
+    "location": "Office", "description": "..."}
+
+    Resolving entity IDs — never guess: Meeting owner/conductor (CRM
+    users/sales reps) — always lookup_users, never lookup contacts/leads/
+    companies for sales reps. Participants/organizer — lookup_meeting_related_entity
+    with entity_type="invitee" (organizer is usually the row with
+    entity="user"). relatedTo leads/contacts/deals/companies — same tool with
+    entity_type="lead"/"contact"/"deal"/"company" respectively.
+
+    timezone: use the timezone picklist ID from get_meeting_field_instructions,
+    not a bare string. customFieldValues: {"<internalName>": <value>} — never
+    use field ID as the key. Picklist fields: use Option ID (number) from the
+    live tenant_fields below.
+  example:
+    title: "Demo Call"
+    from: "2026-05-10T08:00:00.000Z"
+    to: "2026-05-10T08:30:00.000Z"
+    participants: [{id: 7236, entity: "user"}]
+
+- id: meeting.search_by_term
+  bucket: meeting
+  intent: search_by_term
+  method: POST
+  path: /meetings/search
+  dynamic_fields: false
+  description: "Search/filter meetings by a free-text search term (title only)."
+  usage_notes: >
+    Meetings do not support multi-field free-text search — this searches the
+    "title" field ONLY (contains match). Do NOT use this to find meetings by
+    owner or organizer name; look up their user ID via lookup_users or
+    lookup_meeting_related_entity(entity_type="invitee") instead, then use
+    meeting.search with an "owner" or "organizer" filter.
+
+    Use this ONLY when the user provides a specific search term. NEVER use
+    this tool with wildcard characters ("*"), empty strings, or blank terms.
+    NEVER use this tool when the user asks for "all" meetings — for
+    "all"/"list" queries, use meeting.search with an empty or date-range
+    filter instead.
+
+    search_term: A specific term to match against the meeting title.
+
+    page: 0-based (default 0). size: page size, max 500 (default 20). sort:
+    e.g. "from,desc" (default) — do NOT sort by "scheduledAt" or "updatedAt".
+  example: {search_term: "Demo Call"}
+
+- id: meeting.update
+  bucket: meeting
+  intent: update
+  method: PUT
+  path: /meetings/{meeting_id}
+  dynamic_fields: true
+  description: "Update an existing meeting."
+  usage_notes: >
+    entity_id: pass the meeting ID from search results (this bucket's real
+    parameter name is "entity_id", not "meeting_id" — inherited as-is from
+    the old update_entity tool that actually handled this; meeting.get's own
+    real schema uses "meeting_id" instead — that inconsistency is real, from
+    the old system, not smoothed over here).
+
+    The server GETs the existing meeting first, then merges field_values
+    into it before saving — other fields are left unchanged, this is not a
+    full replace. "participants" and "relatedTo" are merged (deduplicated by
+    id+entity) rather than replaced outright; "customFieldValues" is merged
+    key-by-key. Example: field_values = {"participants": [{"id": <user_id>,
+    "entity": "user"}]} adds a participant without dropping existing ones.
+
+    Same invitee rules as meeting.create apply to any participants being
+    added here: only leads/contacts with a valid email may be invitees,
+    deals can never be invitees. Same picklist Option ID / customFieldValues
+    internal-name / date-UTC-conversion / never-guess-ownerId rules as
+    meeting.create apply to any other field being changed — see
+    meeting.create's usage_notes for the full rules; not repeated verbatim
+    here to avoid duplicating the same text twice.
+  example: {entity_id: 111, participants: [{id: 7236, entity: "user"}]}

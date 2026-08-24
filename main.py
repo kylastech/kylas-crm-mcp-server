@@ -6094,6 +6094,7 @@ _ENTITY_CONFIG = {
         "field_fmt": "standard",
     },
     "meeting": {
+        "get_fn": get_meeting_logic,
         "search_fn": search_meetings_logic,
         "by_term_fn": search_meetings_by_term_logic,
         "idle_fn": None,
@@ -6696,16 +6697,24 @@ def list_tool(
     narrow with bucket/intent once you have a sense of what you're looking for.
 
     Registry contents right now (this will grow — always confirm here rather than
-    assuming an id exists):
-      buckets: lead, contact
-      intents: get, search, create
-      (each bucket currently has exactly one endpoint per intent, e.g. "lead.get")
+    assuming an id exists, since not every bucket has every intent):
+      buckets: lead, contact, meeting, call_log, _meta
+      intents: get, search, search_by_term, search_idle, create, update, lookup
+      (lead has all of get/search/search_by_term/search_idle/create/update;
+      contact and meeting have get/search/search_by_term/create/update but no
+      search_idle; call_log has only search/create/update — no get and no
+      search_by_term; _meta is bucket-less and only has lookup entries, e.g.
+      "user.lookup". Call list_tool(bucket=...) to see exactly which intents
+      a given bucket actually has — don't assume parity across buckets.)
 
-    bucket: restrict to one bucket (e.g. "lead", "contact"). Omit to search every bucket.
-    intent: restrict to one intent — "get", "search", or "create". Omit to match any.
+    bucket: restrict to one bucket (e.g. "lead", "contact", "meeting", "call_log",
+      "_meta"). Omit to search every bucket.
+    intent: restrict to one intent — "get", "search", "search_by_term",
+      "search_idle", "create", "update", or "lookup". Omit to match any.
 
-    Example: list_tool(bucket="lead") returns the 3 lead.* rows (get/search/create),
-    each with its own id and one-line description — nothing more.
+    Example: list_tool(bucket="lead") returns all lead.* rows (get/search/
+    search_by_term/search_idle/create/update), each with its own id and
+    one-line description — nothing more.
     """
     results = []
     for entry in _REGISTRY.values():
@@ -6729,13 +6738,19 @@ def list_tool(
 _BUCKET_FIELD_FETCHERS: Dict[str, Any] = {
     "lead": _fetch_lead_fields,
     "contact": _fetch_contact_fields,
+    "meeting": _fetch_meeting_fields,
+    "call_log": _fetch_call_log_fields,
 }
 
 # Maps a bucket to the real, original get_* tool whose inputSchema
-# build_payload copies verbatim for that bucket's ".get" entry.
+# build_payload copies verbatim for that bucket's ".get" entry. call_log has
+# no entry here on purpose — there is no get-a-single-call-log-by-id tool in
+# the old system (see registry/call_log.yaml's header comment), so it has no
+# ".get" registry entry to need one.
 _REGISTRY_BUCKET_TO_GET_TOOL: Dict[str, str] = {
     "lead": "get_lead",
     "contact": "get_contact",
+    "meeting": "get_meeting",
 }
 
 
@@ -7126,9 +7141,13 @@ tools themselves, on demand.
    build_payload does no validation of its own, on purpose.
 
 ## What's registered right now (call list_tool to confirm, don't assume)
-Buckets: lead, contact. Intents: get, search, create. Each bucket currently
-has exactly one endpoint per intent (e.g. "lead.get", "contact.search").
-This registry is expected to grow over time.
+Buckets: lead, contact, meeting, call_log, plus a bucket-less "_meta" group
+for shared lookups (user.lookup, product.lookup, pipeline.lookup). Intents in
+use: get, search, search_by_term, search_idle, create, update, lookup — but
+NOT every bucket has every intent (e.g. call_log has no "get" or
+"search_by_term"; contact and meeting have no "search_idle"). Always call
+list_tool(bucket=...) to see exactly which ids exist for a bucket before
+assuming one does. This registry is expected to grow over time.
 
 ## Rules that apply across every endpoint, not just one
 - Always call list_tool first if you don't already know the exact id
@@ -7197,7 +7216,7 @@ def _snapshot_original_tool_parameters(tool_name: str) -> None:
 
 
 for _name in (
-    "get_lead", "get_contact",
+    "get_lead", "get_contact", "get_meeting",
     "search_entity", "search_entity_by_term", "search_idle_entities",
     "create_entity", "update_entity",
     "lookup_users", "lookup_products", "lookup_pipelines",
