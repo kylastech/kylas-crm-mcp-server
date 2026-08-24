@@ -224,3 +224,6 @@ kylas-crm-unpacked.zip
 
 # macOS
 .DS_Store
+
+# Tool Contracts
+TOOL_IO_CONTRACT.md

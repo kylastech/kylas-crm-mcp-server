@@ -5,11 +5,13 @@
 # references a bucket/intent not listed here fails validation loudly at
 # import time, before the server accepts any connection.
 #
-# Further buckets (deal, task, company, ...) come in a later step.
+# Further buckets (company, meeting, ...) come in a later step.
 
 buckets:
   - lead
   - contact
+  - deal
+  - task
   - _meta
 
 intents:

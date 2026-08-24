@@ -1,0 +1,206 @@
+# registry/deal.yaml
+#
+# Registry entries for the "deal" bucket — same approach as lead.yaml.
+#
+# usage_notes below are VERBATIM/assembled from the real, currently-running
+# old system's own text — get_deal's actual docstring, search_entity's,
+# search_entity_by_term's, search_idle_entities's, create_entity's, and
+# update_entity's actual docstrings (the real registered tools that handled
+# every deal operation), and SYSTEM_INSTRUCTIONS' COMMON RULES + "Deal
+# Operations" sections (DEAL_SYSTEM_INSTRUCTIONS in main.py).
+#
+# deal.search_idle IS included: the old system's real
+# _ENTITY_CONFIG["deal"]["idle_fn"] is search_idle_deals_logic (confirmed
+# directly in main.py) — deals have idle-search support, same as leads.
+#
+# NOTE on "schema": there is deliberately no schema: block per entry anymore.
+# build_payload now copies the REAL schema straight from the actual old
+# tools (get_deal/search_entity/search_entity_by_term/search_idle_entities/
+# create_entity/update_entity) at call time — see _real_*_schema in main.py.
+# A schema: block here would be dead, unread config exactly like the
+# search_page_offset bug found earlier in this project — better to have
+# none than a copy that can silently drift from the real thing.
+
+- id: deal.get
+  bucket: deal
+  intent: get
+  method: GET
+  path: /deals/{deal_id}
+  dynamic_fields: false
+  description: "Get full details of a deal by ID (GET /deals/{id})."
+  usage_notes: >
+    Use when the user asks for complete deal info, deal details, or to view a
+    specific deal.
+    deal_id: The deal ID (e.g. from search_deals or search_deals_by_term results).
+  example: {deal_id: 12345}
+
+- id: deal.search
+  bucket: deal
+  intent: search
+  method: POST
+  path: /search/deal
+  dynamic_fields: true
+  description: "Filter/search deals by field criteria."
+  usage_notes: >
+    filters: List of filter objects. Each must have: field (str) — Field
+    internal/API name; operator (str) — one of the allowed operators for
+    that field type; value — type depends on field type; timeZone (str,
+    optional) — for date/datetime filters; type (str, optional) — field
+    type, inferred from schema if omitted. Filters are REQUIRED (non-empty)
+    for deal. page: 0-based (default 0). size: page size, max 100
+    (default 20). sort: e.g. "createdAt,desc" (default).
+
+    Only [FILTERABLE] fields (from the live tenant_filterable_fields below)
+    are allowed. PICK_LIST exceptions (use internal name string, not Option
+    ID): currency, country, dealSource.
+
+    Date/datetime fields (filter/search): keep the value in the user's
+    timezone; pass timeZone in the filter (or omit — server uses it). Do NOT
+    convert filter values to UTC.
+
+    Never guess IDs — always resolve first: Users (createdBy, updatedBy,
+    owner, ownerId, assignedTo, etc.) — call lookup_users(query); never use
+    contact or lead lookup tools for employees/users; if multiple matches,
+    list them and ask user to pick. Products — call lookup_products(query);
+    if multiple matches, list and ask. Entity IDs (for association filters) —
+    search for the entity first to get its real ID; never invent IDs.
+
+    Finding deals by product: Call lookup_products(query) to resolve the
+    product name to an ID, then filter with field "products", operator
+    "equal", value <product_id>.
+
+    Pagination: always use the largest page size available. Do NOT
+    auto-fetch all pages sequentially — fetch page 1, show results, then ask
+    if the user wants more. If you receive a 429 error: stop, wait at least
+    5 seconds, then retry once.
+
+    Idle / Stagnant Deals: use search_idle_entities("deal", days) for "no
+    activity for N days" queries. Fallback: search_entity("deal", [...])
+    with updatedAt ≤ threshold AND latestActivityCreatedAt ≤ threshold.
+  example:
+    filters: [{field: "closingDate", operator: "greater_or_equal", value: "2024-01-01"}]
+
+- id: deal.create
+  bucket: deal
+  intent: create
+  method: POST
+  path: /deals
+  dynamic_fields: true
+  description: "Create a new deal."
+  usage_notes: >
+    Build field_values from user input only — no defaults, no extras. Keys:
+    API name for standard fields, or field ID string for custom fields;
+    custom fields go under "customFieldValues": {"<internalName>": <value>} —
+    never use field ID as the key.
+
+    Deal-Specific Field Formats:
+    - Monetary fields (estimatedValue, actualValue, value): must be
+      {"currencyId": <id>, "value": <number>}. Never pass a plain number —
+      API will reject it. (e.g. "estimatedValue": {"currencyId": 431,
+      "value": 32})
+    - Owner (ownedBy): {"id": <user_id>} — resolve via lookup_users.
+      (e.g. "ownedBy": {"id": 7236})
+
+    Pipeline and Stage:
+    - Call lookup_pipelines(entity_type="DEAL") first. List pipelines and
+      confirm with user (even if only one).
+    - Sequential stage flow: If the pipeline has sequentialStageFlow=true,
+      stages cannot be skipped. The server handles this automatically — just
+      pass the desired target stage and the server will handle sequential
+      advancement transparently.
+
+    Products on Deals:
+    Before create/update, ask user for: product name (resolve via
+    lookup_products), quantity, price per unit, currency, and optional
+    discount. Do NOT add without confirming price, quantity, and currency.
+    Format: {"products": [{"id": <product_id>, "quantity": <qty>,
+    "price": {"currencyId": <id>, "value": <price>},
+    "discount": {"value": <disc>, "type": "PERCENTAGE|FLAT"}}]}
+
+    Picklist fields: use Option ID (number) from the live tenant_fields
+    below, except currency, country, dealSource → use internal name
+    (string).
+
+    Date / datetime fields: call get_current_user to get the user's
+    timezone, then call parse_datetime_to_utc_iso_tool(datetime_string,
+    timezone) and use the returned UTC ISO string in field_values.
+
+    Never guess IDs: ownerId and any other user reference (createdBy,
+    updatedBy, assignedTo, etc.) — call lookup_users(query) first; never use
+    contact or lead lookup tools for employees/users; if multiple matches,
+    list them and ask the user to pick.
+  example: {name: "New Deal", estimatedValue: {currencyId: 431, value: 5000}}
+
+- id: deal.search_by_term
+  bucket: deal
+  intent: search_by_term
+  method: POST
+  path: /search/deal
+  dynamic_fields: false
+  description: "Search/filter deals by a free-text search term."
+  usage_notes: >
+    Use this ONLY when the user provides a specific search term (e.g. a
+    name or keyword). NEVER use this tool with wildcard characters
+    ("*"), empty strings, or blank terms. NEVER use this tool when the user
+    asks for "all" records (e.g. "show all deals") — for "all"/"list"
+    queries, use deal.search with a date filter (e.g. updatedAt >= last 90
+    days) instead.
+
+    search_term: A specific term to search across multiple fields (deal
+    name, etc.).
+
+    page: 0-based (default 0). size: page size, max 100 (default 20). sort:
+    e.g. "updatedAt,desc" (default).
+  example: {search_term: "Acme"}
+
+- id: deal.search_idle
+  bucket: deal
+  intent: search_idle
+  method: POST
+  path: /search/deal
+  dynamic_fields: false
+  description: "Search deals that have been idle (no recent activity) for N days."
+  usage_notes: >
+    Use this tool to find stale or neglected deals.
+
+    days: Number of days of inactivity (e.g., 30 = last updated >30 days
+    ago). time_zone: Timezone for date calculation (optional; defaults to
+    current user's timezone or server default). page: 0-based (default 0).
+    size: page size, max 100 (default 20). sort: e.g. "createdAt,desc"
+    (default).
+
+    Fallback if this doesn't cover what's needed: deal.search with
+    updatedAt ≤ threshold AND latestActivityCreatedAt ≤ threshold.
+  example: {days: 30}
+
+- id: deal.update
+  bucket: deal
+  intent: update
+  method: PUT
+  path: /deals/{deal_id}
+  dynamic_fields: true
+  description: "Update an existing deal."
+  usage_notes: >
+    entity_id: pass the deal ID from search results (this bucket's real
+    parameter name is "entity_id", not "deal_id" — inherited as-is from the
+    old update_entity tool that actually handled this; deal.get's own real
+    schema uses "deal_id" instead — that inconsistency is real, from the old
+    system, not smoothed over here).
+
+    Fields are merged over the existing record — other fields are left
+    unchanged, this is not a full replace.
+
+    Move to same-pipeline stage: update with {"pipelineStage": stage_id}.
+    Move to different pipeline: update with {"pipeline": {...},
+    "forecastingType": "..."} with full pipeline object including nested
+    stage. Closing reasons (Closed Lost/Unqualified): call
+    get_pipeline_details, ask user to pick, then pass pipelineStageReason.
+    Sequential stage flow is handled automatically by the server.
+
+    All the same rules as deal.create apply to any field being changed here
+    (monetary field format, ownedBy format, picklist Option ID exceptions,
+    customFieldValues internal-name rule, date/datetime UTC conversion,
+    never guessing ownerId, products format) — see deal.create's
+    usage_notes for the full rules; not repeated verbatim here to avoid
+    duplicating the same text twice.
+  example: {entity_id: 12345, name: "Updated Deal Name"}

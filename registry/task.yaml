@@ -1,0 +1,166 @@
+# registry/task.yaml
+#
+# Registry entries for the "task" bucket — same approach as lead.yaml.
+#
+# usage_notes below are VERBATIM/assembled from the real, currently-running
+# old system's own text — get_task's actual docstring, search_entity's,
+# search_entity_by_term's, create_entity's, and update_entity's actual
+# docstrings (the real registered tools that handled every task operation),
+# and SYSTEM_INSTRUCTIONS' COMMON RULES + "Task Operations" sections.
+#
+# Deliberately has NO task.search_idle entry: the old system's real
+# _ENTITY_CONFIG["task"]["idle_fn"] is None (confirmed directly in
+# main.py) — tasks never had idle-search support at all, unlike leads/deals.
+# Not an omission; adding one would be inventing a capability that never
+# existed.
+#
+# NOTE on "schema": there is deliberately no schema: block per entry anymore.
+# build_payload now copies the REAL schema straight from the actual old
+# tools (get_task/search_entity/search_entity_by_term/create_entity/
+# update_entity) at call time — see _real_*_schema in main.py. A schema:
+# block here would be dead, unread config exactly like the
+# search_page_offset bug found earlier in this project — better to have
+# none than a copy that can silently drift from the real thing.
+
+- id: task.get
+  bucket: task
+  intent: get
+  method: GET
+  path: /tasks/{task_id}
+  dynamic_fields: false
+  description: "Get full details of a task by ID."
+  # The real old get_task tool's docstring was exactly this one line and
+  # nothing else — no param note, same as get_contact. Left short on
+  # purpose; that brevity is real, not something to paper over.
+  usage_notes: ""
+  example: {task_id: 12345}
+
+- id: task.search
+  bucket: task
+  intent: search
+  method: POST
+  path: /tasks/search
+  dynamic_fields: true
+  description: "Filter/search tasks by field criteria."
+  usage_notes: >
+    filters: List of filter objects. Each must have: field (str) — Field
+    internal/API name; operator (str) — one of the allowed operators for
+    that field type; value — type depends on field type; timeZone (str,
+    optional) — for date/datetime filters; type (str, optional) — field
+    type, inferred from schema if omitted. Filters are REQUIRED (non-empty)
+    for task. page: 0-based (default 0). size: page size, max 100
+    (default 20). sort: e.g. "createdAt,desc" (default).
+
+    No pipeline, pipelineStage, emails, or phoneNumbers fields exist for
+    tasks — don't filter by them. Only [FILTERABLE] fields (from the live
+    tenant_filterable_fields below) are allowed.
+
+    Filter tasks by a specific entity ID:
+    - Lead: filter with field "associatedLeads", operator "equal",
+      value <lead_id>
+    - Contact: filter with field "associatedContacts", operator "equal",
+      value <contact_id>
+    - Deal: filter with field "associatedDeals", operator "equal",
+      value <deal_id>
+    - Company: filter with field "associatedCompanies", operator "equal",
+      value <company_id>
+
+    Date/datetime fields (filter/search): keep the value in the user's
+    timezone; pass timeZone in the filter (or omit — server uses it). Do NOT
+    convert filter values to UTC.
+
+    Never guess IDs — always resolve first: Users (createdBy, updatedBy,
+    owner, ownerId, assignedTo, etc.) — call lookup_users(query); never use
+    contact or lead lookup tools for employees/users; if multiple matches,
+    list them and ask user to pick.
+
+    Pagination: always use the largest page size available. Do NOT
+    auto-fetch all pages sequentially — fetch page 1, show results, then ask
+    if the user wants more. If you receive a 429 error: stop, wait at least
+    5 seconds, then retry once.
+  example:
+    filters: [{field: "status", operator: "equal", value: "OPEN"}]
+
+- id: task.create
+  bucket: task
+  intent: create
+  method: POST
+  path: /tasks
+  dynamic_fields: true
+  description: "Create a new task."
+  usage_notes: >
+    No pipeline, pipelineStage, emails, or phoneNumbers fields for tasks.
+
+    Build field_values from user input only — no defaults, no extras. Keys:
+    API name for standard fields, or field ID string for custom fields;
+    custom fields go under "customFieldValues": {"<internalName>": <value>} —
+    never use field ID as the key.
+
+    Association (link task to an entity):
+    "relation": [{"targetEntityId": <id>, "targetEntityType":
+    "LEAD|CONTACT|DEAL|COMPANY", "targetEntityName": "<name>"}]
+
+    Resolve entity before creating/updating a task: Use
+    lookup_entity_for_task(entity_type, search_term) to find the entity ID
+    by name. entity_type: "lead", "contact", "deal", or "company" (internal
+    type, not tenant display name). Returns ID and name to use in the
+    "relation" field above.
+
+    Picklist fields: use Option ID (number) from the live tenant_fields
+    below.
+
+    Date / datetime fields: call get_current_user to get the user's
+    timezone, then call parse_datetime_to_utc_iso_tool(datetime_string,
+    timezone) and use the returned UTC ISO string in field_values.
+
+    Never guess IDs: ownerId and any other user reference (createdBy,
+    updatedBy, assignedTo, etc.) — call lookup_users(query) first; never use
+    contact or lead lookup tools for employees/users; if multiple matches,
+    list them and ask the user to pick.
+  example: {name: "Follow up call", status: "OPEN", priority: "HIGH"}
+
+- id: task.search_by_term
+  bucket: task
+  intent: search_by_term
+  method: POST
+  path: /tasks/search
+  dynamic_fields: false
+  description: "Search/filter tasks by a free-text search term."
+  usage_notes: >
+    Use this ONLY when the user provides a specific search term (e.g. a
+    task name or keyword). NEVER use this tool with wildcard characters
+    ("*"), empty strings, or blank terms. NEVER use this tool when the user
+    asks for "all" records (e.g. "show all tasks") — for "all"/"list"
+    queries, use task.search with a date filter (e.g. updatedAt >= last 90
+    days) instead.
+
+    search_term: A specific term to search across multiple fields (task
+    name, etc.).
+
+    page: 0-based (default 0). size: page size, max 100 (default 20). sort:
+    e.g. "updatedAt,desc" (default).
+  example: {search_term: "Follow up"}
+
+- id: task.update
+  bucket: task
+  intent: update
+  method: PUT
+  path: /tasks/{task_id}
+  dynamic_fields: true
+  description: "Update an existing task."
+  usage_notes: >
+    entity_id: pass the task ID from search results (this bucket's real
+    parameter name is "entity_id", not "task_id" — inherited as-is from the
+    old update_entity tool that actually handled this; task.get's own real
+    schema uses "task_id" instead — that inconsistency is real, from the old
+    system, not smoothed over here).
+
+    Fields are merged over the existing record — other fields are left
+    unchanged, this is not a full replace.
+
+    All the same rules as task.create apply to any field being changed here
+    (relation field format, customFieldValues internal-name rule,
+    date/datetime UTC conversion, never guessing ownerId) — see
+    task.create's usage_notes for the full rules; not repeated verbatim
+    here to avoid duplicating the same text twice.
+  example: {entity_id: 12345, status: "COMPLETED"}

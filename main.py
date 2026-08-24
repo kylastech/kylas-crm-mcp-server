@@ -2866,14 +2866,19 @@ async def get_task_field_instructions() -> str:
 
 
 
+async def get_task_logic(task_id: int) -> Dict[str, Any]:
+    """Fetch a single task by ID (GET /tasks/{id}). Returns raw task dict."""
+    async with get_client() as client:
+        response = await client.get(f"/tasks/{task_id}")
+        return await handle_api_response(response, "Get task")
+
+
 @mcp.tool()
 async def get_task(task_id: int) -> str:
     """Get full details of a task by ID."""
     try:
         _reset_api_call_count()
-        async with get_client() as client:
-            response = await client.get(f"/tasks/{task_id}")
-            task = await handle_api_response(response, "Get task")
+        task = await get_task_logic(task_id)
         return _format_task_for_display(task)
     except KylasAPIError as e:
         return f"✗ Failed to get task: {e.message}\n  Details: {e.response_body}"
@@ -6061,6 +6066,7 @@ _ENTITY_CONFIG = {
         "field_fmt": "standard",
     },
     "task": {
+        "get_fn": get_task_logic,
         "search_fn": search_tasks_logic,
         "by_term_fn": search_tasks_by_term_logic,
         "idle_fn": None,
@@ -6072,6 +6078,7 @@ _ENTITY_CONFIG = {
         "field_fmt": "standard",
     },
     "deal": {
+        "get_fn": get_deal_logic,
         "search_fn": search_deals_logic,
         "by_term_fn": search_deals_by_term_logic,
         "idle_fn": search_idle_deals_logic,
@@ -6697,14 +6704,14 @@ def list_tool(
 
     Registry contents right now (this will grow — always confirm here rather than
     assuming an id exists):
-      buckets: lead, contact
-      intents: get, search, create
-      (each bucket currently has exactly one endpoint per intent, e.g. "lead.get")
+      buckets: lead, contact, deal, task
+      intents: get, search, search_by_term, search_idle, create, update
+      (each bucket has endpoints per supported intent, e.g. "lead.get", "deal.search_idle")
 
-    bucket: restrict to one bucket (e.g. "lead", "contact"). Omit to search every bucket.
-    intent: restrict to one intent — "get", "search", or "create". Omit to match any.
+    bucket: restrict to one bucket (e.g. "lead", "deal"). Omit to search every bucket.
+    intent: restrict to one intent — "get", "search", "create", etc. Omit to match any.
 
-    Example: list_tool(bucket="lead") returns the 3 lead.* rows (get/search/create),
+    Example: list_tool(bucket="deal") returns the deal.* rows (get/search/create/update/search_by_term/search_idle),
     each with its own id and one-line description — nothing more.
     """
     results = []
@@ -6729,6 +6736,8 @@ def list_tool(
 _BUCKET_FIELD_FETCHERS: Dict[str, Any] = {
     "lead": _fetch_lead_fields,
     "contact": _fetch_contact_fields,
+    "deal": _fetch_deal_fields,
+    "task": _fetch_task_fields,
 }
 
 # Maps a bucket to the real, original get_* tool whose inputSchema
@@ -6736,6 +6745,8 @@ _BUCKET_FIELD_FETCHERS: Dict[str, Any] = {
 _REGISTRY_BUCKET_TO_GET_TOOL: Dict[str, str] = {
     "lead": "get_lead",
     "contact": "get_contact",
+    "deal": "get_deal",
+    "task": "get_task",
 }
 
 
@@ -7126,9 +7137,9 @@ tools themselves, on demand.
    build_payload does no validation of its own, on purpose.
 
 ## What's registered right now (call list_tool to confirm, don't assume)
-Buckets: lead, contact. Intents: get, search, create. Each bucket currently
-has exactly one endpoint per intent (e.g. "lead.get", "contact.search").
-This registry is expected to grow over time.
+Buckets: lead, contact, deal, task. Intents: get, search, search_by_term,
+search_idle, create, update. Each bucket has endpoints per supported intent
+(e.g. "lead.get", "deal.search_idle"). This registry is expected to grow.
 
 ## Rules that apply across every endpoint, not just one
 - Always call list_tool first if you don't already know the exact id
@@ -7197,7 +7208,7 @@ def _snapshot_original_tool_parameters(tool_name: str) -> None:
 
 
 for _name in (
-    "get_lead", "get_contact",
+    "get_lead", "get_contact", "get_deal", "get_task",
     "search_entity", "search_entity_by_term", "search_idle_entities",
     "create_entity", "update_entity",
     "lookup_users", "lookup_products", "lookup_pipelines",
