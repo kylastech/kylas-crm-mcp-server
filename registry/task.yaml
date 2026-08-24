@@ -261,6 +261,7 @@
     endpoint with a different HTTP method (lead is a GET, the other three
     are POST with a "view=task" filter) — that's a real property of the old
     system, not smoothed into one shared shape here.
+    search_term: optional name to filter results (e.g. "John", "Acme").
 
     IMPORTANT — search_term must be a SINGLE token (a first name, a last
     name, or a company/deal name with no spaces), never a full "First
