@@ -6147,12 +6147,46 @@ async def search_idle_entities(
 # without the tools' user-facing string format changing at all.
 # ---------------------------------------------------------------------------
 
+def _unwrap_field_values_if_wrapped(field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Guard against the single most common caller mistake for create/update:
+    nesting the real field data one level too deep, e.g.
+        {"field_values": {"firstName": "Jane", "lastName": "Doe"}}
+    instead of the flat shape create_entity_logic/update_entity_logic (and
+    execute_request's create/update intents) actually take:
+        {"firstName": "Jane", "lastName": "Doe"}
+    "field_values" is never itself a real Kylas field name, so if it shows up
+    as a key here with a dict value, it's always this mistake, never a
+    legitimate field. Without this guard, _normalize_field_values's catch-all
+    ("all other standard fields at top level") happily accepts it as a single
+    bogus top-level key, POSTs {"field_values": {...}} to Kylas, and Kylas
+    silently ignores the unrecognized key — producing a real record (ID,
+    owner, timestamps all assigned) with none of the actual field data, a 200
+    response, and no error anywhere to catch. Unwrapping here means the real
+    fields reach _normalize_field_values as intended; any field genuinely
+    named "field_values" cannot exist, so this is safe with no false positives.
+    """
+    if isinstance(field_values, dict) and isinstance(field_values.get("field_values"), dict):
+        unwrapped = dict(field_values)
+        inner = unwrapped.pop("field_values")
+        logger.warning(
+            "create/update field_values arrived wrapped in an extra 'field_values' key — "
+            "unwrapping automatically. Caller should send the fields flat, not nested."
+        )
+        # Any keys that were already flat (unlikely alongside a wrapper, but
+        # possible) win over the unwrapped ones, so we never silently drop
+        # something the caller placed correctly.
+        return {**inner, **unwrapped}
+    return field_values
+
+
 async def create_entity_logic(entity_type: str, field_values: Dict[str, Any]) -> Dict[str, Any]:
     cfg = _ENTITY_CRUD_CONFIG.get(entity_type)
     if not cfg:
         valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
         raise ValueError(f"Unknown entity_type '{entity_type}'. Valid: {valid}")
     _reset_api_call_count()
+    field_values = _unwrap_field_values_if_wrapped(field_values)
     return await cfg["create_fn"](field_values)
 
 
@@ -6162,6 +6196,7 @@ async def update_entity_logic(entity_type: str, entity_id: int, field_values: Di
         valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
         raise ValueError(f"Unknown entity_type '{entity_type}'. Valid: {valid}")
     _reset_api_call_count()
+    field_values = _unwrap_field_values_if_wrapped(field_values)
     return await cfg["update_fn"](entity_id, field_values)
 
 
