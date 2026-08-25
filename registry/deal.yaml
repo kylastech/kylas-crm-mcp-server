@@ -151,7 +151,9 @@
   dynamic_fields: true
   description: "Create a new deal."
   usage_notes: >
-    Build field_values from user input only — no defaults, no extras. Keys:
+    The payload argument you pass to execute_request IS the object below,
+    sent exactly as-is — a flat JSON object with the field names directly as
+    its top-level keys. Build this payload from user input only — no defaults, no extras. Keys:
     API name for standard fields, or field ID string for custom fields;
     custom fields go under "customFieldValues": {"<internalName>": <value>} —
     never use field ID as the key.
@@ -185,7 +187,7 @@
 
     Date / datetime fields: call get_current_user to get the user's
     timezone, then call parse_datetime_to_utc_iso_tool(datetime_string,
-    timezone) and use the returned UTC ISO string in field_values.
+    timezone) and put the returned UTC ISO string directly in the payload.
 
     Never guess IDs: ownedBy and any other user reference — call
     lookup_users(query) first; if multiple matches, list them and ask the
@@ -251,22 +253,26 @@
     schema uses "deal_id" instead — that inconsistency is real, from the old
     system, not smoothed over here).
 
+    Put entity_id and the fields you're changing together in one flat
+    payload object.
+
     Fields are merged over the existing record — other fields are left
     unchanged, this is not a full replace.
 
-    Move to a stage in the SAME pipeline: field_values = {"pipelineStage":
-    <stage_id>}. Move to a DIFFERENT pipeline: field_values = {"pipeline":
-    {...}, "forecastingType": "..."} with the full pipeline object including
-    the nested target stage. Closing reasons (Closed Lost/Unqualified): call
+    Move to a stage in the SAME pipeline: set the payload to
+    {"entity_id": <id>, "pipelineStage": <stage_id>}. Move to a DIFFERENT
+    pipeline: set the payload to {"entity_id": <id>, "pipeline": {...},
+    "forecastingType": "..."} with the full pipeline object including the
+    nested target stage. Closing reasons (Closed Lost/Unqualified): call
     get_pipeline_details for the valid reasons, ask the user to pick, then
-    pass {"pipelineStage": stage_id, "pipelineStageReason": reason}. If the
-    pipeline has sequentialStageFlow=true, the same automatic first-stage
-    fallback described in deal.create applies here too.
+    pass {"entity_id": <id>, "pipelineStage": stage_id, "pipelineStageReason":
+    reason}. If the pipeline has sequentialStageFlow=true, the same automatic
+    first-stage fallback described in deal.create applies here too.
 
-    Adding contacts/products: field_values = {"associatedContacts": [{"id":
-    4942095, "name": "Alice"}], "products": [{"id": 245208, "quantity": 2}]}
-    — existing products/contacts are preserved, new ones are merged
-    (duplicates by ID skipped).
+    Adding contacts/products: set the payload to {"entity_id": <id>,
+    "associatedContacts": [{"id": 4942095, "name": "Alice"}], "products":
+    [{"id": 245208, "quantity": 2}]} — existing products/contacts are
+    preserved, new ones are merged (duplicates by ID skipped).
 
     All the same rules as deal.create apply to any other field being
     changed here (monetary field wrapping, picklist Option ID exceptions,

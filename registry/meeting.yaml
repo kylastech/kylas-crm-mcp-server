@@ -224,12 +224,14 @@
     real schema uses "meeting_id" instead — that inconsistency is real, from
     the old system, not smoothed over here).
 
-    The server GETs the existing meeting first, then merges field_values
-    into it before saving — other fields are left unchanged, this is not a
-    full replace. "participants" and "relatedTo" are merged (deduplicated by
-    id+entity) rather than replaced outright; "customFieldValues" is merged
-    key-by-key. Example: field_values = {"participants": [{"id": <user_id>,
-    "entity": "user"}]} adds a participant without dropping existing ones.
+    Put entity_id and the fields you're changing together in one flat
+    payload object. The server GETs the existing meeting first, then
+    merges this payload into it before saving — other fields are left
+    unchanged, this is not a full replace. "participants" and "relatedTo"
+    are merged (deduplicated by id+entity) rather than replaced outright;
+    "customFieldValues" is merged key-by-key. Example: {"entity_id": 111,
+    "participants": [{"id": <user_id>, "entity": "user"}]} adds a
+    participant without dropping existing ones.
 
     Same invitee rules as meeting.create apply to any participants being
     added here: only leads/contacts with a valid email may be invitees,
