@@ -497,6 +497,15 @@ OPERATOR_SYMBOL_MAP = {
     "lt": "less",
     "ne": "not_equal",
     "eq": "equal",
+    # Verbose forms — common LLM/API convention, normalize to canonical names
+    "greater_than": "greater",
+    "less_than": "less",
+    "greater_than_or_equal": "greater_or_equal",
+    "less_than_or_equal": "less_or_equal",
+    "greater_than_or_equal_to": "greater_or_equal",
+    "less_than_or_equal_to": "less_or_equal",
+    "equals": "equal",
+    "not_equals": "not_equal",
 }
 
 # Picklist fields that use internal name (string) in search; all others use Option ID (long)
