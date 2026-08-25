@@ -333,7 +333,7 @@ performing.
    no arguments first if you don't know what's available yet; narrow with
    bucket/intent once you have a sense of what you're looking for.
 
-2. build_payload(id)
+2. build_payload(id, fields?)
    Get everything about the ONE endpoint you picked: its real HTTP method and
    path, usage_notes (the actual field-shape rules for that specific
    endpoint — read these, they are load-bearing, not decorative), a
@@ -345,6 +345,26 @@ performing.
    (method/path/usage_notes/example) is still correct and usable, only the
    tenant-specific enrichment is missing. This tool never sees or validates
    the payload you go on to build from it.
+
+   A few picklist fields on a real tenant are enormous — timezone alone is
+   ~435 options. Their option lists are omitted by default and shown as
+   "options_count" / "options_omitted" / "uses_internal_name" instead. Every
+   other field, including every small picklist and every custom field, always
+   comes back complete, so this costs you nothing on a normal request. The
+   large ones, with both names each goes by (entities disagree — a lead has
+   "companyIndustry", a company has "industry"):
+
+     timezone, country / companyCountry, companyIndustry / industry,
+     requirementCurrency, companyBusinessType / businessType
+
+   If the user's request actually mentions one of those — "country India",
+   "timezone IST" — pass it in the optional "fields" list to get its real
+   options: build_payload("lead.create", fields=["country"]). Otherwise omit
+   the parameter. If you only realise later that you need one, just call
+   build_payload again naming it; that is always cheaper and always correct
+   compared with guessing an option id or internal name, which you must never
+   do. Note that deal, task and call_log have no large picklists at all, so
+   "fields" does nothing for those buckets.
 
 3. execute_request(id, payload)
    Send the exact payload you built, using the SAME id you called
@@ -6494,8 +6514,87 @@ _REGISTRY_BUCKET_TO_GET_TOOL: Dict[str, str] = {
 }
 
 
+# Per-bucket picklist rules for build_payload's response-slimming.
+#
+#   "large"         - fields whose picklist option arrays are big enough to
+#                     dominate the response. Their options are OMITTED by
+#                     default and only inlined when build_payload's "fields"
+#                     hint names them. Measured on a live QA tenant: timezone
+#                     alone is 435 options / 37 KB — 39% of lead.create's
+#                     entire payload; country 247, companyIndustry 147,
+#                     requirementCurrency 165. Every other picklist on every
+#                     bucket is <= 9 options, so it is always inlined and
+#                     nothing about it changes.
+#   "internal_name" - fields whose accepted value is the option's "name"
+#                     string, not its numeric id. Surfaced as the
+#                     "uses_internal_name" flag when options are omitted,
+#                     because without the inline options the caller can no
+#                     longer see that country's value is "IN" and not 175.
+#
+# BOTH must be per-bucket, not global. The same concept is named differently
+# across entities (lead's companyIndustry is company's industry), and — more
+# importantly — the value FORMAT differs for the same field name: lead's
+# timezone takes an internal name, meeting's timezone takes an Option ID.
+# A single global constant emits confidently wrong uses_internal_name flags
+# for company and meeting, which is worse than emitting nothing at all.
+# Each bucket's "internal_name" is the same constant that bucket's own search
+# rule builder already uses, and each matches that bucket's YAML usage_notes.
+#
+# "large" lists BOTH spellings of each concept on purpose. A spelling that
+# doesn't exist on a bucket simply never matches, so listing both costs
+# nothing and removes the need to know which entity uses which name.
+# deal/task/call_log have empty sets deliberately: deal's four picklists hold
+# 6 options / 346 B in total, so gating them would buy a re-fetch round trip
+# to save ~100 bytes.
+_LARGE_COMPANY_PICKLISTS = {
+    "country", "companycountry",
+    "companyindustry", "industry",
+    "companybusinesstype", "businesstype",
+}
+_BUCKET_PICKLIST_RULES: Dict[str, Dict[str, set]] = {
+    "lead": {
+        "large": {"timezone", "requirementcurrency"} | _LARGE_COMPANY_PICKLISTS,
+        "internal_name": PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "contact": {
+        "large": {"timezone", "requirementcurrency"} | _LARGE_COMPANY_PICKLISTS,
+        "internal_name": PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "company": {
+        "large": {"timezone"} | _LARGE_COMPANY_PICKLISTS,
+        "internal_name": COMPANY_PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "meeting": {
+        "large": {"timezone"},
+        "internal_name": MEETING_PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "deal": {
+        "large": set(),
+        "internal_name": DEAL_PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "task": {
+        "large": set(),
+        "internal_name": PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "call_log": {
+        "large": set(),
+        "internal_name": CALL_LOG_PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    # quotation has no create/update entry in the registry, so it never
+    # reaches the tenant_fields path at all — listed only for completeness.
+    "quotation": {
+        "large": set(),
+        "internal_name": set(),
+    },
+}
+
+
 async def _fold_field_metadata_into_schema(
-    base_schema: Dict[str, Any], fetch_fields_fn: Any, for_search: bool
+    base_schema: Dict[str, Any],
+    fetch_fields_fn: Any,
+    for_search: bool,
+    requested_picklists: Optional[List[str]] = None,
+    bucket: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Fetch this tenant's real field metadata for one bucket (via whichever
@@ -6506,10 +6605,26 @@ async def _fold_field_metadata_into_schema(
     _BUCKET_FIELD_FETCHERS entry, not a new copy of this function.
     for_search=True: adds tenant_filterable_fields (name/type/standard) for building
     filters. for_search=False (create/update): adds tenant_fields.standard/custom,
-    each field including its live picklist option id/label pairs where applicable.
+    each field including its live picklist option id/label pairs — EXCEPT for the
+    handful of oversized picklists listed in _BUCKET_PICKLIST_RULES[bucket]["large"],
+    whose options are omitted unless requested_picklists names them (see below).
+
+    requested_picklists: the caller's "which large picklists do I actually need"
+    hint, straight from build_payload's own "fields" parameter. None or empty
+    means "none of them" — the large picklists are then omitted, which is the
+    common case and the whole point: an unremarkable lead.create drops from
+    ~95 KB to ~24 KB. Names are matched case-insensitively. Names that aren't
+    a large picklist on this bucket are ignored, not an error — every other
+    field is returned in full either way, so a wrong guess costs nothing.
+
+    bucket: the entity bucket ("lead", "company", ...), used to pick that
+    bucket's row in _BUCKET_PICKLIST_RULES. Passing None disables the slimming
+    entirely (unknown bucket -> empty "large" set -> everything inlined), which
+    is the right failure mode: an unrecognised bucket falls back to the old,
+    complete behaviour rather than silently hiding options.
     """
     schema = json.loads(json.dumps(base_schema))  # cheap deep copy, no extra dependency
-    fields = await fetch_fields_fn()
+    fields_meta = await fetch_fields_fn()
 
     if for_search:
         schema["tenant_filterable_fields"] = [
@@ -6519,10 +6634,24 @@ async def _fold_field_metadata_into_schema(
                 "type": f.get("type"),
                 "standard": f.get("standard", False),
             }
-            for f in fields
+            for f in fields_meta
             if f.get("filterable", False)
         ]
+        # requested_picklists is deliberately ignored here: the search path
+        # never emits options at all, so there is nothing to slim.
         return schema
+
+    # Unknown/None bucket falls back to empty sets => nothing is treated as
+    # large => every option is inlined, exactly as before this feature existed.
+    _bucket_rules = _BUCKET_PICKLIST_RULES.get(bucket or "", {})
+    large_fields = {n.lower() for n in _bucket_rules.get("large", set())}
+    internal_name_fields = {n.lower() for n in _bucket_rules.get("internal_name", set())}
+    # Non-strings are skipped rather than raising: this list comes straight
+    # from a model's tool call, and a malformed hint should degrade to "no
+    # hint", never fail the whole build_payload.
+    requested_picklists_set = {
+        n.strip().lower() for n in (requested_picklists or []) if isinstance(n, str)
+    }
 
     def _field_summary(f: Dict[str, Any]) -> Dict[str, Any]:
         summary = {
@@ -6547,15 +6676,37 @@ async def _fold_field_metadata_into_schema(
             # caller had no way to ever produce the correct value for those 5 fields —
             # confirmed live, every value tried for companyIndustry/companyBusinessType
             # failed because none of them could be the real internal name.
-            summary["options"] = [
+            opts = [
                 {"id": v.get("id"), "name": v.get("name"), "label": v.get("displayName") or v.get("label") or v.get("name")}
                 for v in values if isinstance(v, dict)
             ]
+            field_name = (f.get("name") or "").strip().lower()
+            if field_name in large_fields and field_name not in requested_picklists_set:
+                # Oversized picklist the caller didn't ask for. Emit a stub
+                # instead of the array. The stub is deliberately self-
+                # describing — it names the exact re-call that recovers the
+                # options — so this stays usable even for a caller that never
+                # read the docstring, and so no separate lookup endpoint is
+                # needed to make the omission safe.
+                summary["options_count"] = len(opts)
+                summary["options_omitted"] = (
+                    f"{len(opts)} options — omitted to keep this response small. "
+                    f"If you need to set this field, re-call "
+                    f"build_payload(id, fields=[\"{f.get('name')}\"]) to get them. "
+                    f"Do NOT guess an option id or name."
+                )
+                # Without the inline options the caller can no longer see
+                # whether this field wants "IN" or 175 — so say it outright.
+                # Read per-bucket: the same field name disagrees across
+                # entities (lead's timezone is a name, meeting's is an id).
+                summary["uses_internal_name"] = field_name in internal_name_fields
+            else:
+                summary["options"] = opts
         return summary
 
     schema["tenant_fields"] = {
-        "standard": [_field_summary(f) for f in fields if f.get("standard", False)],
-        "custom": [_field_summary(f) for f in fields if not f.get("standard", False)],
+        "standard": [_field_summary(f) for f in fields_meta if f.get("standard", False)],
+        "custom": [_field_summary(f) for f in fields_meta if not f.get("standard", False)],
     }
 
     # Override the static YAML's "required" guess with the REAL required-field
@@ -6565,7 +6716,7 @@ async def _fold_field_metadata_into_schema(
     # registry originally hardcoded lead.create's required as
     # [firstName, lastName, email], but Kylas actually accepted a real create
     # with no email at all. Live data is the only real source of truth here.
-    live_required = [f.get("name") for f in fields if f.get("standard", False) and f.get("required", False)]
+    live_required = [f.get("name") for f in fields_meta if f.get("standard", False) and f.get("required", False)]
     if live_required:
         schema["required"] = live_required
 
@@ -6573,12 +6724,14 @@ async def _fold_field_metadata_into_schema(
 
 
 @mcp.tool()
-async def build_payload(id: str) -> str:
+async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
     """
     Step 2 of 3 in the generic CRM tool flow: get everything about the ONE
-    endpoint you already picked via list_tool. Takes ONLY that id — nothing
-    else — and never sees or checks the values you're about to send; that only
-    happens (if at all) in execute_request, described there.
+    endpoint you already picked via list_tool. Takes that id, plus an optional
+    "fields" hint (described at the bottom) that only controls how much
+    picklist detail comes back — never the values you're about to send. This
+    tool still never sees or checks those values; that only happens (if at
+    all) in execute_request, described there.
 
     Returns a JSON object with these fields:
       id             - the id you asked for, echoed back.
@@ -6609,6 +6762,11 @@ async def build_payload(id: str) -> str:
                        tenant's REAL custom fields (with real picklist option
                        id/label pairs) for create/update, or the real
                        filterable-field list for search. Never placeholder data.
+                       A few oversized picklists (see "fields" below) come back
+                       with "options_count"/"options_omitted" instead of an
+                       "options" array — that is a deliberate size saving, not
+                       a fetch failure, and "options_omitted" tells you exactly
+                       how to get the real options when you need them.
       live_fetch_error - present only when dynamic_fields is true and the live
                        fetch failed (e.g. no credentials configured yet). When
                        this is present, everything else above — method, path,
@@ -6622,6 +6780,52 @@ async def build_payload(id: str) -> str:
     is caught there (or by Kylas itself), never here.
 
     id: an endpoint id from list_tool (e.g. "lead.create", "contact.search").
+
+    fields: OPTIONAL. The names of the LARGE picklist fields you need the full
+      option list for — nothing else. This is not "the fields I intend to
+      set": every field of every type still comes back in full, with its name,
+      displayName, type and required flag, whether or not you pass this.
+
+      A handful of picklists on this tenant are enormous (timezone alone is
+      435 options / ~37 KB, which is 39% of a lead.create response). Their
+      "options" arrays are OMITTED by default and replaced with
+      "options_count" + "options_omitted" + "uses_internal_name". Every other
+      picklist — source, salutation, campaign, companyEmployees, all custom
+      picklists, and so on — is 9 options or fewer and is ALWAYS inlined in
+      full. So the only reason to pass this parameter is when the user has
+      actually mentioned one of the big ones.
+
+      The large picklists, with both spellings each concept goes by (entities
+      disagree on the name — a lead has "companyIndustry", a company has
+      "industry" — so pass whichever name you see in tenant_fields):
+
+        timezone              - the user's/record's time zone (~435 options)
+        country               / companyCountry        (~247 options)
+        companyIndustry       / industry              (~147 options)
+        requirementCurrency                           (~165 options)
+        companyBusinessType   / businessType          (small, listed for
+                                                       consistency with the
+                                                       fields above)
+
+      Which of these exist depends on the entity: lead/contact have all of
+      them, company has the company-prefixed set plus timezone, meeting has
+      only timezone, and deal/task/call_log have none at all (their picklists
+      are small, so this parameter does nothing for those buckets).
+
+      Pass the names as a list, e.g. build_payload("lead.create",
+      fields=["country"]) when the user said "country India", or
+      fields=["country", "timezone"] if they gave both. Matching is
+      case-insensitive. Names that aren't a large picklist on this bucket are
+      simply ignored — a wrong guess is never an error and never hides
+      anything, because everything else is returned in full regardless.
+
+      Omit it whenever the user's request doesn't touch one of the fields
+      above — that's the normal case and it is the cheap one.
+
+      You are never stuck: if a response shows "options_omitted" for a field
+      you turn out to need, just call build_payload again naming that field.
+      Re-calling is idempotent. NEVER guess a picklist option id or internal
+      name to avoid the second call.
     """
     entry = _REGISTRY.get(id)
     if not entry:
@@ -6661,7 +6865,10 @@ async def build_payload(id: str) -> str:
         else:
             try:
                 schema = await _fold_field_metadata_into_schema(
-                    schema, fetch_fields_fn, for_search=(entry["intent"] == "search")
+                    schema, fetch_fields_fn,
+                    for_search=(entry["intent"] == "search"),
+                    requested_picklists=fields,
+                    bucket=entry["bucket"],
                 )
                 fetched_live = True
             except KylasAPIError as e:
