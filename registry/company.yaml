@@ -121,7 +121,9 @@
     No pipeline, pipelineStage, associatedContacts, or products fields exist
     for companies.
 
-    Build field_values from user input only — no defaults, no extras. Keys:
+    The payload argument you pass to execute_request IS the object below,
+    sent exactly as-is — a flat JSON object with the field names directly as
+    its top-level keys. Build this payload from user input only — no defaults, no extras. Keys:
     API name for standard fields, or field ID string for custom fields;
     custom fields go under "customFieldValues": {"<internalName>": <value>} —
     never use field ID as the key.
@@ -146,7 +148,7 @@
 
     Date / datetime fields: call get_current_user to get the user's
     timezone, then call parse_datetime_to_utc_iso_tool(datetime_string,
-    timezone) and use the returned UTC ISO string in field_values.
+    timezone) and put the returned UTC ISO string directly in the payload.
 
     Never guess IDs: ownerId and any other user reference — call
     lookup_users(query) first; if multiple matches, list them and ask the
@@ -205,11 +207,14 @@
     own real schema uses "company_id" instead — that inconsistency is real,
     from the old system, not smoothed over here).
 
+    Put entity_id and the fields you're changing together in one flat
+    payload object.
+
     Fields are merged over the existing record — other fields are left
     unchanged, this is not a full replace.
 
     Phone updates: always include phone_country_code (e.g. "IN", "+91",
-    "US") whenever phone or phoneNumbers is in field_values. Never assume a
+    "US") whenever phone or phoneNumbers is in the payload. Never assume a
     default country.
 
     All the same rules as company.create apply to any field being changed

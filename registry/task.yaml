@@ -181,14 +181,17 @@
     internal type ("lead"/"contact"/"deal"/"company"), not the tenant's
     display name — never invent an ID or name for this field.
 
-    Build field_values from user input only — no defaults, no extras. Keys:
-    API name for standard fields, or field ID string for custom fields;
-    custom fields go under "customFieldValues": {"<internalName>": <value>} —
-    never use field ID as the key.
+    The payload argument you pass to execute_request IS the object shown in
+    "example" below, sent exactly as-is — a flat JSON object with the field
+    names directly as its top-level keys. Build this payload from user
+    input only — no defaults, no extras. Keys: API name for standard
+    fields, or field ID
+    string for custom fields; custom fields go under "customFieldValues":
+    {"<internalName>": <value>} — never use field ID as the key.
 
     Date / datetime fields (e.g. dueDate): call get_current_user to get the
     user's timezone, then call parse_datetime_to_utc_iso_tool(datetime_string,
-    timezone) and use the returned UTC ISO string in field_values.
+    timezone) and put the returned UTC ISO string directly in the payload.
 
     Never guess IDs: assignedTo and any other user reference — call
     lookup_users(query) first; if multiple matches, list them and ask the

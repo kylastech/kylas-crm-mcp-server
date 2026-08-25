@@ -137,7 +137,9 @@
   dynamic_fields: true
   description: "Create a new lead."
   usage_notes: >
-    Build field_values from user input only — no defaults, no extras. Keys:
+    The payload argument you pass to execute_request IS the object below,
+    sent exactly as-is — a flat JSON object with the field names directly as
+    its top-level keys. Build this payload from user input only — no defaults, no extras. Keys:
     API name for standard fields, or field ID string for custom fields;
     custom fields go under "customFieldValues": {"<internalName>": <value>} —
     never use field ID as the key.
@@ -165,15 +167,15 @@
 
     Date / datetime fields: call get_current_user to get the user's
     timezone, then call parse_datetime_to_utc_iso_tool(datetime_string,
-    timezone) and use the returned UTC ISO string in field_values.
+    timezone) and put the returned UTC ISO string directly in the payload.
 
     Never guess IDs: ownerId and any other user reference (createdBy,
     updatedBy, assignedTo, etc.) — call lookup_users(query) first; never use
     contact or lead lookup tools for employees/users; if multiple matches,
     list them and ask the user to pick.
 
-    Example field_values shape: {"firstName": "Jane", "lastName": "Doe",
-    "email": "jane@example.com", "phone": "9876543210",
+    This payload's exact shape, flat, no wrapper key: {"firstName": "Jane",
+    "lastName": "Doe", "email": "jane@example.com", "phone": "9876543210",
     "phone_country_code": "IN", "customFieldValues": {"cfLeadSource":
     "Web"}, "leadSource": <picklist_option_id>}
   example: {firstName: "Jane", lastName: "Doe", email: "jane@x.com"}
@@ -234,12 +236,15 @@
     schema uses "lead_id" instead — that inconsistency is real, from the old
     system, not smoothed over here).
 
+    Put entity_id and the fields you're changing together in one flat
+    payload object: {"entity_id": 12345, "firstName": "Jane", "lastName":
+    "Doe"}.
+
     Fields are merged over the existing record — other fields are left
-    unchanged, this is not a full replace. Example: field_values =
-    {"firstName": "Jane", "lastName": "Doe"}.
+    unchanged, this is not a full replace.
 
     Phone updates: always include phone_country_code (e.g. "IN", "+91",
-    "US") whenever phone or phoneNumbers is in field_values. Never assume a
+    "US") whenever phone or phoneNumbers is in the payload. Never assume a
     default country.
 
     All the same rules as lead.create apply to any field being changed here

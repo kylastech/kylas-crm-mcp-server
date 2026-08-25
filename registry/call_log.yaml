@@ -176,17 +176,20 @@
     parameter name is "entity_id", inherited as-is from the old
     update_entity tool that actually handled this).
 
-    UNLIKE every other bucket in this registry, call_log update is a FULL
-    REPLACE, not a merge — update_call_log_logic sends field_values straight
-    through as the entire PUT body with no GET-then-merge step first.
-    field_values MUST include every required field again (outcome,
-    startTime, phoneNumber, callType, relatedTo), not just the ones being
-    changed, or Kylas will receive an incomplete record.
+    Put entity_id and the fields you're setting together in one flat
+    payload object.
 
-    Example: field_values = {"outcome": "connected", "callType": "outgoing",
-    "startTime": "2026-05-10T08:00:00.000Z", "phoneNumber": "9876543210",
-    "relatedTo": {"id": <lead_id>, "entity": "lead", "phoneNumber":
-    "9876543210"}}.
+    UNLIKE every other bucket in this registry, call_log update is a FULL
+    REPLACE, not a merge — update_call_log_logic sends this payload straight
+    through as the entire PUT body with no GET-then-merge step first. The
+    payload MUST include every required field again (outcome, startTime,
+    phoneNumber, callType, relatedTo), not just the ones being changed, or
+    Kylas will receive an incomplete record.
+
+    Example: {"entity_id": <id>, "outcome": "connected", "callType":
+    "outgoing", "startTime": "2026-05-10T08:00:00.000Z", "phoneNumber":
+    "9876543210", "relatedTo": {"id": <lead_id>, "entity": "lead",
+    "phoneNumber": "9876543210"}}.
 
     Same picklist-internal-name and never-guess-IDs rules as call_log.create
     apply — see call_log.create's usage_notes for the full rules; not
