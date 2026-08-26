@@ -160,3 +160,63 @@
 
     pipeline_id: the pipeline's ID, from pipeline.lookup's results.
   example: {pipeline_id: 12345}
+
+# user.current and datetime.parse below were migrated into the registry from
+# the standalone tool surface (get_current_user / parse_datetime_to_utc_iso_tool)
+# so that only list_tool/build_payload/execute_request/initialize_session stay
+# exposed as top-level tools — everything else, including these two, is now
+# reachable exclusively through the id-based flow. Same architecture as every
+# other entry in this file: description/usage_notes copied from the real
+# tools' own docstrings in main.py, routed via _REGISTRY_ID_TO_META_TOOL /
+# _META_LOOKUP_ROUTERS to those same real tool functions, unchanged.
+
+- id: user.current
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /users/me
+  dynamic_fields: false
+  description: "Get the current authenticated user's own profile — id, IANA timezone, name, recordActions permissions."
+  usage_notes: >
+    Call this whenever a date/datetime-related query is involved (to learn
+    the user's timezone before filtering or converting anything), or
+    whenever you need the current user's own ID (e.g. to set
+    ownerId/createdBy to "me").
+
+    For *.search / *.search_idle date/datetime filters: use the returned
+    timezone as the time_zone for those filters; keep the filter's
+    date/datetime values as-is — do NOT convert them to UTC yourself.
+
+    For *.create / *.update with a date/datetime field: when the user gives
+    a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"),
+    interpret it in this timezone, convert it to UTC with datetime.parse,
+    and send the returned UTC ISO string in the payload.
+
+    For ownerId/createdBy referring to the current user ("assign to me",
+    "created by me"): use the returned id directly — do NOT call
+    user.lookup to resolve yourself by name.
+
+    Takes no parameters at all — payload is always {}.
+  example: {}
+
+- id: datetime.parse
+  bucket: _meta
+  intent: lookup
+  method: "N/A — pure conversion, makes no Kylas API call at all"
+  path: "N/A"
+  dynamic_fields: false
+  description: "Convert a datetime string given in the user's local timezone to the UTC ISO string Kylas *.create/*.update payloads need."
+  usage_notes: >
+    Call user.current first (unless the user's timezone is already known
+    this session) to get their IANA timezone. Then call this with (the
+    datetime exactly as the user said it, that timezone).
+
+    local_datetime: the datetime as the user said it, e.g. "11 Feb 2026
+    7:30 AM", "11th Feb 2026 at 7:30 am" — parsed with dateutil, so common
+    natural-language date formats work.
+    timezone: IANA timezone name (e.g. "Asia/Calcutta"), from user.current.
+
+    Returns a UTC ISO string like "2026-02-11T02:00:00.000Z". Put this
+    directly in the target date/datetime field's value in the *.create/
+    *.update payload — never guess or hand-construct this string yourself.
+  example: {local_datetime: "11 Feb 2026 7:30 AM", timezone: "Asia/Calcutta"}

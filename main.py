@@ -428,11 +428,12 @@ performing.
 ## What's registered right now (call list_tool to confirm, don't assume)
 Buckets: lead, contact, meeting, call_log, deal, task, company, quotation,
 plus a bucket-less "_meta" group for shared lookups (user.lookup,
-product.lookup, pipeline.lookup, pipeline.details). Not every bucket has
-every intent:
+product.lookup, pipeline.lookup, pipeline.details, user.current,
+datetime.parse). Not every bucket has every intent:
   - lead, deal, company: get, search, search_by_term, search_idle, create, update (all 6)
   - contact, meeting: get, search, search_by_term, create, update (no search_idle)
-  - task: get, search, search_by_term, create, update, lookup (task.lookup_entity — no search_idle)
+  - task: get, search, search_by_term, create, update, lookup (task.lookup_entity,
+    task.search_any_relation — no search_idle)
   - call_log: search, create, update, lookup (call_log.by_entity — no get, no search_by_term, no search_idle)
   - meeting also has lookup (meeting.lookup_related), beyond the get/search/search_by_term/create/update above
   - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
@@ -440,24 +441,22 @@ every intent:
 Always call list_tool(bucket=...) to see exactly which ids exist for a
 bucket before assuming one does.
 
-## Standalone utility tools (outside the 3-step flow)
-Only 4 tools don't fit the id-based flow above and stay independently
-callable — everything else lookup/get-shaped lives in the registry instead
-(see pipeline.details, meeting.lookup_related, task.lookup_entity,
-call_log.by_entity above):
-- initialize_session() — call FIRST, once, before anything else (see the
-  mandatory first step at the top of these instructions). Returns this
-  tenant's live session-start context (currently: entity label mapping).
-- get_current_user() — current user's profile/timezone; call before any
-  date/datetime conversion. No bucket concept applies — it's about the
-  calling user, not a CRM entity.
-- parse_datetime_to_utc_iso_tool(local_datetime, timezone) — convert a
-  local datetime to the UTC ISO string create/update payloads need. A pure
-  conversion function; doesn't call the Kylas API at all.
-- search_tasks_with_any_relation(page, size, sort) — tasks linked to ANY
-  entity (4 parallel is_not_null calls, deduplicated) — an OR across 4
-  association fields that a single jsonRule-based filter set (what
-  task.search's payload actually is) cannot express as one filter.
+## Only 4 tools exist outside the id-based flow above
+list_tool, build_payload, execute_request, and initialize_session are the
+ONLY top-level tools in this server — literally everything else, including
+ones with no CRM entity or bucket concept, lives inside the registry and is
+reached only via the 3-step flow:
+  - get_current_user (current user's profile/timezone; call before any
+    date/datetime conversion) -> _meta id "user.current"
+  - parse_datetime_to_utc_iso_tool(local_datetime, timezone) (a pure
+    conversion, no API call) -> _meta id "datetime.parse"
+  - search_tasks_with_any_relation (tasks linked to ANY entity) -> id
+    "task.search_any_relation"
+Never assume one of these still exists as a directly-callable tool by that
+old name — call list_tool to find its id, exactly like any other operation.
+initialize_session() itself stays outside the 3-step flow (it's the one
+thing you call before list_tool even makes sense) — see the mandatory first
+step at the top of these instructions.
 
 ## Rules that apply across every endpoint, not just one
 - Always call list_tool first if you don't already know the exact id
@@ -501,8 +500,8 @@ it empty. Never call *.search_by_term with "*" or a blank term — it returns
 nothing; use *.search with a date filter for "all"/"list" queries instead.
 Tell the user: "Showing records updated in the last 3 months. Specify a
 date range for older records." If the user gives their own date range, use
-that instead. Call get_current_user first if the user's timezone is
-unknown.
+that instead. Resolve id "user.current" (build_payload -> execute_request)
+first if the user's timezone is unknown.
 
 ## REPORT FORMATTING — apply whenever presenting 3+ records or a summary
 Structure every report like this:
@@ -6331,7 +6330,7 @@ async def create_entity(entity_type: str, field_values: Dict[str, Any]) -> str:
        "participants": [{"id": <user_id>, "entity": "user"}],  ← REQUIRED; NO deals
        "relatedTo": [{"id": <lead_id>, "entity": "lead"}],
        "timezone": {"id": 372, "name": "Asia/Calcutta"}}
-      Use get_current_user + parse_datetime_to_utc_iso_tool to convert local time to UTC.
+      Use ids "user.current" + "datetime.parse" (build_payload -> execute_request) to convert local time to UTC.
 
     call_log:
       {"outcome": "connected",                           ← REQUIRED: connected/rejected/busy/no_answer/missed_call/in_progress
@@ -7157,30 +7156,32 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
 # to FastMCP(...) below) is the server's one and only instructions text.
 # ---------------------------------------------------------------------------
 
-# The tools kept advertised to a connecting client. Beyond the 3 core
-# registry tools, this also keeps a small number of standalone utility tools
-# that genuinely cannot be expressed as a registry id:
-#   - get_current_user: no bucket at all — it's about the calling user, not
-#     any CRM entity.
-#   - parse_datetime_to_utc_iso_tool: a pure conversion function, doesn't
-#     even call the Kylas API — not a get/search/create/update on anything.
-#   - search_tasks_with_any_relation: makes 4 parallel is_not_null calls (one
-#     per association field) and dedupes — an OR across 4 fields that a
-#     single jsonRule-based filter set (what task.search's payload actually
-#     is) cannot express as one filter.
-# get_pipeline_details, lookup_meeting_related_entity, lookup_entity_for_task,
-# and get_call_logs used to live here too — they're genuinely lookup/get-shaped
-# (unlike the 3 above) and have since been folded into the registry instead,
-# as pipeline.details (_meta), meeting.lookup_related, task.lookup_entity,
-# and call_log.by_entity respectively — see _REGISTRY_ID_TO_META_TOOL /
-# _META_LOOKUP_ROUTERS below for their dispatch. lookup_users/lookup_products/
-# lookup_pipelines were never listed here either, for the same reason —
-# they're reachable through the _meta bucket (user.lookup/product.lookup/
-# pipeline.lookup).
+# The tools kept advertised to a connecting client — exactly 4, and no
+# others: the 3-step registry flow (list_tool/build_payload/execute_request)
+# plus initialize_session, the mandatory session-start tool. Nothing else is
+# expressible as a top-level tool call any more — every other operation,
+# including ones with no CRM bucket concept, is reachable only through the
+# id-based flow above:
+#   - get_current_user (no bucket at all — it's about the calling user, not
+#     a CRM entity) -> _meta id "user.current"
+#   - parse_datetime_to_utc_iso_tool (a pure conversion function, doesn't
+#     even call the Kylas API) -> _meta id "datetime.parse"
+#   - search_tasks_with_any_relation (4 parallel is_not_null calls, one per
+#     association field, deduped — an OR across 4 fields that a single
+#     jsonRule-based filter set, what task.search's payload actually is,
+#     cannot express as one filter) -> "task.search_any_relation"
+#   - get_pipeline_details, lookup_meeting_related_entity,
+#     lookup_entity_for_task, get_call_logs -> pipeline.details (_meta),
+#     meeting.lookup_related, task.lookup_entity, call_log.by_entity
+#   - lookup_users, lookup_products, lookup_pipelines -> user.lookup,
+#     product.lookup, pipeline.lookup (_meta)
+# All of the above stay defined and @mcp.tool()-decorated exactly as before
+# (_finalize_tool_surface below only ever controls what's ADVERTISED, never
+# deletes the function) so build_payload/execute_request can keep calling
+# them directly — see _REGISTRY_ID_TO_META_TOOL / _META_LOOKUP_ROUTERS for
+# the id -> real tool dispatch.
 _REGISTRY_ONLY_TOOL_NAMES = {
-    "list_tool", "build_payload", "execute_request",
-    "initialize_session", "get_current_user", "parse_datetime_to_utc_iso_tool",
-    "search_tasks_with_any_relation",
+    "list_tool", "build_payload", "execute_request", "initialize_session",
 }
 
 
@@ -7228,6 +7229,7 @@ for _name in (
     "lookup_users", "lookup_products", "lookup_pipelines",
     "get_pipeline_details", "lookup_meeting_related_entity",
     "lookup_entity_for_task", "get_call_logs",
+    "get_current_user", "parse_datetime_to_utc_iso_tool", "search_tasks_with_any_relation",
 ):
     _snapshot_original_tool_parameters(_name)
 
@@ -7245,6 +7247,9 @@ _REGISTRY_ID_TO_META_TOOL: Dict[str, str] = {
     "meeting.lookup_related": "lookup_meeting_related_entity",
     "task.lookup_entity": "lookup_entity_for_task",
     "call_log.by_entity": "get_call_logs",
+    "user.current": "get_current_user",
+    "datetime.parse": "parse_datetime_to_utc_iso_tool",
+    "task.search_any_relation": "search_tasks_with_any_relation",
 }
 
 
@@ -7322,6 +7327,33 @@ async def _call_log_by_entity_router(payload: Dict[str, Any]) -> str:
     )
 
 
+async def _current_user_router(payload: Dict[str, Any]) -> str:
+    # get_current_user takes no parameters at all — payload is ignored.
+    # Same self-catching shape/caveat as _meeting_lookup_related_router above.
+    return await get_current_user()
+
+
+async def _parse_datetime_router(payload: Dict[str, Any]) -> str:
+    # parse_datetime_to_utc_iso_tool is a plain sync function (a pure
+    # conversion, no API call at all) — wrapped in an async def only so this
+    # router has the same awaitable shape execute_request expects of every
+    # entry in _META_LOOKUP_ROUTERS. Same self-catching shape/caveat as
+    # _meeting_lookup_related_router above.
+    return parse_datetime_to_utc_iso_tool(
+        local_datetime=payload["local_datetime"],
+        timezone=payload["timezone"],
+    )
+
+
+async def _task_search_any_relation_router(payload: Dict[str, Any]) -> str:
+    # Same self-catching shape/caveat as _meeting_lookup_related_router above.
+    return await search_tasks_with_any_relation(
+        page=payload.get("page", 0),
+        size=payload.get("size", 20),
+        sort=payload.get("sort", "createdAt,desc"),
+    )
+
+
 # "_meta" entries (and the bucket-scoped lookups below) are NOT
 # entity-CRUD-shaped like lead/contact — each one is its own standalone old
 # tool with its own real signature, so (unlike get/search/create/update)
@@ -7340,6 +7372,9 @@ _META_LOOKUP_ROUTERS: Dict[str, Any] = {
     "meeting.lookup_related": _meeting_lookup_related_router,
     "task.lookup_entity": _task_lookup_entity_router,
     "call_log.by_entity": _call_log_by_entity_router,
+    "user.current": _current_user_router,
+    "datetime.parse": _parse_datetime_router,
+    "task.search_any_relation": _task_search_any_relation_router,
 }
 
 
