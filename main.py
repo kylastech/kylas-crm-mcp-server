@@ -1157,21 +1157,25 @@ async def _fetch_current_user() -> Dict[str, Any]:
 async def get_current_user() -> str:
     """
     Get the current authenticated user's profile from Kylas (GET /users/me).
-    Call this whenever a date or datetime-related query is involved.
-    Returns timezone (IANA, e.g. Asia/Calcutta), recordActions (call, email, sms, etc.), name, and other profile fields.
+    Call this whenever a date or datetime-related query is involved, or whenever
+    you need the current user's own ID (e.g. to set ownerId/createdBy to "me").
+    Returns id, timezone (IANA, e.g. Asia/Calcutta), recordActions (call, email, sms, etc.), name, and other profile fields.
     - For filtering (search_leads, search_idle_leads): use the returned timezone as the timeZone in date/datetime filters; keep the user's date/datetime as-is (do not convert to UTC).
     - For create_lead: when the user provides a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone, convert to UTC using parse_datetime_to_utc_iso, and send the UTC ISO string in field_values.
+    - For ownerId/createdBy referring to the current user (e.g. "assign to me", "create a lead owned by me"): use the returned id directly — do NOT call user.lookup/lookup_users to resolve yourself by name.
     """
     try:
         _reset_api_call_count()
         logger.info("Fetching current user (users/me)")
         user = await _fetch_current_user()
+        user_id = user.get("id")
         tz = user.get("timezone") or "UTC"
         name = user.get("name") or f"{user.get('firstName', '')} {user.get('lastName', '')}".strip() or "—"
         lines = [
             "=" * 50,
             "CURRENT USER (GET /users/me)",
             "=" * 50,
+            f"ID: {user_id}",
             f"Name: {name}",
             f"Timezone: {tz}",
             "",
@@ -1185,6 +1189,7 @@ async def get_current_user() -> str:
             "Use this timezone for:",
             "  - Date/datetime filters in search_leads: pass timeZone in each date filter; do not convert filter values to UTC.",
             "  - create_lead with datetime fields: convert user's local datetime to UTC with parse_datetime_to_utc_iso, then send UTC ISO in field_values.",
+            f"Use this ID ({user_id}) directly for ownerId/createdBy when the action refers to the current user — no need for a separate user.lookup call.",
             "=" * 50,
         ])
         return "\n".join(lines)
