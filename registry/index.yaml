@@ -1,0 +1,36 @@
+# registry/index.yaml
+#
+# Closed enums the startup validator checks every registry entry against.
+# Adding a new bucket or intent means adding it here FIRST — an entry that
+# references a bucket/intent not listed here fails validation loudly at
+# import time, before the server accepts any connection.
+#
+# Further buckets (deal, task, company, ...) come in a later step.
+#
+# NOTE: this file only ever defines the closed vocabulary (buckets/intents)
+# that entries elsewhere in this directory must conform to — it carries no
+# operation metadata, usage_notes, or request/input schema of its own, and
+# is not part of the schema-resolution path. See any bucket file (e.g.
+# contact.yaml) for the full explanation of why request schemas live in
+# main.py (_ORIGINAL_TOOL_PARAMETERS / _real_*_schema, resolved at runtime
+# by build_payload) rather than in YAML.
+
+buckets:
+  - lead
+  - contact
+  - meeting
+  - call_log
+  - deal
+  - task
+  - company
+  - quotation
+  - _meta
+
+intents:
+  - get
+  - search
+  - search_by_term
+  - search_idle
+  - create
+  - update
+  - lookup

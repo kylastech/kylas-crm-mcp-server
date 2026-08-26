@@ -1,0 +1,224 @@
+# registry/contact.yaml
+#
+# Registry entries for the "contact" bucket — same approach as lead.yaml.
+#
+# ARCHITECTURE — what lives here vs. what lives in main.py
+# ---------------------------------------------------------------------------
+# Each entry below is static operation metadata and LLM-facing guidance only:
+# id, bucket, intent, method, path, dynamic_fields, description, usage_notes,
+# example. There is deliberately no "schema:" block for the request/input
+# shape — that would duplicate a schema that already exists elsewhere in this
+# codebase, and a duplicate copy can silently drift from the real thing (see
+# the search_page_offset bug found earlier in this project as a concrete
+# example of exactly that failure mode).
+#
+# Instead, build_payload (main.py) resolves the real input schema at request
+# time from the original, already-registered MCP tool schemas it snapshots
+# into _ORIGINAL_TOOL_PARAMETERS, via the _real_get_schema / _real_search_schema
+# / _real_search_by_term_schema / _real_create_schema / _real_update_schema
+# helpers — for contact specifically: get_contact's, search_entity's,
+# search_entity_by_term's, create_entity's, and update_entity's actual
+# inputSchema, copied verbatim, never re-authored here. For entries where
+# dynamic_fields is true, build_payload additionally fetches this tenant's
+# live field metadata (via _fetch_contact_fields) and folds the real custom
+# fields and picklist option id/label pairs into that schema before
+# returning it — so the request shape a caller actually sees is always live,
+# tenant-accurate data, not a static guess baked into this file.
+#
+# The sources of truth are intentionally kept separate, on purpose:
+#   - YAML (this file)       -> what the operation is, how to route it, and
+#                                how an LLM should use it (usage_notes/example).
+#   - Runtime Python schemas -> the authoritative request/input shape
+#                                (_ORIGINAL_TOOL_PARAMETERS / _real_*_schema).
+#   - Live tenant metadata   -> this tenant's own custom fields and
+#                                picklist/option values, fetched on demand.
+#   - Python logic           -> validation, normalization, dispatch, and the
+#                                actual Kylas API call (contact.create/update/
+#                                get/search/search_by_term's real *_logic
+#                                functions in main.py).
+# In short: YAML describes what the operation is and how the LLM should use
+# it; runtime Python provides the authoritative request schema and execution
+# behavior. Nothing here should ever try to re-describe the request shape —
+# that description belongs to main.py alone, so there is exactly one place
+# it can drift from reality, and it isn't this file.
+#
+# usage_notes below are VERBATIM/assembled from the real, currently-running
+# old system's own text — get_contact's actual docstring, search_entity's,
+# search_entity_by_term's, create_entity's, and update_entity's actual
+# docstrings (the real registered tools that handled every contact
+# operation), and SYSTEM_INSTRUCTIONS' COMMON RULES + "Contact Operations"
+# sections. Deliberately does NOT include the extra associatedLeads/
+# associatedDeals/associatedCompanies filter fields an earlier draft of this
+# file had — that detail came from search_contacts's own docstring, which is
+# DEAD CODE (never decorated with @mcp.tool(), never actually registered),
+# so it was never really part of what the old system sent to a live client.
+# Excluded on that basis, not an oversight.
+#
+# Also deliberately has NO contact.search_idle entry: the old system's real
+# _ENTITY_CONFIG["contact"]["idle_fn"] is None (confirmed directly in
+# main.py) — contacts never had idle-search support at all, unlike leads.
+# Not an omission; adding one would be inventing a capability that never
+# existed.
+
+- id: contact.get
+  bucket: contact
+  intent: get
+  method: GET
+  path: /contacts/{contact_id}
+  dynamic_fields: false
+  description: "Get full details of a contact by ID."
+  # The real old get_contact tool's docstring was exactly this one line and
+  # nothing else — no param note, unlike get_lead's. Left short on purpose;
+  # that asymmetry is real, not something to paper over by inventing parity.
+  usage_notes: ""
+  example: {contact_id: 67890}
+
+- id: contact.search
+  bucket: contact
+  intent: search
+  method: POST
+  path: /search/contact
+  dynamic_fields: true
+  description: "Filter/search contacts by field criteria."
+  usage_notes: >
+    filters: List of filter objects. Each must have: field (str) — Field
+    internal/API name; operator (str) — one of the allowed operators for
+    that field type; value — type depends on field type; timeZone (str,
+    optional) — for date/datetime filters; type (str, optional) — field
+    type, inferred from schema if omitted. Filters are REQUIRED (non-empty)
+    for contact. page: 0-based (default 0). size: page size, max 100
+    (default 20). sort: e.g. "createdAt,desc" (default).
+
+    No pipeline or pipelineStage fields exist for contacts — don't filter by
+    them. Only [FILTERABLE] fields (from the live tenant_filterable_fields
+    below) are allowed. PICK_LIST/MULTI_PICKLIST: use Option ID, except
+    requirementCurrency, companyBusinessType, country, timezone,
+    companyIndustry → use internal name.
+
+    Date/datetime fields (filter/search): keep the value in the user's
+    timezone; pass timeZone in the filter (or omit — server uses it). Do NOT
+    convert filter values to UTC.
+
+    Never guess IDs — always resolve first: Users (createdBy, updatedBy,
+    owner, ownerId, assignedTo, etc.) — call lookup_users(query); never use
+    contact or lead lookup tools for employees/users; if multiple matches,
+    list them and ask user to pick. Products — call lookup_products(query);
+    if multiple matches, list and ask. Entity IDs (for association filters) —
+    search for the entity first to get its real ID; never invent IDs.
+
+    Pagination: always use the largest page size available. Do NOT
+    auto-fetch all pages sequentially — fetch page 1, show results, then ask
+    if the user wants more. If you receive a 429 error: stop, wait at least
+    5 seconds, then retry once.
+  example:
+    filters: [{field: "createdAt", operator: "greater_or_equal", value: "2024-01-01T00:00:00.000Z"}]
+
+- id: contact.create
+  bucket: contact
+  intent: create
+  method: POST
+  path: /contacts
+  dynamic_fields: true
+  description: "Create a new contact."
+  usage_notes: >
+    No pipeline, pipelineStage, associatedContacts, or products fields exist
+    for contacts.
+
+    The payload argument you pass to execute_request IS the object below,
+    sent exactly as-is — a flat JSON object with the field names directly as
+    its top-level keys. Build this payload from user input only — no defaults, no extras. Keys:
+    API name for standard fields, or field ID string for custom fields;
+    custom fields go under "customFieldValues": {"<internalName>": <value>} —
+    never use field ID as the key.
+
+    Phone: Shorthand "phone": "9876543210" + "phone_country_code": "IN"
+    (2-letter code or dial prefix e.g. "+91"). Full array: "phoneNumbers":
+    [{"value": "9876543210", "code": "IN", "type": "MOBILE", "primary":
+    true}] — still include "phone_country_code" at top level even with full
+    array. REQUIRED: if the user gave a phone number but NO country/dial
+    code, do NOT call this tool — ask them first. REQUIRED: if the user gave
+    a phone number but NO phone type, do NOT call this tool — ask them
+    first: "Is this number MOBILE, WORK, HOME, or PERSONAL?" Include
+    "phone_type": "<TYPE>" at top level alongside "phone_country_code".
+    Phone types: MOBILE, WORK, HOME, PERSONAL. First entry is primary by
+    default.
+
+    Email: Shorthand "email": "user@example.com" (becomes OFFICE, primary).
+    Full array: "emails": [{"value": "user@example.com", "type": "OFFICE",
+    "primary": true}]. Email types: OFFICE, PERSONAL. Exactly one must be
+    primary.
+
+    Picklist fields: use Option ID (number) from the live tenant_fields
+    below, except requirementCurrency, companyBusinessType, country,
+    timezone, companyIndustry → use internal name (string).
+
+    Date / datetime fields: call get_current_user to get the user's
+    timezone, then call parse_datetime_to_utc_iso_tool(datetime_string,
+    timezone) and put the returned UTC ISO string directly in the payload.
+
+    Never guess IDs: ownerId and any other user reference (createdBy,
+    updatedBy, assignedTo, etc.) — call lookup_users(query) first; never use
+    contact or lead lookup tools for employees/users; if multiple matches,
+    list them and ask the user to pick.
+
+    This payload's exact shape, flat, no wrapper key (lead/contact share the
+    same shape): {"firstName": "Jane", "lastName": "Doe", "email":
+    "jane@example.com", "phone": "9876543210", "phone_country_code": "IN",
+    "customFieldValues": {"cfLeadSource": "Web"}, "leadSource":
+    <picklist_option_id>}
+  example: {firstName: "John", lastName: "Smith", email: "john@x.com"}
+
+- id: contact.search_by_term
+  bucket: contact
+  intent: search_by_term
+  method: POST
+  path: /search/contact
+  dynamic_fields: false
+  description: "Search/filter contacts by a free-text search term."
+  usage_notes: >
+    Use this ONLY when the user provides a specific search term (e.g. a
+    name, email, or keyword). NEVER use this tool with wildcard characters
+    ("*"), empty strings, or blank terms. NEVER use this tool when the user
+    asks for "all" records (e.g. "show all contacts") — for "all"/"list"
+    queries, use contact.search with a date filter (e.g. updatedAt >= last
+    90 days) instead.
+
+    search_term: A specific term to search across multiple fields (first
+    name, last name, email, phone, etc.).
+
+    page: 0-based (default 0). size: page size, max 100 (default 20). sort:
+    e.g. "updatedAt,desc" (default).
+  example: {search_term: "John"}
+
+- id: contact.update
+  bucket: contact
+  intent: update
+  method: PUT
+  path: /contacts/{contact_id}
+  dynamic_fields: true
+  description: "Update an existing contact."
+  usage_notes: >
+    entity_id: pass the contact ID from search results (this bucket's real
+    parameter name is "entity_id", not "contact_id" — inherited as-is from
+    the old update_entity tool that actually handled this; contact.get's
+    own real schema uses "contact_id" instead — that inconsistency is real,
+    from the old system, not smoothed over here).
+
+    Put entity_id and the fields you're changing together in one flat
+    payload object: {"entity_id": 12345, "firstName": "Jane", "lastName":
+    "Doe"}.
+
+    Fields are merged over the existing record — other fields are left
+    unchanged, this is not a full replace.
+
+    Phone updates: always include phone_country_code (e.g. "IN", "+91",
+    "US") whenever phone or phoneNumbers is in the payload. Never assume a
+    default country.
+
+    All the same rules as contact.create apply to any field being changed
+    here (email/phone shorthand, picklist Option ID exceptions,
+    customFieldValues internal-name rule, date/datetime UTC conversion,
+    never guessing ownerId) — see contact.create's usage_notes for the full
+    rules; not repeated verbatim here to avoid duplicating the same text
+    twice.
+  example: {entity_id: 67890, firstName: "Jane", lastName: "Doe"}

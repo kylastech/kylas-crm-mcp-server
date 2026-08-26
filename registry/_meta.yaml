@@ -1,0 +1,162 @@
+# registry/_meta.yaml
+#
+# Bucket-less shared reference lookups — added specifically to close a real
+#
+# that id existed anywhere in the registry, so that hint pointed nowhere.
+#
+# ARCHITECTURE — what lives here vs. what lives in main.py
+# ---------------------------------------------------------------------------
+# Each entry below is static operation metadata and LLM-facing guidance only:
+# id, bucket, intent, method, path, dynamic_fields, description, usage_notes,
+# example. There is deliberately no "schema:" block for the request/input
+# shape here either, for the same reason as every other bucket file in this
+# registry: duplicating a schema that already exists elsewhere can silently
+# drift from the real thing (see the search_page_offset bug found earlier in
+# this project as a concrete example of exactly that failure mode).
+#
+# Instead, build_payload (main.py) resolves the real input schema at request
+# time via _real_get_schema, applied to whichever real original tool
+# _REGISTRY_ID_TO_META_TOOL maps this id's bucket-less id to — lookup_users
+# for user.lookup, lookup_products for product.lookup, lookup_pipelines for
+# pipeline.lookup — copying that tool's actual inputSchema verbatim, never
+# re-authored here. All three entries below have dynamic_fields: false, so
+# unlike the lead/contact/meeting/call_log bucket files, there is no live
+# tenant field/picklist enrichment step for _meta entries — the schema
+# build_payload returns is exactly that snapshotted tool schema, nothing
+# folded in on top of it. execute_request then dispatches each id to its own
+# small router in _META_LOOKUP_ROUTERS (main.py), which calls that same real
+# tool's underlying *_logic function.
+#
+# The sources of truth are intentionally kept separate, on purpose:
+#   - YAML (this file)       -> what the operation is, how to route it, and
+#                                how an LLM should use it (usage_notes/example).
+#   - Runtime Python schemas -> the authoritative request/input shape
+#                                (_ORIGINAL_TOOL_PARAMETERS / _real_get_schema).
+#   - Python logic           -> validation, normalization, and the actual
+#                                Kylas API call (lookup_users_logic/
+#                                lookup_products_logic/lookup_pipelines_logic/
+#                                get_pipeline_details_logic in main.py,
+#                                dispatched via _META_LOOKUP_ROUTERS).
+# In short: YAML describes what the operation is and how the LLM should use
+# it; runtime Python provides the authoritative request schema and execution
+# behavior. Nothing here should ever try to re-describe the request shape —
+# that description belongs to main.py alone, so there is exactly one place
+# it can drift from reality, and it isn't this file.
+#
+# description/usage_notes copied from the real, currently-running old
+# lookup_users tool's own docstring — not written from scratch. Real
+# endpoint (GET /users/lookup) confirmed from lookup_users_logic's own
+# docstring in main.py.
+#
+# product.lookup and pipeline.lookup follow the exact same pattern as
+# user.lookup above — description/usage_notes copied from the real,
+# currently-running lookup_products/lookup_pipelines tools' own docstrings,
+# real endpoints confirmed from lookup_products_logic/lookup_pipelines_logic.
+#
+# pipeline.details is a different real tool (get_pipeline_details_logic) that
+# happens to also be pipeline-related and bucket-less, so it lives here
+# alongside pipeline.lookup rather than inventing a "pipeline" bucket for a
+# single entry. Call pipeline.lookup FIRST to resolve which pipeline the user
+# means; only call pipeline.details once that's confirmed — it returns one
+# already-known pipeline's stages and closing reasons, not a search.
+
+- id: user.lookup
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /users/lookup
+  dynamic_fields: false
+  description: "Look up users by name, or list all users in the system."
+  usage_notes: >
+    Use return_all=True (with query "name:" or empty) to fetch all users in
+    one response (all pages combined). For name search: query in
+    field:value form (e.g. "firstName:last", "name:Last"). If one user is
+    found, use that ID for the field you were resolving (e.g. ownerId); if
+    multiple, list them and ask the user which one they mean — never guess.
+
+    IMPORTANT — "name:" only matches a SINGLE token, never a full "First
+    Last" name (confirmed live: "name:Janardan" and "name:Borse" each
+    match, but "name:Janardan Borse" matches nothing at all — Kylas's own
+    query parser breaks on the space, it is not a case-sensitivity issue).
+    If the user gives a full name, do NOT build "name:<first> <last>" —
+    either use "firstName:<first>" (matches first name only, most
+    reliable for a full name given by the user) or "name:<one token>"
+    (last name alone also works under "name:"). Never silently drop half
+    the name and call it a match without telling the user which token was
+    actually searched.
+
+    query: Search string (e.g. "firstName:last", "name:Last") — value must
+    be a single token, see above. Use "name:" or leave default to list all
+    when return_all=True. page: 0-based (default 0), ignored when
+    return_all=True. size: max 50 (default 50), used per page when
+    return_all=True. return_all: if True, fetch all pages and return every
+    user in one response (cap 500).
+  example: {query: "firstName:John"}
+
+- id: product.lookup
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /products/lookup
+  dynamic_fields: false
+  description: "Look up products by name. Use this BEFORE filtering leads or deals by product when the user gives a product name."
+  usage_notes: >
+    If one product is found, use that product's ID when filtering leads or
+    deals (e.g. filter field "products", operator "equal", value <id> — works
+    for both leads and deals). If multiple products are found, ask the user
+    which product they mean (list the options), then use the chosen
+    product's ID — never guess.
+
+    query: Search string. Use "name:<product_name>" (e.g. "name:Widget") or
+    just the product name (e.g. "Widget"); if no ":" is present the server
+    sends it as name:value to the API. page: 0-based (default 0). size: max
+    50 (default 50).
+  example: {query: "name:Widget"}
+
+- id: pipeline.lookup
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /pipelines/lookup
+  dynamic_fields: false
+  description: "Look up pipelines by name for leads or deals. Use when the user asks for items by stage (e.g. open/closed/won) but does not specify which pipeline."
+  usage_notes: >
+    Call this first; do NOT look up pipeline stages until after the user has
+    confirmed the pipeline. Present the pipeline(s) (id and name) and ask the
+    user which pipeline they mean — even if only one is found, still ask for
+    confirmation. Only after confirmation, look up that pipeline's stages,
+    then map user intent (open/closed/won/lost) to stage id(s) for
+    search/update.
+
+    query: Search string. Use "name:<pipeline_name>" or just the pipeline
+    name; empty string returns all pipelines for the entity. entity_type:
+    "LEAD" (default) or "DEAL". page: 0-based (default 0). size: max 50
+    (default 50).
+  example: {query: "", entity_type: "LEAD"}
+
+- id: pipeline.details
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /pipelines/{pipeline_id}
+  dynamic_fields: false
+  description: "Get one pipeline's full details — stages and closing reasons — by pipeline ID."
+  usage_notes: >
+    Call pipeline.lookup FIRST and get user confirmation on which pipeline
+    they mean — only call this once that's settled, never to browse
+    pipelines. Returns: pipeline name, stages (id, name, position,
+    forecastingType, ordered by position), sequentialStageFlow flag (if
+    true, stages must be moved one at a time in order — a create/update
+    that jumps ahead is handled automatically server-side, not something
+    you need to work around), unqualifiedReasons (for Closed Unqualified),
+    and lostReasons (for Closed Lost).
+
+    Map user intent (open/closed/won/lost) to a stage id from the returned
+    list for create/update/search. When moving a lead or deal to Closed
+    Lost or Closed Unqualified: show the exact reason strings from
+    lostReasons/unqualifiedReasons, ask the user to pick one, then pass
+    that EXACT string as pipelineStageReason alongside the target
+    pipelineStage id.
+
+    pipeline_id: the pipeline's ID, from pipeline.lookup's results.
+  example: {pipeline_id: 12345}
