@@ -228,10 +228,10 @@ def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) ->
         return ""
 
     lines = [
-        "## ENTITY NAME ROUTING — CALL get_entity_labels() FIRST, THEN USE THESE RULES",
+        "## ENTITY NAME ROUTING — CALL initialize_session() FIRST, THEN USE THESE RULES",
         "",
         "This tenant has renamed CRM entities. When the user mentions any of the names below,",
-        "call get_entity_labels() to confirm, then use the standard type for all tool calls:",
+        "call initialize_session() to confirm, then use the standard type for all tool calls:",
         "",
     ]
 
@@ -241,12 +241,12 @@ def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) ->
         display_plural = label_data.get("displayNamePlural", entity_type)
         std_type = entity_type.lower()
         lines.append(
-            f'- If user says "{display_name}" or "{display_plural}" → call get_entity_labels(), '
+            f'- If user says "{display_name}" or "{display_plural}" → call initialize_session(), '
             f'then use standard type "{std_type}" in all tool calls'
         )
 
     lines.append("")
-    lines.append('DO NOT tell the user an entity "doesn\'t exist" before calling get_entity_labels().')
+    lines.append('DO NOT tell the user an entity "doesn\'t exist" before calling initialize_session().')
 
     return "\n".join(lines)
 
@@ -273,6 +273,38 @@ async def _load_entity_labels() -> Dict[str, Dict[str, str]]:
         logger.warning(f"Failed to load entity labels: {e}")
         _ENTITY_LABELS = {}
         return {}
+
+
+async def _fetch_entity_labels() -> Dict[str, Dict[str, str]]:
+    """
+    Raw-data fetch for initialize_session()'s Entity Label Mapping section.
+    Returns the cached tenant label mapping (loaded at startup and kept
+    fresh by _label_refresh_loop) — no live API call here, so this is cheap
+    to call on every session start.
+    """
+    return _ENTITY_LABELS
+
+
+# ---------------------------------------------------------------------------
+# Session-start context: each entry is (description, async_fetch_fn).
+# async_fetch_fn() returns the raw data (typically a dict) for that piece of
+# context; initialize_session() below JSON-dumps it under the description,
+# unchanged. To add a new piece of session-start context later: write its
+# description here, write (or reuse) an async function that fetches its raw
+# data, and add one line — nothing else about initialize_session() needs to
+# change. Only entries actually wired up and used belong here, not
+# placeholders for ideas.
+# ---------------------------------------------------------------------------
+_SESSION_CONTEXT: List[Tuple[str, Any]] = [
+    (
+        "Entity Label Mapping — this tenant's custom display names for CRM "
+        "entities, keyed by standard entity type. When the user refers to "
+        "an entity by one of the displayName/displayNamePlural values "
+        "below, use that entry's key as the standard type in all tool "
+        "calls.",
+        _fetch_entity_labels,
+    ),
+]
 
 
 async def _label_refresh_loop(interval_seconds: int = 1800) -> None:
@@ -314,6 +346,26 @@ if not API_KEY:
 
 SYSTEM_INSTRUCTIONS = """
 # Kylas CRM MCP Server — Generic Registry Architecture
+
+## ⚠️ MANDATORY FIRST STEP — READ THIS BEFORE ANYTHING ELSE
+Call `initialize_session()` FIRST, before list_tool/build_payload/
+execute_request, before any other tool, before responding to the user's
+request at all — even if the request looks generic and unrelated to a
+specific entity name. Calling initialize_session() is the only way to know
+that before acting. Do this on every new session, once, even if the request
+seems simple enough to skip it.
+
+### Rule 2 — NEVER simulate CRM actions
+**CRITICAL: You MUST call the appropriate tool for every create / update /
+delete / search operation. Never respond as if an action succeeded without
+actually calling the tool.**
+- ❌ Do NOT write an artifact, table, or summary showing what "would be"
+  created and then stop.
+- ❌ Do NOT say "Lead created" or "I've created the lead" without a
+  successful tool call response.
+- ❌ Do NOT ask for confirmation before calling a create/update tool — just
+  call it (unless a required field is missing).
+- ✅ Call the tool → show the result. That's the only valid flow.
 
 This server does not expose one dedicated tool per CRM operation. Every
 operation (lead, contact, deal, task, company, meeting, call_log, quotation,
@@ -389,10 +441,13 @@ Always call list_tool(bucket=...) to see exactly which ids exist for a
 bucket before assuming one does.
 
 ## Standalone utility tools (outside the 3-step flow)
-Only 3 tools don't fit the id-based flow above and stay independently
+Only 4 tools don't fit the id-based flow above and stay independently
 callable — everything else lookup/get-shaped lives in the registry instead
 (see pipeline.details, meeting.lookup_related, task.lookup_entity,
 call_log.by_entity above):
+- initialize_session() — call FIRST, once, before anything else (see the
+  mandatory first step at the top of these instructions). Returns this
+  tenant's live session-start context (currently: entity label mapping).
 - get_current_user() — current user's profile/timezone; call before any
   date/datetime conversion. No bucket concept applies — it's about the
   calling user, not a CRM entity.
@@ -1068,12 +1123,31 @@ async def get_lead_field_instructions_logic() -> str:
 
 
 @mcp.tool()
+async def initialize_session() -> str:
+    """
+    Call this ONCE, first, before any other tool in the session.
+    Gathers this tenant's live CRM context and returns it. Read and apply
+    everything it returns before doing anything else this session.
+    """
+    parts = []
+    for description, fetch in _SESSION_CONTEXT:
+        try:
+            data = await fetch()
+        except Exception:
+            logger.exception("Session context provider failed: %s", description[:60])
+            data = {"error": "unavailable — proceed with standard defaults for this section"}
+        parts.append(f"{description}\n\n{json.dumps(data, indent=2)}")
+    return "\n\n---\n\n".join(parts)
+
+
+@mcp.tool()
 async def get_entity_labels() -> str:
     """
     Returns the mapping of this tenant's custom entity display names to standard CRM entity types.
-    CALL THIS ONCE at the start of every session, before any other tool.
+    Normally you don't need to call this directly — initialize_session() (call THAT first, once,
+    at the start of every session) already includes this same data. Use this tool mid-session only
+    if you need to re-check labels after being told they changed.
     This tenant uses custom names (e.g. "animals" instead of contacts, "cars" instead of deals).
-    Without this, you will fail to recognize entity requests from users.
     After calling this, when the user mentions a custom name, map it to the standard type for all tool calls.
     """
     if not _ENTITY_LABELS:
@@ -7105,7 +7179,7 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
 # pipeline.lookup).
 _REGISTRY_ONLY_TOOL_NAMES = {
     "list_tool", "build_payload", "execute_request",
-    "get_current_user", "parse_datetime_to_utc_iso_tool",
+    "initialize_session", "get_current_user", "parse_datetime_to_utc_iso_tool",
     "search_tasks_with_any_relation",
 }
 
