@@ -282,3 +282,37 @@
     "relation" field: {"targetEntityId": <id>, "targetEntityType":
     "LEAD|CONTACT|DEAL|COMPANY", "targetEntityName": "<name>"}.
   example: {entity_type: "lead", search_term: "John"}
+
+# Migrated into the registry from the standalone tool surface
+# (search_tasks_with_any_relation) so that only
+# list_tool/build_payload/execute_request/initialize_session stay exposed as
+# top-level tools. Same "lookup" intent as task.lookup_entity above — a
+# second, unrelated "lookup"-shaped id in the same bucket, nothing wrong with
+# that (ids are unique, not bucket+intent).
+- id: task.search_any_relation
+  bucket: task
+  intent: lookup
+  method: GET
+  path: "4 parallel /search/task calls (one per association field, is_not_null) — see usage_notes"
+  dynamic_fields: false
+  description: "Find tasks that have AT LEAST ONE relation present — linked to a lead, contact, deal, or company, without specifying which one."
+  usage_notes: >
+    task.search's own jsonRule-based filters cannot express an OR across
+    multiple association fields in a single request. This id instead makes
+    4 parallel is_not_null calls (associatedLeads, associatedContacts,
+    associatedDeals, associatedCompanies) and returns a unified,
+    deduplicated list sorted by the requested field.
+
+    Use this when the user asks for tasks that "have a relation", "are
+    linked to an entity", or "have an associated lead/contact/deal/company"
+    without specifying a particular entity ID. If they DO specify a
+    particular entity, use task.search with a filter on that one
+    association field instead — this id is only for the OR-across-any case.
+
+    page: 0-based (default 0). size: default 20. sort: default
+    "createdAt,desc"; other useful values: "dueDate,asc", "dueDate,desc",
+    "createdAt,asc".
+
+    Each result includes the task's relation(s), shown with this tenant's
+    display names.
+  example: {page: 0, size: 20, sort: "createdAt,desc"}
