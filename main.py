@@ -6711,6 +6711,11 @@ async def _fold_field_metadata_into_schema(
                 "displayName": f.get("displayName"),
                 "type": f.get("type"),
                 "standard": f.get("standard", False),
+                # Same lookup + same TEXT_FIELD fallback _build_search_json_rule
+                # itself uses to validate a filter's operator at execute_request
+                # time — surfaced here too so a caller sees the real allowed
+                # list up front instead of learning it from a rejected filter.
+                "allowed_operators": OPERATOR_MAPPING.get(f.get("type")) or OPERATOR_MAPPING["TEXT_FIELD"],
             }
             for f in fields_meta
             if f.get("filterable", False)
@@ -6845,6 +6850,14 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
                        "options" array — that is a deliberate size saving, not
                        a fetch failure, and "options_omitted" tells you exactly
                        how to get the real options when you need them.
+                       Each tenant_filterable_fields entry also carries
+                       "allowed_operators" — the ONLY operator names valid for
+                       that field's type (e.g. DATETIME_PICKER never takes
+                       "equal", only "greater"/"between"/"today"/etc.). Pick a
+                       filter's "operator" from that field's own list — never
+                       guess a plausible-looking name (e.g. "greater_than",
+                       "greater_than_equal_to") and let execute_request reject
+                       it; that costs a round trip this list already avoids.
       live_fetch_error - present only when dynamic_fields is true and the live
                        fetch failed (e.g. no credentials configured yet). When
                        this is present, everything else above — method, path,
