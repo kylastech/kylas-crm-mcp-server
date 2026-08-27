@@ -6608,11 +6608,23 @@ async def _fold_field_metadata_into_schema(
     agnostic on purpose: was hardcoded to lead only until "contact" was added;
     kept generic from here so a 3rd/4th bucket is just one more
     _BUCKET_FIELD_FETCHERS entry, not a new copy of this function.
-    for_search=True: adds tenant_filterable_fields (name/type/standard) for building
-    filters. for_search=False (create/update): adds tenant_fields.standard/custom,
-    each field including its live picklist option id/label pairs — EXCEPT for the
-    handful of oversized picklists listed in _BUCKET_PICKLIST_RULES[bucket]["large"],
-    whose options are omitted unless requested_picklists names them (see below).
+    BOTH paths run the same _field_summary() over the same live metadata and so
+    get the same picklist treatment (real option id/name/label triples, or the
+    omission stub for an oversized one); they differ only in which fields they
+    cover and in two path-specific keys:
+
+      for_search=False (create/update) -> tenant_fields.standard/custom, every
+        field, each carrying "required".
+      for_search=True (search) -> tenant_filterable_fields, filterable fields
+        only, each carrying "filter_field_path" (the literal string
+        _build_search_json_rule expects in a rule's "field" key) instead of
+        "required", which is not a filter concept.
+
+    The search path used to emit only name/displayName/type/standard and return
+    immediately. That left a caller with no way to learn a picklist's Option
+    IDs at all — _build_search_json_rule validates the field name and coerces
+    the rule type but never resolves a label to an id, and the registry has no
+    picklist-lookup endpoint — so any picklist filter had to be guessed.
 
     requested_picklists: the caller's "which large picklists do I actually need"
     hint, straight from build_payload's own "fields" parameter. None or empty
@@ -6621,36 +6633,34 @@ async def _fold_field_metadata_into_schema(
     ~95 KB to ~24 KB. Names are matched case-insensitively. Names that aren't
     a large picklist on this bucket are ignored, not an error — every other
     field is returned in full either way, so a wrong guess costs nothing.
+    This now applies to search too: build_payload("lead.search",
+    fields=["country"]) inlines that picklist's options for filtering, exactly
+    as it already did for create/update.
 
     bucket: the entity bucket ("lead", "company", ...), used to pick that
     bucket's row in _BUCKET_PICKLIST_RULES. Passing None disables the slimming
     entirely (unknown bucket -> empty "large" set -> everything inlined), which
     is the right failure mode: an unrecognised bucket falls back to the old,
-    complete behaviour rather than silently hiding options.
+    complete behaviour rather than silently hiding options. A bucket with no
+    row at all (quotation today) additionally gets no "uses_internal_name" on
+    its picklists, because nobody has verified that bucket's value-shape rules
+    and a defaulted "false" would be an unearned claim, not a safe default.
     """
     schema = json.loads(json.dumps(base_schema))  # cheap deep copy, no extra dependency
     fields_meta = await fetch_fields_fn()
-
-    if for_search:
-        schema["tenant_filterable_fields"] = [
-            {
-                "name": f.get("name"),
-                "displayName": f.get("displayName"),
-                "type": f.get("type"),
-                "standard": f.get("standard", False),
-            }
-            for f in fields_meta
-            if f.get("filterable", False)
-        ]
-        # requested_picklists is deliberately ignored here: the search path
-        # never emits options at all, so there is nothing to slim.
-        return schema
 
     # Unknown/None bucket falls back to empty sets => nothing is treated as
     # large => every option is inlined, exactly as before this feature existed.
     _bucket_rules = _BUCKET_PICKLIST_RULES.get(bucket or "", {})
     large_fields = {n.lower() for n in _bucket_rules.get("large", set())}
     internal_name_fields = {n.lower() for n in _bucket_rules.get("internal_name", set())}
+    # True only when THIS bucket has a real row in _BUCKET_PICKLIST_RULES.
+    # A bucket with no row (quotation today, or any future entity) gets no
+    # uses_internal_name at all rather than a default-false one: "we haven't
+    # checked" and "this field takes an Option ID" are different claims, and
+    # emitting the second when we mean the first is how a caller ends up
+    # confidently sending the wrong value shape.
+    rules_authored = bool(_bucket_rules)
     # Non-strings are skipped rather than raising: this list comes straight
     # from a model's tool call, and a malformed hint should degrade to "no
     # hint", never fail the whole build_payload.
@@ -6658,14 +6668,35 @@ async def _fold_field_metadata_into_schema(
         n.strip().lower() for n in (requested_picklists or []) if isinstance(n, str)
     }
 
-    def _field_summary(f: Dict[str, Any]) -> Dict[str, Any]:
+    # for_search is a REQUIRED argument, not a defaulted one, even though it
+    # always receives the enclosing for_search. A default would let a future
+    # call site silently pick the create/update shape on the search path.
+    def _field_summary(f: Dict[str, Any], for_search: bool) -> Dict[str, Any]:
+        name = f.get("name")
+        is_standard = f.get("standard", False)
         summary = {
-            "name": f.get("name"),
+            "name": name,
             "displayName": f.get("displayName"),
             "type": f.get("type"),
-            "required": f.get("required", False),
-            "standard": f.get("standard", False),
+            "standard": is_standard,
         }
+        if for_search:
+            # The EXACT string _build_search_json_rule puts in a rule's
+            # "field" key for this field — a literal to copy verbatim, not a
+            # description. Custom fields are addressed by a dotted path there
+            # ("customFieldValues.cfFruits"); standard fields by bare name.
+            # Note this is a search-only shape: the create/update payload
+            # NESTS custom fields instead, so that path deliberately uses a
+            # different key name (see Phase 2) rather than reusing this one —
+            # the same dotted string would be silently wrong in a create body.
+            summary["filter_field_path"] = (
+                name if is_standard else f"customFieldValues.{name}"
+            )
+        else:
+            # "required" is a create/update constraint only. On a filterable
+            # field it reads as "you must filter on this", so it is omitted
+            # from the search summary entirely.
+            summary["required"] = f.get("required", False)
         if f.get("type") in ("PICK_LIST", "MULTI_PICKLIST"):
             picklist = f.get("picklist") or {}
             values = picklist.get("values") or picklist.get("picklistValues") or []
@@ -6685,7 +6716,19 @@ async def _fold_field_metadata_into_schema(
                 {"id": v.get("id"), "name": v.get("name"), "label": v.get("displayName") or v.get("label") or v.get("name")}
                 for v in values if isinstance(v, dict)
             ]
-            field_name = (f.get("name") or "").strip().lower()
+            field_name = (name or "").strip().lower()
+            # On the SEARCH path this flag is correct by construction: it is
+            # read from the same per-bucket set _rule_type_for_value already
+            # uses to pick "string" vs "long" for the rule it builds, so a
+            # true here and the rule builder can never disagree. On the
+            # create/update path the equivalent claim is not yet verified for
+            # every bucket (meeting's YAML documents status/medium as
+            # internal-name for FILTERS but Option ID for CREATE), so that
+            # path still emits it only where it already did — below, on an
+            # omitted picklist, where the caller has no options to reason
+            # from and silence is the worse of the two errors.
+            if for_search and rules_authored:
+                summary["uses_internal_name"] = field_name in internal_name_fields
             if field_name in large_fields and field_name not in requested_picklists_set:
                 # Oversized picklist the caller didn't ask for. Emit a stub
                 # instead of the array. The stub is deliberately self-
@@ -6696,22 +6739,46 @@ async def _fold_field_metadata_into_schema(
                 summary["options_count"] = len(opts)
                 summary["options_omitted"] = (
                     f"{len(opts)} options — omitted to keep this response small. "
-                    f"If you need to set this field, re-call "
-                    f"build_payload(id, fields=[\"{f.get('name')}\"]) to get them. "
+                    f"If you need to {'filter on' if for_search else 'set'} this field, "
+                    f"re-call build_payload(id, fields=[\"{name}\"]) to get them. "
                     f"Do NOT guess an option id or name."
                 )
                 # Without the inline options the caller can no longer see
                 # whether this field wants "IN" or 175 — so say it outright.
                 # Read per-bucket: the same field name disagrees across
                 # entities (lead's timezone is a name, meeting's is an id).
-                summary["uses_internal_name"] = field_name in internal_name_fields
+                if rules_authored and not for_search:
+                    summary["uses_internal_name"] = field_name in internal_name_fields
             else:
                 summary["options"] = opts
         return summary
 
+    if for_search:
+        # Filterable fields now get the SAME treatment as create/update
+        # fields: real picklist options (or the omission stub), the value-shape
+        # flag, and the literal rule field path. Before this, the search path
+        # emitted name/displayName/type/standard and nothing else, which left
+        # a caller no way at all to learn a picklist's Option IDs —
+        # _build_search_json_rule validates the field and coerces the rule
+        # type but never resolves a label to an id, and no picklist lookup
+        # endpoint exists in the registry. So a picklist filter could only
+        # ever be guessed.
+        schema["tenant_filterable_fields"] = [
+            _field_summary(f, for_search=True)
+            for f in fields_meta
+            if f.get("filterable", False)
+        ]
+        return schema
+
     schema["tenant_fields"] = {
-        "standard": [_field_summary(f) for f in fields_meta if f.get("standard", False)],
-        "custom": [_field_summary(f) for f in fields_meta if not f.get("standard", False)],
+        "standard": [
+            _field_summary(f, for_search=False)
+            for f in fields_meta if f.get("standard", False)
+        ],
+        "custom": [
+            _field_summary(f, for_search=False)
+            for f in fields_meta if not f.get("standard", False)
+        ],
     }
 
     # Override the static YAML's "required" guess with the REAL required-field
@@ -6764,14 +6831,26 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
                        fetched successfully on this call.
       tenant_fields / tenant_filterable_fields - present only when
                        dynamic_fields and fetched_live are both true: this
-                       tenant's REAL custom fields (with real picklist option
-                       id/label pairs) for create/update, or the real
-                       filterable-field list for search. Never placeholder data.
+                       tenant's REAL fields, with real picklist option
+                       id/name/label triples — tenant_fields (every field) for
+                       create/update, tenant_filterable_fields (filterable
+                       fields only) for search. Never placeholder data.
                        A few oversized picklists (see "fields" below) come back
                        with "options_count"/"options_omitted" instead of an
                        "options" array — that is a deliberate size saving, not
                        a fetch failure, and "options_omitted" tells you exactly
                        how to get the real options when you need them.
+                       Per-field keys worth knowing:
+                         uses_internal_name - on a picklist: true means send
+                           the option's "name" string, false means send its
+                           numeric "id". Absent means this entity's rule has
+                           not been verified — read usage_notes instead of
+                           assuming either shape.
+                         filter_field_path - search only: the exact string to
+                           put in a filter's "field" key. Copy it verbatim;
+                           custom fields use a dotted path here.
+                         required - create/update only. Filters are never
+                           required, so it is absent from search fields.
       live_fetch_error - present only when dynamic_fields is true and the live
                        fetch failed (e.g. no credentials configured yet). When
                        this is present, everything else above — method, path,
@@ -6789,7 +6868,9 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
     fields: OPTIONAL. The names of the LARGE picklist fields you need the full
       option list for — nothing else. This is not "the fields I intend to
       set": every field of every type still comes back in full, with its name,
-      displayName, type and required flag, whether or not you pass this.
+      displayName and type, whether or not you pass this. Works the same on
+      create/update ids and search ids — on a search id it inlines the options
+      you need to build a filter on that picklist.
 
       A handful of picklists on this tenant are enormous (timezone alone is
       435 options / ~37 KB, which is 39% of a lead.create response). Their
@@ -6819,7 +6900,8 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
 
       Pass the names as a list, e.g. build_payload("lead.create",
       fields=["country"]) when the user said "country India", or
-      fields=["country", "timezone"] if they gave both. Matching is
+      build_payload("lead.search", fields=["country"]) when they asked for
+      leads in India, or fields=["country", "timezone"] for both. Matching is
       case-insensitive. Names that aren't a large picklist on this bucket are
       simply ignored — a wrong guess is never an error and never hides
       anything, because everything else is returned in full regardless.
