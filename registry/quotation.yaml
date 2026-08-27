@@ -81,8 +81,9 @@
   description: "Filter/search quotations by field criteria."
   usage_notes: >
     filters: List of filter objects. Each must have: field (str) — Field
-    internal/API name; operator (str) — one of the allowed operators for
-    that field type; value — type depends on field type; timeZone (str,
+    internal/API name; operator (str) — one of that field's
+    "allowed_operators" (from the live tenant_filterable_fields below);
+    value — type depends on field type; timeZone (str,
     optional) — for date/datetime filters; type (str, optional) — field
     type, inferred from schema if omitted. Filters are REQUIRED (non-empty)
     for quotation. page: 0-based (default 0). size: page size, max 100

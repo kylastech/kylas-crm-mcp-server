@@ -124,8 +124,9 @@
   description: "Filter/search tasks by field criteria."
   usage_notes: >
     filters: List of filter objects. Each must have: field (str) — Field
-    internal/API name; operator (str) — one of the allowed operators for
-    that field type; value — type depends on field type; timeZone (str,
+    internal/API name; operator (str) — one of that field's
+    "allowed_operators" (from the live tenant_filterable_fields below);
+    value — type depends on field type; timeZone (str,
     optional) — for date/datetime filters; type (str, optional) — field
     type, inferred from schema if omitted. Filters are REQUIRED (non-empty)
     for task. page: 0-based (default 0). size: page size, max 100
@@ -141,9 +142,9 @@
     "operator": "equal", "value": <lead_id>} (same pattern for
     associatedContacts/associatedDeals/associatedCompanies with the
     matching id). Resolve the entity's real ID first via
-    lookup_entity_for_task(entity_type, search_term) — a real, separately
-    registered tool (entity_type: "lead"/"contact"/"deal"/"company";
-    returns matching entities with IDs) — never invent an ID.
+    task.lookup_entity(entity_type, search_term) (entity_type:
+    "lead"/"contact"/"deal"/"company"; returns matching entities with IDs)
+    — never invent an ID.
 
     Tasks with ANY relation present, regardless of which entity: use the
     separately registered search_tasks_with_any_relation() tool instead of
@@ -153,7 +154,7 @@
     cannot express an OR across those 4 association fields.
 
     Never guess IDs — always resolve first: Users (assignedTo, createdBy,
-    updatedBy, etc.) — call lookup_users(query); if multiple matches, list
+    updatedBy, etc.) — call user.lookup(query); if multiple matches, list
     them and ask user to pick.
 
     Pagination: always use the largest page size available. Do NOT
@@ -177,7 +178,7 @@
     Association (link the task to an entity): "relation":
     [{"targetEntityId": <id>, "targetEntityType": "LEAD|CONTACT|DEAL|COMPANY",
     "targetEntityName": "<name>"}]. Resolve the entity first via
-    lookup_entity_for_task(entity_type, search_term) — entity_type is the
+    task.lookup_entity(entity_type, search_term) — entity_type is the
     internal type ("lead"/"contact"/"deal"/"company"), not the tenant's
     display name — never invent an ID or name for this field.
 
@@ -194,7 +195,7 @@
     timezone) and put the returned UTC ISO string directly in the payload.
 
     Never guess IDs: assignedTo and any other user reference — call
-    lookup_users(query) first; if multiple matches, list them and ask the
+    user.lookup(query) first; if multiple matches, list them and ask the
     user to pick.
   example:
     name: "Follow up"

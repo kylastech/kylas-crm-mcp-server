@@ -6638,6 +6638,14 @@ async def _fold_field_metadata_into_schema(
                 "displayName": f.get("displayName"),
                 "type": f.get("type"),
                 "standard": f.get("standard", False),
+                # The operators legal for this field's type — without this, a
+                # caller has to already know OPERATOR_MAPPING (main.py) by
+                # heart, or guess and get rejected by execute_request's own
+                # validation. Empty list for a type OPERATOR_MAPPING doesn't
+                # recognize, not an error: an unrecognized type is still
+                # surfaced with name/displayName/type so the caller can see
+                # it exists, just with no known-safe operator to suggest.
+                "allowed_operators": OPERATOR_MAPPING.get(f.get("type"), []),
             }
             for f in fields_meta
             if f.get("filterable", False)
@@ -6767,6 +6775,11 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
                        tenant's REAL custom fields (with real picklist option
                        id/label pairs) for create/update, or the real
                        filterable-field list for search. Never placeholder data.
+                       Each entry in tenant_filterable_fields carries its own
+                       "allowed_operators" — the ONLY operators valid for that
+                       field's type (e.g. a DATE field cannot take "contains").
+                       Build every filter's "operator" from this list, never
+                       guessed or copied from a different field's type.
                        A few oversized picklists (see "fields" below) come back
                        with "options_count"/"options_omitted" instead of an
                        "options" array — that is a deliberate size saving, not

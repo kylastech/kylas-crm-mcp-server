@@ -95,8 +95,9 @@
   usage_notes: >
     filters: List of filter objects. Each must have: field (str) — Field
     internal/API name (e.g. firstName, country, source, createdAt); operator
-    (str) — one of the allowed operators for that field type; value — type
-    depends on field type; timeZone (str, optional) — for date/datetime
+    (str) — one of that field's "allowed_operators" (from the live
+    tenant_filterable_fields below); value — type depends on field type;
+    timeZone (str, optional) — for date/datetime
     filters; type (str, optional) — field type, inferred from schema if
     omitted. Filters are REQUIRED (non-empty) for lead. page: 0-based
     (default 0). size: page size, max 100 (default 20). sort: e.g.
@@ -112,9 +113,9 @@
     convert filter values to UTC.
 
     Never guess IDs — always resolve first: Users (createdBy, updatedBy,
-    owner, ownerId, assignedTo, etc.) — call lookup_users(query); never use
+    owner, ownerId, assignedTo, etc.) — call user.lookup(query); never use
     contact or lead lookup tools for employees/users; if multiple matches,
-    list them and ask user to pick. Products — call lookup_products(query);
+    list them and ask user to pick. Products — call product.lookup(query);
     if multiple matches, list and ask. Entity IDs (for association filters) —
     search for the entity first to get its real ID; never invent IDs.
 
@@ -123,9 +124,9 @@
     if the user wants more. If you receive a 429 error: stop, wait at least
     5 seconds, then retry once.
 
-    Idle / Stagnant Leads: use search_idle_entities("lead", days) for "no
-    activity for N days" queries. Fallback: search_entity("lead", [...])
-    with updatedAt ≤ threshold AND latestActivityCreatedAt ≤ threshold.
+    Idle / Stagnant Leads: use lead.search_idle(days) for "no activity for N
+    days" queries. Fallback: lead.search with updatedAt ≤ threshold AND
+    latestActivityCreatedAt ≤ threshold filters.
   example:
     filters: [{field: "updatedAt", operator: "greater_or_equal", value: "2024-01-01T00:00:00.000Z"}]
 
@@ -170,7 +171,7 @@
     timezone) and put the returned UTC ISO string directly in the payload.
 
     Never guess IDs: ownerId and any other user reference (createdBy,
-    updatedBy, assignedTo, etc.) — call lookup_users(query) first; never use
+    updatedBy, assignedTo, etc.) — call user.lookup(query) first; never use
     contact or lead lookup tools for employees/users; if multiple matches,
     list them and ask the user to pick.
 

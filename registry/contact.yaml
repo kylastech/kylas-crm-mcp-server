@@ -82,8 +82,9 @@
   description: "Filter/search contacts by field criteria."
   usage_notes: >
     filters: List of filter objects. Each must have: field (str) — Field
-    internal/API name; operator (str) — one of the allowed operators for
-    that field type; value — type depends on field type; timeZone (str,
+    internal/API name; operator (str) — one of that field's
+    "allowed_operators" (from the live tenant_filterable_fields below);
+    value — type depends on field type; timeZone (str,
     optional) — for date/datetime filters; type (str, optional) — field
     type, inferred from schema if omitted. Filters are REQUIRED (non-empty)
     for contact. page: 0-based (default 0). size: page size, max 100
@@ -100,9 +101,9 @@
     convert filter values to UTC.
 
     Never guess IDs — always resolve first: Users (createdBy, updatedBy,
-    owner, ownerId, assignedTo, etc.) — call lookup_users(query); never use
+    owner, ownerId, assignedTo, etc.) — call user.lookup(query); never use
     contact or lead lookup tools for employees/users; if multiple matches,
-    list them and ask user to pick. Products — call lookup_products(query);
+    list them and ask user to pick. Products — call product.lookup(query);
     if multiple matches, list and ask. Entity IDs (for association filters) —
     search for the entity first to get its real ID; never invent IDs.
 
@@ -157,7 +158,7 @@
     timezone) and put the returned UTC ISO string directly in the payload.
 
     Never guess IDs: ownerId and any other user reference (createdBy,
-    updatedBy, assignedTo, etc.) — call lookup_users(query) first; never use
+    updatedBy, assignedTo, etc.) — call user.lookup(query) first; never use
     contact or lead lookup tools for employees/users; if multiple matches,
     list them and ask the user to pick.
 

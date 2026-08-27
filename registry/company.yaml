@@ -81,8 +81,9 @@
   description: "Filter/search companies by field criteria."
   usage_notes: >
     filters: List of filter objects. Each must have: field (str) — Field
-    internal/API name; operator (str) — one of the allowed operators for
-    that field type; value — type depends on field type; timeZone (str,
+    internal/API name; operator (str) — one of that field's
+    "allowed_operators" (from the live tenant_filterable_fields below);
+    value — type depends on field type; timeZone (str,
     optional) — for date/datetime filters; type (str, optional) — field
     type, inferred from schema if omitted. Filters are REQUIRED (non-empty)
     for company. page: 0-based (default 0). size: page size, max 100
@@ -97,7 +98,7 @@
     convert filter values to UTC.
 
     Never guess IDs — always resolve first: Users (createdBy, updatedBy,
-    owner, ownerId, etc.) — call lookup_users(query); if multiple matches,
+    owner, ownerId, etc.) — call user.lookup(query); if multiple matches,
     list them and ask user to pick.
 
     Pagination: always use the largest page size available. Do NOT
@@ -151,7 +152,7 @@
     timezone) and put the returned UTC ISO string directly in the payload.
 
     Never guess IDs: ownerId and any other user reference — call
-    lookup_users(query) first; if multiple matches, list them and ask the
+    user.lookup(query) first; if multiple matches, list them and ask the
     user to pick.
   example: {name: "Acme Corp", website: "https://acme.com", email: "contact@acme.com"}
 
