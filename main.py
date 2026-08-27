@@ -381,9 +381,11 @@ performing.
 
 1. list_tool(bucket?, intent?)
    Find the id of the endpoint you need. Returns only a short
-   id/bucket/intent/description row per match — never a schema. Call it with
-   no arguments first if you don't know what's available yet; narrow with
-   bucket/intent once you have a sense of what you're looking for.
+   id/bucket/intent/description row per match — never a schema. When the user
+   names an entity (e.g. "task", "contact", "lead"), pass bucket (and intent if
+   known) on the FIRST call (e.g. list_tool(bucket="task")). Reserve the bare
+   call (no arguments) for when you genuinely cannot tell what entity the user
+   is referring to.
 
 2. build_payload(id, fields?)
    Get everything about the ONE endpoint you picked: its real HTTP method and
@@ -6522,23 +6524,25 @@ def list_tool(
     This tool exists purely to narrow the full registry down to the one id you
     actually need, without paying the cost of every endpoint's full schema.
 
-    It is always safe and cheap to call this with NO arguments to see everything
-    currently registered — do that first if you're not sure what's available, then
-    narrow with bucket/intent once you have a sense of what you're looking for.
+    When the user names a specific entity (e.g. "task", "contact", "lead"), pass
+    bucket (and intent if known) on your FIRST call (e.g. list_tool(bucket="task")).
+    Reserve the bare call (no arguments) for when you genuinely cannot tell what
+    entity the user is referring to.
 
     Registry contents right now (this will grow — always confirm here rather than
     assuming an id exists, since not every bucket has every intent):
-      buckets: lead, contact, meeting, call_log, _meta
+      buckets: lead, contact, task, deal, company, meeting, call_log, quotation, _meta
       intents: get, search, search_by_term, search_idle, create, update, lookup
-      (lead has all of get/search/search_by_term/search_idle/create/update;
-      contact and meeting have get/search/search_by_term/create/update but no
-      search_idle; call_log has only search/create/update — no get and no
-      search_by_term; _meta is bucket-less and only has lookup entries, e.g.
-      "user.lookup". Call list_tool(bucket=...) to see exactly which intents
-      a given bucket actually has — don't assume parity across buckets.)
+      (lead, deal, company have get/search/search_by_term/search_idle/create/update;
+      contact, meeting have get/search/search_by_term/create/update;
+      task has get/search/search_by_term/create/update/lookup;
+      call_log has search/create/update/lookup;
+      quotation has get/search/search_by_term/search_idle;
+      _meta is bucket-less and has lookup entries. Call list_tool(bucket=...) to see
+      exactly which intents a given bucket actually has — don't assume parity across buckets.)
 
-    bucket: restrict to one bucket (e.g. "lead", "contact", "meeting", "call_log",
-      "_meta"). Omit to search every bucket.
+    bucket: restrict to one bucket (e.g. "lead", "contact", "task", "deal", "company",
+      "meeting", "call_log", "quotation", "_meta"). Omit only when entity is unknown.
     intent: restrict to one intent — "get", "search", "search_by_term",
       "search_idle", "create", "update", or "lookup". Omit to match any.
 
