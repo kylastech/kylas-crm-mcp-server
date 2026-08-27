@@ -89,6 +89,13 @@
     (default 20). sort: only sortable fields are accepted — if unsure, omit
     sort entirely and the server defaults to updatedAt,desc.
 
+    Date/datetime filters (e.g. updatedAt): REQUIRED — resolve id
+    "user.current" (build_payload -> execute_request) first to get the real
+    timezone (never assume UTC, never guess). Keep the filter's value in
+    that local timezone; pass it as the filter's own "timeZone" property.
+    Do NOT convert filter values to UTC yourself, and do NOT put a trailing
+    "Z" on them.
+
     Only [FILTERABLE] fields (from the live tenant_filterable_fields below)
     are allowed. Common filters: quotationNumber, summary, status,
     grandTotal, associatedDeal, updatedAt. The id field (type ID) does NOT

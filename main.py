@@ -1230,12 +1230,24 @@ async def _fetch_current_user() -> Dict[str, Any]:
 async def get_current_user() -> str:
     """
     Get the current authenticated user's profile from Kylas (GET /users/me).
-    Call this whenever a date or datetime-related query is involved, or whenever
-    you need the current user's own ID (e.g. to set ownerId/createdBy to "me").
+    REQUIRED, first, before building ANY date/datetime value or filter this
+    session (never assume UTC, never guess a timezone) — call this once, reuse
+    the returned timezone for every date/datetime operation afterward; no need
+    to call it again unless told the user's timezone changed. Also call it
+    whenever you need the current user's own ID (e.g. to set ownerId/createdBy
+    to "me").
     Returns id, timezone (IANA, e.g. Asia/Calcutta), recordActions (call, email, sms, etc.), name, and other profile fields.
-    - For filtering (search_leads, search_idle_leads): use the returned timezone as the timeZone in date/datetime filters; keep the user's date/datetime as-is (do not convert to UTC).
-    - For create_lead: when the user provides a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone, convert to UTC using parse_datetime_to_utc_iso, and send the UTC ISO string in field_values.
-    - For ownerId/createdBy referring to the current user (e.g. "assign to me", "create a lead owned by me"): use the returned id directly — do NOT call user.lookup/lookup_users to resolve yourself by name.
+    - For *.search / *.search_idle filters: use the returned timezone as the
+      filter's timeZone (or *.search_idle's top-level time_zone); keep the
+      date/datetime VALUE itself in that local timezone — do NOT convert it to
+      UTC yourself, and do NOT put a trailing "Z" on it.
+    - For *.create / *.update: when the user gives a datetime in their own
+      words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone,
+      convert it to UTC via id "datetime.parse" (build_payload -> execute_request),
+      and send the returned UTC ISO string in the payload.
+    - For ownerId/createdBy/assignedTo referring to the current user (e.g.
+      "assign to me", "create a lead owned by me"): use the returned id
+      directly — do NOT resolve id "user.lookup" to look yourself up by name.
     """
     try:
         _reset_api_call_count()
@@ -1259,10 +1271,10 @@ async def get_current_user() -> str:
             lines.append(f"  • {k}: {v}")
         lines.extend([
             "",
-            "Use this timezone for:",
-            "  - Date/datetime filters in search_leads: pass timeZone in each date filter; do not convert filter values to UTC.",
-            "  - create_lead with datetime fields: convert user's local datetime to UTC with parse_datetime_to_utc_iso, then send UTC ISO in field_values.",
-            f"Use this ID ({user_id}) directly for ownerId/createdBy when the action refers to the current user — no need for a separate user.lookup call.",
+            f"REQUIRED before any date/datetime operation this session — reuse \"{tz}\" below, don't re-fetch unless the user's timezone may have changed:",
+            "  - *.search / *.search_idle date/datetime filters: pass this timezone as the filter's timeZone (search) or the top-level time_zone (search_idle); keep the filter VALUE itself in this local timezone — do not convert it to UTC yourself, do not put a trailing \"Z\" on it.",
+            "  - *.create / *.update datetime fields: convert the user's local datetime to UTC via id \"datetime.parse\" (build_payload -> execute_request), then send the returned UTC ISO string in the payload.",
+            f"Use this ID ({user_id}) directly for ownerId/createdBy/assignedTo when the action refers to the current user — no need for a separate id \"user.lookup\" call.",
             "=" * 50,
         ])
         return "\n".join(lines)
@@ -1457,7 +1469,7 @@ async def lookup_pipelines_logic(
         name = p.get("name", p.get("displayName", "—"))
         lines.append(f"  • ID: {pid}  |  Name: {name}")
     lines.append("-" * 50)
-    lines.append("Ask the user to confirm which pipeline to use (list id and name). Do NOT call get_pipeline_stages until the user has confirmed. After confirmation, call get_pipeline_stages with that pipeline ID only, then search or update with pipeline + pipelineStage filters.")
+    lines.append("Ask the user to confirm which pipeline to use (list id and name). Do NOT resolve id \"pipeline.details\" until the user has confirmed. After confirmation, resolve id \"pipeline.details\" (build_payload -> execute_request) with that pipeline ID only to get its stages, then use the target bucket's *.search or *.update id with pipeline + pipelineStage filters.")
     return "\n".join(lines)
 
 
@@ -1605,7 +1617,7 @@ async def get_pipeline_details_logic(pipeline_id: int) -> str:
     else:
         lines.append("  (none configured)")
     lines.append("")
-    lines.append("When updating lead to Closed Lost or Closed Unqualified, ask the user to pick one reason from the list above, then call update_lead with pipelineStageReason set to that exact string.")
+    lines.append("When moving a lead or deal to Closed Lost or Closed Unqualified, ask the user to pick one reason from the list above, then resolve id \"lead.update\" or \"deal.update\" (whichever entity this pipeline belongs to) with pipelineStageReason set to that exact string.")
     return "\n".join(lines)
 
 

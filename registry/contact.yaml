@@ -95,23 +95,31 @@
     requirementCurrency, companyBusinessType, country, timezone,
     companyIndustry → use internal name.
 
-    Date/datetime fields (filter/search): keep the value in the user's
-    timezone; pass timeZone in the filter (or omit — server uses it). Do NOT
-    convert filter values to UTC.
+    Date/datetime fields (filter/search): REQUIRED — resolve id
+    "user.current" (build_payload -> execute_request) first to get the real
+    timezone (never assume UTC, never guess). Keep the filter's value in
+    that local timezone; pass it as the filter's own "timeZone" property (or
+    omit it — execute_request falls back to a default, but passing the real
+    one is safer and required if you don't already know it from earlier this
+    session). Do NOT convert filter values to UTC yourself, and do NOT put a
+    trailing "Z" on them — that is for *.create/*.update payloads only (see
+    below), never for search filter values.
 
     Never guess IDs — always resolve first: Users (createdBy, updatedBy,
-    owner, ownerId, assignedTo, etc.) — call lookup_users(query); never use
-    contact or lead lookup tools for employees/users; if multiple matches,
-    list them and ask user to pick. Products — call lookup_products(query);
-    if multiple matches, list and ask. Entity IDs (for association filters) —
-    search for the entity first to get its real ID; never invent IDs.
+    owner, ownerId, assignedTo, etc.) — REQUIRED: resolve id "user.lookup"
+    (build_payload -> execute_request); never use contact or lead lookup
+    tools for employees/users; if multiple matches, list them and ask user
+    to pick. Products — REQUIRED: resolve id "product.lookup" (build_payload
+    -> execute_request); if multiple matches, list and ask. Entity IDs (for
+    association filters) — search for the entity first to get its real ID;
+    never invent IDs.
 
     Pagination: always use the largest page size available. Do NOT
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
     if the user wants more. If you receive a 429 error: stop, wait at least
     5 seconds, then retry once.
   example:
-    filters: [{field: "createdAt", operator: "greater_or_equal", value: "2024-01-01T00:00:00.000Z"}]
+    filters: [{field: "createdAt", operator: "greater_or_equal", value: "2024-01-01T00:00:00.000", timeZone: "Asia/Calcutta"}]
 
 - id: contact.create
   bucket: contact
@@ -152,20 +160,22 @@
     below, except requirementCurrency, companyBusinessType, country,
     timezone, companyIndustry → use internal name (string).
 
-    Date / datetime fields: call get_current_user to get the user's
-    timezone, then call parse_datetime_to_utc_iso_tool(datetime_string,
-    timezone) and put the returned UTC ISO string directly in the payload.
+    Date / datetime fields: REQUIRED: resolve id "user.current" first to get
+    the user's timezone, then id "datetime.parse" (build_payload ->
+    execute_request; payload: local_datetime, timezone) and put the
+    returned UTC ISO string directly in the payload.
 
     Never guess IDs: ownerId and any other user reference (createdBy,
-    updatedBy, assignedTo, etc.) — call lookup_users(query) first; never use
-    contact or lead lookup tools for employees/users; if multiple matches,
-    list them and ask the user to pick.
+    updatedBy, assignedTo, etc.) — REQUIRED: resolve id "user.lookup"
+    (build_payload -> execute_request) first; never use contact or lead
+    lookup tools for employees/users; if multiple matches, list them and ask
+    the user to pick.
 
     This payload's exact shape, flat, no wrapper key (lead/contact share the
-    same shape): {"firstName": "Jane", "lastName": "Doe", "email":
-    "jane@example.com", "phone": "9876543210", "phone_country_code": "IN",
-    "customFieldValues": {"cfLeadSource": "Web"}, "leadSource":
-    <picklist_option_id>}
+    same shape for phone/email shorthand and customFieldValues — contact has
+    no leadSource field, that one is lead-only): {"firstName": "Jane",
+    "lastName": "Doe", "email": "jane@example.com", "phone": "9876543210",
+    "phone_country_code": "IN", "customFieldValues": {"cfLeadSource": "Web"}}
   example: {firstName: "John", lastName: "Smith", email: "john@x.com"}
 
 - id: contact.search_by_term
