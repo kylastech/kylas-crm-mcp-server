@@ -1065,10 +1065,26 @@ def _build_search_json_rule(
 
         rule_type = _rule_type_for_value(api_type, field_name, value)
         if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
+            # A value that can't be coerced used to fall through unchanged, which
+            # sent Kylas a contradiction (e.g. {"type": "long", "value": "OPEN"}
+            # for a picklist filter). Kylas answers that with an empty page, not
+            # an error, so a wrong value looked exactly like "no records match" —
+            # the caller was told the search succeeded and found nothing. Fail
+            # loudly here instead: this is the only layer that can still tell the
+            # difference between the two.
             try:
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
-                value = value
+                hint = ""
+                if api_type in ("PICK_LIST", "MULTI_PICKLIST"):
+                    hint = (
+                        " Picklist filters take the numeric Option ID, not the option's name — "
+                        "read the real id from this bucket's tenant_filterable_fields options."
+                    )
+                return {}, (
+                    f"Filter #{i + 1}: field '{field_name}' (type {api_type}) expects a numeric "
+                    f"value but got {value!r}.{hint}"
+                )
         # Date/datetime fields: convert date values from user's timezone to UTC
         # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
         if rule_type == "date" and value is not None:
@@ -2154,7 +2170,7 @@ async def search_leads_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No leads found matching the filters. (Total in DB: {total})"
+        return f"No leads found matching the filters."
     lines = [f"Found {len(results)} lead(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for lead in results:
         lid = lead.get("id", "?")
@@ -2472,7 +2488,7 @@ async def search_contacts_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No contacts found matching the filters. (Total in DB: {total})"
+        return f"No contacts found matching the filters."
     lines = [f"Found {len(results)} contact(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for contact in results:
         cid = contact.get("id", "?")
@@ -2755,7 +2771,7 @@ async def search_tasks_logic(
     total_pages = data.get("totalPages", 1)
     if not results:
         filter_summary = "; ".join([f"{f.get('field')}={f.get('value')}" for f in filters])
-        return f"No tasks found matching filters: {filter_summary}. (Total tasks in DB: {total})"
+        return f"No tasks found matching filters: {filter_summary}."
     lines = [f"Found {len(results)} task(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for task in results:
         tid = task.get("id", "?")
@@ -3133,10 +3149,26 @@ def _build_deal_search_json_rule(
         else:
             rule_type = _rule_type_for_value(api_type, field_name, value)
         if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
+            # A value that can't be coerced used to fall through unchanged, which
+            # sent Kylas a contradiction (e.g. {"type": "long", "value": "OPEN"}
+            # for a picklist filter). Kylas answers that with an empty page, not
+            # an error, so a wrong value looked exactly like "no records match" —
+            # the caller was told the search succeeded and found nothing. Fail
+            # loudly here instead: this is the only layer that can still tell the
+            # difference between the two.
             try:
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
-                value = value
+                hint = ""
+                if api_type in ("PICK_LIST", "MULTI_PICKLIST"):
+                    hint = (
+                        " Picklist filters take the numeric Option ID, not the option's name — "
+                        "read the real id from this bucket's tenant_filterable_fields options."
+                    )
+                return {}, (
+                    f"Filter #{i + 1}: field '{field_name}' (type {api_type}) expects a numeric "
+                    f"value but got {value!r}.{hint}"
+                )
         # Date/datetime fields: convert date values from user's timezone to UTC
         # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
         if rule_type == "date" and value is not None:
@@ -3606,7 +3638,7 @@ async def search_deals_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No deals found matching the filters. (Total in DB: {total})"
+        return f"No deals found matching the filters."
     lines = [f"Found {len(results)} deal(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for deal in results:
         did = deal.get("id", "?")
@@ -3699,7 +3731,7 @@ async def search_deals_by_term_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No deals found matching '{term}'. (Total in DB: {total})"
+        return f"No deals found matching '{term}'."
     lines = [f"Found {len(results)} deal(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for deal in results:
         did = deal.get("id", "?")
@@ -3899,10 +3931,26 @@ def _build_company_search_json_rule(
         else:
             rule_type = _rule_type_for_value(api_type, field_name, value)
         if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
+            # A value that can't be coerced used to fall through unchanged, which
+            # sent Kylas a contradiction (e.g. {"type": "long", "value": "OPEN"}
+            # for a picklist filter). Kylas answers that with an empty page, not
+            # an error, so a wrong value looked exactly like "no records match" —
+            # the caller was told the search succeeded and found nothing. Fail
+            # loudly here instead: this is the only layer that can still tell the
+            # difference between the two.
             try:
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
-                value = value
+                hint = ""
+                if api_type in ("PICK_LIST", "MULTI_PICKLIST"):
+                    hint = (
+                        " Picklist filters take the numeric Option ID, not the option's name — "
+                        "read the real id from this bucket's tenant_filterable_fields options."
+                    )
+                return {}, (
+                    f"Filter #{i + 1}: field '{field_name}' (type {api_type}) expects a numeric "
+                    f"value but got {value!r}.{hint}"
+                )
         # Date/datetime fields: convert date values from user's timezone to UTC
         # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
         if rule_type == "date" and value is not None:
@@ -4084,7 +4132,7 @@ async def search_companies_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No companies found matching the filters. (Total in DB: {total})"
+        return f"No companies found matching the filters."
     lines = [f"Found {len(results)} company(ies) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for company in results:
         cid = company.get("id", "?")
@@ -4425,10 +4473,26 @@ def _build_meeting_search_json_rule(
         else:
             rule_type = _rule_type_for_value(api_type, field_name, value)
         if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
+            # A value that can't be coerced used to fall through unchanged, which
+            # sent Kylas a contradiction (e.g. {"type": "long", "value": "OPEN"}
+            # for a picklist filter). Kylas answers that with an empty page, not
+            # an error, so a wrong value looked exactly like "no records match" —
+            # the caller was told the search succeeded and found nothing. Fail
+            # loudly here instead: this is the only layer that can still tell the
+            # difference between the two.
             try:
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
-                value = value
+                hint = ""
+                if api_type in ("PICK_LIST", "MULTI_PICKLIST"):
+                    hint = (
+                        " Picklist filters take the numeric Option ID, not the option's name — "
+                        "read the real id from this bucket's tenant_filterable_fields options."
+                    )
+                return {}, (
+                    f"Filter #{i + 1}: field '{field_name}' (type {api_type}) expects a numeric "
+                    f"value but got {value!r}.{hint}"
+                )
         # Date/datetime fields: convert date values from user's timezone to UTC
         # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
         if rule_type == "date" and value is not None:
@@ -4770,7 +4834,7 @@ async def search_meetings_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No meetings found matching the filters. (Total in DB: {total})"
+        return f"No meetings found matching the filters."
     lines = [f"Found {len(results)} meeting(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for m in results:
         lines.append(_format_meeting_summary_line(m))
@@ -5164,10 +5228,26 @@ def _build_call_log_search_json_rule(
         else:
             rule_type = _rule_type_for_value(api_type, field_name, value)
         if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
+            # A value that can't be coerced used to fall through unchanged, which
+            # sent Kylas a contradiction (e.g. {"type": "long", "value": "OPEN"}
+            # for a picklist filter). Kylas answers that with an empty page, not
+            # an error, so a wrong value looked exactly like "no records match" —
+            # the caller was told the search succeeded and found nothing. Fail
+            # loudly here instead: this is the only layer that can still tell the
+            # difference between the two.
             try:
                 value = float(value) if rule_type == "double" else int(value)
             except (TypeError, ValueError):
-                value = value
+                hint = ""
+                if api_type in ("PICK_LIST", "MULTI_PICKLIST"):
+                    hint = (
+                        " Picklist filters take the numeric Option ID, not the option's name — "
+                        "read the real id from this bucket's tenant_filterable_fields options."
+                    )
+                return {}, (
+                    f"Filter #{i + 1}: field '{field_name}' (type {api_type}) expects a numeric "
+                    f"value but got {value!r}.{hint}"
+                )
         # Date/datetime fields: convert date values from user's timezone to UTC
         # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
         if rule_type == "date" and value is not None:
@@ -5304,7 +5384,7 @@ async def search_call_logs_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No call logs found matching the filters. (Total in DB: {total})"
+        return f"No call logs found matching the filters."
     lines = [f"Found {len(results)} call log(s) (page {page + 1} of {total_pages}, total {total})", ""]
     for log in results:
         lines.append(_format_call_log_for_display(log))
@@ -5403,7 +5483,7 @@ async def search_leads_by_term_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No leads found matching '{term}'. (Total in DB: {total})"
+        return f"No leads found matching '{term}'."
     lines = [f"Found {len(results)} lead(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for lead in results:
         lid = lead.get("id", "?")
@@ -5443,7 +5523,7 @@ async def search_contacts_by_term_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No contacts found matching '{term}'. (Total in DB: {total})"
+        return f"No contacts found matching '{term}'."
     lines = [f"Found {len(results)} contact(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for contact in results:
         cid = contact.get("id", "?")
@@ -5483,7 +5563,7 @@ async def search_tasks_by_term_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No tasks found matching '{term}'. (Total in DB: {total})"
+        return f"No tasks found matching '{term}'."
     lines = [f"Found {len(results)} task(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for task in results:
         tid = task.get("id", "?")
@@ -5522,7 +5602,7 @@ async def search_companies_by_term_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No companies found matching '{term}'. (Total in DB: {total})"
+        return f"No companies found matching '{term}'."
     lines = [f"Found {len(results)} company/ies for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for company in results:
         cid = company.get("id", "?")
@@ -5570,7 +5650,7 @@ async def search_meetings_by_term_logic(
     total = data.get("totalElements", data.get("total", len(results)))
     total_pages = data.get("totalPages", 1)
     if not results:
-        return f"No meetings found matching '{term}' in title. (Total in DB: {total})"
+        return f"No meetings found matching '{term}' in title."
     lines = [f"Found {len(results)} meeting(s) with title matching '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for m in results:
         lines.append(_format_meeting_summary_line(m))
@@ -5760,7 +5840,7 @@ async def search_quotations_logic(
     total = data.get("totalElements", data.get("total", len(results))) if isinstance(data, dict) else len(results)
     total_pages = data.get("totalPages", 1) if isinstance(data, dict) else 1
     if not results:
-        return f"No quotations found matching the filters. (Total in DB: {total})"
+        return f"No quotations found matching the filters."
     lines = [f"Found {len(results)} quotation(s) (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for q in results:
         qid = q.get("id", "?")
@@ -5807,7 +5887,7 @@ async def search_quotations_by_term_logic(
     total = data.get("totalElements", data.get("total", len(results))) if isinstance(data, dict) else len(results)
     total_pages = data.get("totalPages", 1) if isinstance(data, dict) else 1
     if not results:
-        return f"No quotations found for '{term}'. (Total in DB: {total})"
+        return f"No quotations found for '{term}'."
     lines = [f"Found {len(results)} quotation(s) for '{term}' (page {page + 1} of {total_pages}, total {total})", "-" * 60]
     for q in results:
         qid = q.get("id", "?")
@@ -6534,7 +6614,8 @@ def list_tool(
       buckets: lead, contact, task, deal, company, meeting, call_log, quotation, _meta
       intents: get, search, search_by_term, search_idle, create, update, lookup
       (lead, deal, company have get/search/search_by_term/search_idle/create/update;
-      contact, meeting have get/search/search_by_term/create/update;
+      contact has get/search/search_by_term/create/update;
+      meeting has get/search/search_by_term/create/update/lookup;
       task has get/search/search_by_term/create/update/lookup;
       call_log has search/create/update/lookup;
       quotation has get/search/search_by_term/search_idle;
@@ -6685,11 +6766,17 @@ async def _fold_field_metadata_into_schema(
     agnostic on purpose: was hardcoded to lead only until "contact" was added;
     kept generic from here so a 3rd/4th bucket is just one more
     _BUCKET_FIELD_FETCHERS entry, not a new copy of this function.
-    for_search=True: adds tenant_filterable_fields (name/type/standard) for building
-    filters. for_search=False (create/update): adds tenant_fields.standard/custom,
-    each field including its live picklist option id/label pairs — EXCEPT for the
-    handful of oversized picklists listed in _BUCKET_PICKLIST_RULES[bucket]["large"],
-    whose options are omitted unless requested_picklists names them (see below).
+    for_search=True: adds tenant_filterable_fields (name/displayName/type/standard)
+    for building filters. for_search=False (create/update): adds
+    tenant_fields.standard/custom (the same, plus required).
+    BOTH paths include live picklist option id/name/label triples and a
+    uses_internal_name flag on every PICK_LIST/MULTI_PICKLIST field — EXCEPT for
+    the handful of oversized picklists listed in
+    _BUCKET_PICKLIST_RULES[bucket]["large"], whose options are omitted unless
+    requested_picklists names them (see below).
+    The search path used to emit no options at all, which made picklist FILTERS
+    unbuildable — a caller could see status was a PICK_LIST but never learn its
+    option ids, so it guessed the option name and got a silent empty result set.
 
     requested_picklists: the caller's "which large picklists do I actually need"
     hint, straight from build_payload's own "fields" parameter. None or empty
@@ -6708,21 +6795,6 @@ async def _fold_field_metadata_into_schema(
     schema = json.loads(json.dumps(base_schema))  # cheap deep copy, no extra dependency
     fields_meta = await fetch_fields_fn()
 
-    if for_search:
-        schema["tenant_filterable_fields"] = [
-            {
-                "name": f.get("name"),
-                "displayName": f.get("displayName"),
-                "type": f.get("type"),
-                "standard": f.get("standard", False),
-            }
-            for f in fields_meta
-            if f.get("filterable", False)
-        ]
-        # requested_picklists is deliberately ignored here: the search path
-        # never emits options at all, so there is nothing to slim.
-        return schema
-
     # Unknown/None bucket falls back to empty sets => nothing is treated as
     # large => every option is inlined, exactly as before this feature existed.
     _bucket_rules = _BUCKET_PICKLIST_RULES.get(bucket or "", {})
@@ -6735,6 +6807,75 @@ async def _fold_field_metadata_into_schema(
         n.strip().lower() for n in (requested_picklists or []) if isinstance(n, str)
     }
 
+    def _picklist_detail(f: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        The option-related keys for ONE picklist field: either the real
+        id/name/label triples, or the omission stub for an oversized one.
+        Shared by both the search and create/update paths on purpose — the
+        search path used to emit no options at all, which made every picklist
+        FILTER unbuildable: the caller was told status is a PICK_LIST but never
+        given the option ids, so it fell back to the option NAME ("OPEN"), and
+        that silently matched zero records (see _build_search_json_rule).
+        """
+        picklist = f.get("picklist") or {}
+        values = picklist.get("values") or picklist.get("picklistValues") or []
+        # "name" (the internal name string, e.g. "ACCOUNTING") was missing here
+        # entirely — only "id" and "label" were ever surfaced. That's fine for
+        # most picklist fields (Option ID is the correct value), but for the
+        # documented exceptions (requirementCurrency, companyBusinessType,
+        # country, timezone, companyIndustry — see this bucket's usage_notes),
+        # the internal name is the ONLY value Kylas accepts, and it can differ
+        # from the label in both case and format (e.g. companyIndustry's
+        # "Accounting" label has internal name "ACCOUNTING"; companyBusinessType's
+        # "Analyst" label has internal name "analyst"). Without "name" here, a
+        # caller had no way to ever produce the correct value for those 5 fields —
+        # confirmed live, every value tried for companyIndustry/companyBusinessType
+        # failed because none of them could be the real internal name.
+        opts = [
+            {"id": v.get("id"), "name": v.get("name"), "label": v.get("displayName") or v.get("label") or v.get("name")}
+            for v in values if isinstance(v, dict)
+        ]
+        field_name = (f.get("name") or "").strip().lower()
+        # Which of id/name Kylas wants is per-bucket and not guessable from the
+        # options alone (lead's timezone is a name, meeting's is an id), so it
+        # is stated outright whether or not the options themselves are inlined.
+        uses_internal_name = field_name in internal_name_fields
+        if field_name in large_fields and field_name not in requested_picklists_set:
+            # Oversized picklist the caller didn't ask for. Emit a stub
+            # instead of the array. The stub is deliberately self-
+            # describing — it names the exact re-call that recovers the
+            # options — so this stays usable even for a caller that never
+            # read the docstring, and so no separate lookup endpoint is
+            # needed to make the omission safe.
+            return {
+                "options_count": len(opts),
+                "options_omitted": (
+                    f"{len(opts)} options — omitted to keep this response small. "
+                    f"If you need this field, re-call "
+                    f"build_payload(id, fields=[\"{f.get('name')}\"]) to get them. "
+                    f"Do NOT guess an option id or name."
+                ),
+                "uses_internal_name": uses_internal_name,
+            }
+        return {"options": opts, "uses_internal_name": uses_internal_name}
+
+    if for_search:
+        def _filterable_summary(f: Dict[str, Any]) -> Dict[str, Any]:
+            summary = {
+                "name": f.get("name"),
+                "displayName": f.get("displayName"),
+                "type": f.get("type"),
+                "standard": f.get("standard", False),
+            }
+            if f.get("type") in ("PICK_LIST", "MULTI_PICKLIST"):
+                summary.update(_picklist_detail(f))
+            return summary
+
+        schema["tenant_filterable_fields"] = [
+            _filterable_summary(f) for f in fields_meta if f.get("filterable", False)
+        ]
+        return schema
+
     def _field_summary(f: Dict[str, Any]) -> Dict[str, Any]:
         summary = {
             "name": f.get("name"),
@@ -6744,46 +6885,7 @@ async def _fold_field_metadata_into_schema(
             "standard": f.get("standard", False),
         }
         if f.get("type") in ("PICK_LIST", "MULTI_PICKLIST"):
-            picklist = f.get("picklist") or {}
-            values = picklist.get("values") or picklist.get("picklistValues") or []
-            # "name" (the internal name string, e.g. "ACCOUNTING") was missing here
-            # entirely — only "id" and "label" were ever surfaced. That's fine for
-            # most picklist fields (Option ID is the correct value), but for the
-            # documented exceptions (requirementCurrency, companyBusinessType,
-            # country, timezone, companyIndustry — see this bucket's usage_notes),
-            # the internal name is the ONLY value Kylas accepts, and it can differ
-            # from the label in both case and format (e.g. companyIndustry's
-            # "Accounting" label has internal name "ACCOUNTING"; companyBusinessType's
-            # "Analyst" label has internal name "analyst"). Without "name" here, a
-            # caller had no way to ever produce the correct value for those 5 fields —
-            # confirmed live, every value tried for companyIndustry/companyBusinessType
-            # failed because none of them could be the real internal name.
-            opts = [
-                {"id": v.get("id"), "name": v.get("name"), "label": v.get("displayName") or v.get("label") or v.get("name")}
-                for v in values if isinstance(v, dict)
-            ]
-            field_name = (f.get("name") or "").strip().lower()
-            if field_name in large_fields and field_name not in requested_picklists_set:
-                # Oversized picklist the caller didn't ask for. Emit a stub
-                # instead of the array. The stub is deliberately self-
-                # describing — it names the exact re-call that recovers the
-                # options — so this stays usable even for a caller that never
-                # read the docstring, and so no separate lookup endpoint is
-                # needed to make the omission safe.
-                summary["options_count"] = len(opts)
-                summary["options_omitted"] = (
-                    f"{len(opts)} options — omitted to keep this response small. "
-                    f"If you need to set this field, re-call "
-                    f"build_payload(id, fields=[\"{f.get('name')}\"]) to get them. "
-                    f"Do NOT guess an option id or name."
-                )
-                # Without the inline options the caller can no longer see
-                # whether this field wants "IN" or 175 — so say it outright.
-                # Read per-bucket: the same field name disagrees across
-                # entities (lead's timezone is a name, meeting's is an id).
-                summary["uses_internal_name"] = field_name in internal_name_fields
-            else:
-                summary["options"] = opts
+            summary.update(_picklist_detail(f))
         return summary
 
     schema["tenant_fields"] = {
@@ -6839,11 +6941,21 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
                        only be known by asking Kylas directly (never static).
       fetched_live   - true only if that tenant-specific data was actually
                        fetched successfully on this call.
-      tenant_fields / tenant_filterable_fields - present only when
-                       dynamic_fields and fetched_live are both true: this
-                       tenant's REAL custom fields (with real picklist option
-                       id/label pairs) for create/update, or the real
+      schema.tenant_fields / schema.tenant_filterable_fields - NESTED INSIDE
+                       "schema", not top-level (look for them there, not beside
+                       "id"/"method"/"path"). Present only when dynamic_fields
+                       and fetched_live are both true: this tenant's REAL
+                       custom fields for create/update, or the real
                        filterable-field list for search. Never placeholder data.
+                       Every PICK_LIST/MULTI_PICKLIST field in EITHER of them
+                       carries an "options" array of real {id, name, label}
+                       triples plus a "uses_internal_name" flag saying which of
+                       id/name Kylas accepts for that field on this bucket —
+                       true means send the "name" string, false means send the
+                       numeric "id". This applies to filters too: a picklist
+                       filter value that should be an id but is sent as a name
+                       does NOT error, it silently matches zero records, so
+                       read the flag rather than guessing from the label.
                        A few oversized picklists (see "fields" below) come back
                        with "options_count"/"options_omitted" instead of an
                        "options" array — that is a deliberate size saving, not

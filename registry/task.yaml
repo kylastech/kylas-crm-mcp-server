@@ -156,12 +156,26 @@
     updatedBy, etc.) — call lookup_users(query); if multiple matches, list
     them and ask user to pick.
 
+    Picklist filters (status, priority, type) take the NUMERIC OPTION ID,
+    never the option's name string. Filtering status with the string "OPEN"
+    silently matches zero tasks — the rule is built with type "long" while
+    the value stays a string, so Kylas returns an empty page rather than an
+    error. Read the real id from tenant_filterable_fields' own "options"
+    array below (each entry carries id / name / label, plus a
+    uses_internal_name flag saying which of the two Kylas wants for that
+    field) — never guess one, and never copy an option name into a filter.
+
+    "Tasks that are due" means a dueDate filter, not a status filter: use
+    operator "before_current_date_and_time" for overdue, "today" for due
+    today, or "next_seven_days" for due soon. Add a status filter on top
+    only when the user actually asks to exclude completed tasks.
+
     Pagination: always use the largest page size available. Do NOT
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
     if the user wants more. If you receive a 429 error: stop, wait at least
     5 seconds, then retry once.
   example:
-    filters: [{field: "status", operator: "equal", value: "OPEN"}]
+    filters: [{field: "dueDate", operator: "before_current_date_and_time"}]
 
 - id: task.create
   bucket: task
