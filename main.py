@@ -6692,6 +6692,23 @@ async def _fold_field_metadata_into_schema(
             summary["filter_field_path"] = (
                 name if is_standard else f"customFieldValues.{name}"
             )
+            # The operators legal for this field's type. Without this a caller
+            # has to know OPERATOR_MAPPING by heart, or guess and get rejected
+            # by _build_search_json_rule during execute_request ("operator 'x'
+            # not allowed for field 'y'") — a whole round trip to learn a fact
+            # that was already known here.
+            #
+            # Resolved with the SAME expression the five rule builders use
+            # (main.py:1006 and siblings), TEXT_FIELD fallback included. A
+            # plain .get(type, []) would be wrong, not merely conservative: an
+            # unrecognized type falls back to TEXT_FIELD's nine operators in
+            # the validator, so an empty list here would tell the caller
+            # nothing is legal when in fact those nine are. This list and the
+            # validator must never be able to disagree.
+            summary["allowed_operators"] = (
+                OPERATOR_MAPPING.get(f.get("type"))
+                or OPERATOR_MAPPING.get("TEXT_FIELD", [])
+            )
         else:
             # "required" is a create/update constraint only. On a filterable
             # field it reads as "you must filter on this", so it is omitted
@@ -6849,6 +6866,16 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
                          filter_field_path - search only: the exact string to
                            put in a filter's "field" key. Copy it verbatim;
                            custom fields use a dotted path here.
+                         allowed_operators - search only: the ONLY operators
+                           valid for that field's type (e.g. a DATE field
+                           cannot take "contains", and a CHECKBOX takes only
+                           equal/not_equal). Build every filter's "operator"
+                           from the list on THAT field — never guessed, and
+                           never copied from a field of a different type.
+                           Anything else is rejected before the request is
+                           sent. Symbols (">", ">=", "!=", "==") are accepted
+                           as shorthand and normalized, but the names in this
+                           list always work.
                          required - create/update only. Filters are never
                            required, so it is absent from search fields.
       live_fetch_error - present only when dynamic_fields is true and the live
