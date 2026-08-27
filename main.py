@@ -377,6 +377,33 @@ either below (rules that apply across every operation) or returned by the
 tools themselves, on demand, scoped to the one operation you're actually
 performing.
 
+## Buckets and intents that exist RIGHT NOW — read this BEFORE calling list_tool
+This is the full, real structure of the registry, given to you up front so
+you often don't need to call list_tool() at all just to discover it. For a
+"get"/"search"/"search_by_term"/"search_idle"/"create"/"update" intent, the
+id is always exactly "<bucket>.<intent>" (e.g. "lead.get", "deal.search") —
+you can go straight to build_payload with that id. "lookup" ids do NOT
+follow that pattern (they're one-off, named for what they resolve) — their
+exact id is spelled out below, use it as-is.
+
+| bucket    | get | search | search_by_term | search_idle | create | update | lookup id(s) |
+|-----------|-----|--------|-----------------|-------------|--------|--------|--------------|
+| lead      | Y   | Y      | Y               | Y           | Y      | Y      | —            |
+| contact   | Y   | Y      | Y               | —           | Y      | Y      | —            |
+| deal      | Y   | Y      | Y               | Y           | Y      | Y      | —            |
+| company   | Y   | Y      | Y               | Y           | Y      | Y      | —            |
+| task      | Y   | Y      | Y               | —           | Y      | Y      | task.lookup_entity, task.search_any_relation |
+| meeting   | Y   | Y      | Y               | —           | Y      | Y      | meeting.lookup_related |
+| call_log  | —   | Y      | —               | —           | Y      | Y      | call_log.by_entity |
+| quotation | Y   | Y      | Y               | Y           | —      | —      | — (READ-ONLY bucket: no create/update at all) |
+| _meta (no bucket concept — shared, not entity-scoped) | — | — | — | — | — | — | user.lookup, product.lookup, pipeline.lookup, pipeline.details, user.current, datetime.parse |
+
+Still call list_tool if: you're not sure this list is current (it can
+change), you want an id's one-line description before committing to it, or
+you're narrowing by intent across buckets you don't already know. Never
+guess a "lookup" id from this table's shape alone if you're not sure — this
+table already gives you the real string, use it verbatim.
+
 ## The 3-step flow
 
 1. list_tool(bucket?, intent?)
@@ -424,22 +451,6 @@ performing.
    success or {"ok": false, "error": {"code", "message"}} on failure — never
    a raw exception. A malformed payload is caught HERE, not earlier —
    build_payload does no validation of its own, on purpose.
-
-## What's registered right now (call list_tool to confirm, don't assume)
-Buckets: lead, contact, meeting, call_log, deal, task, company, quotation,
-plus a bucket-less "_meta" group for shared lookups (user.lookup,
-product.lookup, pipeline.lookup, pipeline.details, user.current,
-datetime.parse). Not every bucket has every intent:
-  - lead, deal, company: get, search, search_by_term, search_idle, create, update (all 6)
-  - contact, meeting: get, search, search_by_term, create, update (no search_idle)
-  - task: get, search, search_by_term, create, update, lookup (task.lookup_entity,
-    task.search_any_relation — no search_idle)
-  - call_log: search, create, update, lookup (call_log.by_entity — no get, no search_by_term, no search_idle)
-  - meeting also has lookup (meeting.lookup_related), beyond the get/search/search_by_term/create/update above
-  - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
-  - _meta: lookup only
-Always call list_tool(bucket=...) to see exactly which ids exist for a
-bucket before assuming one does.
 
 ## Only 4 tools exist outside the id-based flow above
 list_tool, build_payload, execute_request, and initialize_session are the
@@ -6538,19 +6549,19 @@ def list_tool(
     currently registered — do that first if you're not sure what's available, then
     narrow with bucket/intent once you have a sense of what you're looking for.
 
-    Registry contents right now (this will grow — always confirm here rather than
-    assuming an id exists, since not every bucket has every intent):
-      buckets: lead, contact, meeting, call_log, _meta
-      intents: get, search, search_by_term, search_idle, create, update, lookup
-      (lead has all of get/search/search_by_term/search_idle/create/update;
-      contact and meeting have get/search/search_by_term/create/update but no
-      search_idle; call_log has only search/create/update — no get and no
-      search_by_term; _meta is bucket-less and only has lookup entries, e.g.
-      "user.lookup". Call list_tool(bucket=...) to see exactly which intents
-      a given bucket actually has — don't assume parity across buckets.)
+    The full bucket/intent table (which bucket has which of get/search/
+    search_by_term/search_idle/create/update, and every "lookup" id's real
+    name) is already given to you in the server's own instructions, under
+    "Buckets and intents that exist RIGHT NOW" — read that first; for a
+    get/search/search_by_term/search_idle/create/update id you can usually
+    skip straight to build_payload("<bucket>.<intent>") without calling this
+    at all. Call this when: you're not sure that table is still current, you
+    want an id's one-line description before committing to it, or you're
+    narrowing across buckets you don't already know by heart.
 
-    bucket: restrict to one bucket (e.g. "lead", "contact", "meeting", "call_log",
-      "_meta"). Omit to search every bucket.
+    bucket: restrict to one bucket (e.g. "lead", "contact", "deal", "task",
+      "company", "meeting", "call_log", "quotation", "_meta"). Omit to search
+      every bucket.
     intent: restrict to one intent — "get", "search", "search_by_term",
       "search_idle", "create", "update", or "lookup". Omit to match any.
 
