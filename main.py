@@ -966,6 +966,13 @@ def _rule_type_for_value(field_type: str, field_name: str, value: Any) -> str:
         return "string" if field_name in PICKLIST_FIELDS_USE_INTERNAL_NAME else "long"
     if field_type == "NUMBER":
         return "double"
+    # MONEY (deal estimatedValue/actualValue, company annualRevenue, quotation
+    # subTotal/grandTotal) is an ordered numeric field: OPERATOR_MAPPING gives it
+    # greater/less/between, but without this branch it fell through to "string"
+    # below and the API rejected every one of those with 003014 "Invalid string
+    # operation". "double", not "long" — money carries decimals.
+    if field_type == "MONEY":
+        return "double"
     # User look-up fields: createdBy, updatedBy, convertedBy, ownerId, importedBy — value is user ID (long)
     if field_type in ("LOOK_UP", "ENTITY_FIELDS", "MEETING_ORGANIZER"):
         return "long"
@@ -6518,39 +6525,6 @@ _REGISTRY_BUCKET_TO_GET_TOOL: Dict[str, str] = {
     "quotation": "get_quotation",
 }
 
-
-# Per-bucket picklist rules for build_payload's response-slimming.
-#
-#   "large"         - fields whose picklist option arrays are big enough to
-#                     dominate the response. Their options are OMITTED by
-#                     default and only inlined when build_payload's "fields"
-#                     hint names them. Measured on a live QA tenant: timezone
-#                     alone is 435 options / 37 KB — 39% of lead.create's
-#                     entire payload; country 247, companyIndustry 147,
-#                     requirementCurrency 165. Every other picklist on every
-#                     bucket is <= 9 options, so it is always inlined and
-#                     nothing about it changes.
-#   "internal_name" - fields whose accepted value is the option's "name"
-#                     string, not its numeric id. Surfaced as the
-#                     "uses_internal_name" flag when options are omitted,
-#                     because without the inline options the caller can no
-#                     longer see that country's value is "IN" and not 175.
-#
-# BOTH must be per-bucket, not global. The same concept is named differently
-# across entities (lead's companyIndustry is company's industry), and — more
-# importantly — the value FORMAT differs for the same field name: lead's
-# timezone takes an internal name, meeting's timezone takes an Option ID.
-# A single global constant emits confidently wrong uses_internal_name flags
-# for company and meeting, which is worse than emitting nothing at all.
-# Each bucket's "internal_name" is the same constant that bucket's own search
-# rule builder already uses, and each matches that bucket's YAML usage_notes.
-#
-# "large" lists BOTH spellings of each concept on purpose. A spelling that
-# doesn't exist on a bucket simply never matches, so listing both costs
-# nothing and removes the need to know which entity uses which name.
-# deal/task/call_log have empty sets deliberately: deal's four picklists hold
-# 6 options / 346 B in total, so gating them would buy a re-fetch round trip
-# to save ~100 bytes.
 _LARGE_COMPANY_PICKLISTS = {
     "country", "companycountry",
     "companyindustry", "industry",
@@ -6654,12 +6628,7 @@ async def _fold_field_metadata_into_schema(
     _bucket_rules = _BUCKET_PICKLIST_RULES.get(bucket or "", {})
     large_fields = {n.lower() for n in _bucket_rules.get("large", set())}
     internal_name_fields = {n.lower() for n in _bucket_rules.get("internal_name", set())}
-    # True only when THIS bucket has a real row in _BUCKET_PICKLIST_RULES.
-    # A bucket with no row (quotation today, or any future entity) gets no
-    # uses_internal_name at all rather than a default-false one: "we haven't
-    # checked" and "this field takes an Option ID" are different claims, and
-    # emitting the second when we mean the first is how a caller ends up
-    # confidently sending the wrong value shape.
+
     rules_authored = bool(_bucket_rules)
     # Non-strings are skipped rather than raising: this list comes straight
     # from a model's tool call, and a malformed hint should degrade to "no
@@ -6668,9 +6637,7 @@ async def _fold_field_metadata_into_schema(
         n.strip().lower() for n in (requested_picklists or []) if isinstance(n, str)
     }
 
-    # for_search is a REQUIRED argument, not a defaulted one, even though it
-    # always receives the enclosing for_search. A default would let a future
-    # call site silently pick the create/update shape on the search path.
+
     def _field_summary(f: Dict[str, Any], for_search: bool) -> Dict[str, Any]:
         name = f.get("name")
         is_standard = f.get("standard", False)
@@ -6681,30 +6648,9 @@ async def _fold_field_metadata_into_schema(
             "standard": is_standard,
         }
         if for_search:
-            # The EXACT string _build_search_json_rule puts in a rule's
-            # "field" key for this field — a literal to copy verbatim, not a
-            # description. Custom fields are addressed by a dotted path there
-            # ("customFieldValues.cfFruits"); standard fields by bare name.
-            # Note this is a search-only shape: the create/update payload
-            # NESTS custom fields instead, so that path deliberately uses a
-            # different key name (see Phase 2) rather than reusing this one —
-            # the same dotted string would be silently wrong in a create body.
             summary["filter_field_path"] = (
                 name if is_standard else f"customFieldValues.{name}"
             )
-            # The operators legal for this field's type. Without this a caller
-            # has to know OPERATOR_MAPPING by heart, or guess and get rejected
-            # by _build_search_json_rule during execute_request ("operator 'x'
-            # not allowed for field 'y'") — a whole round trip to learn a fact
-            # that was already known here.
-            #
-            # Resolved with the SAME expression the five rule builders use
-            # (main.py:1006 and siblings), TEXT_FIELD fallback included. A
-            # plain .get(type, []) would be wrong, not merely conservative: an
-            # unrecognized type falls back to TEXT_FIELD's nine operators in
-            # the validator, so an empty list here would tell the caller
-            # nothing is legal when in fact those nine are. This list and the
-            # validator must never be able to disagree.
             summary["allowed_operators"] = (
                 OPERATOR_MAPPING.get(f.get("type"))
                 or OPERATOR_MAPPING.get("TEXT_FIELD", [])
