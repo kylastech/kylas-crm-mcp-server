@@ -91,7 +91,7 @@
     status, from, owner, associatedLeads, participants; operator (str) — e.g.
     equal, contains, in; value — for status use internal name, for
     associated* equal use numeric id, for participants use a list containing
-    the FULL participant object from lookup_meeting_related_entity;
+    the FULL participant object from meeting.lookup_related;
     timeZone (str, optional) — for date/datetime filters.
 
     Unlike lead/contact/task/deal/company, filters are OPTIONAL for meeting —
@@ -103,8 +103,8 @@
     createdAt); those two get silently normalized to "from" internally, but
     don't rely on that — pass "from,desc" or "createdAt,desc" directly.
 
-    Only [FILTERABLE] fields (from get_meeting_field_instructions) are
-    allowed, plus these synthetic fields the search endpoint accepts even
+    Only [FILTERABLE] fields (see "tenant_filterable_fields" in this same
+    build_payload response) are allowed, plus these synthetic fields the search endpoint accepts even
     though field metadata omits them: associatedLeads, associatedContacts,
     associatedDeals, associatedCompanies (type long; equal / is_null /
     is_not_null) and participants (type participants_lookup; in / not_in
@@ -114,8 +114,9 @@
     use "scheduledAt", it does not exist as a real field (silently mapped to
     "from" internally, but don't rely on that).
 
-    Never guess IDs — always resolve first: call
-    lookup_meeting_related_entity(entity_type, query) before filtering by
+    Never guess IDs — always resolve first: resolve meeting.lookup_related
+    (list_tool -> build_payload -> execute_request; not a standalone tool)
+    with {entity_type, query} before filtering by
     associatedLeads/associatedContacts/associatedDeals/associatedCompanies
     (entity_type: "lead", "contact", "deal", or "company" — use the returned
     numeric id) or by participants (entity_type="invitee" — use the FULL
@@ -123,7 +124,7 @@
     "emails": [...]}, not just the id). For owner: resolve the user via
     lookup_users(query) first, then filter {"field": "owner", "operator":
     "equal", "value": <user_id>}. For organizer: resolve via
-    lookup_meeting_related_entity(entity_type="invitee", query) first, then
+    meeting.lookup_related with {entity_type: "invitee", query} first, then
     filter {"field": "organizer", "operator": "equal", "value": <user_id>}.
     Never use search_entity_by_term to search meetings by owner or organizer
     name — it only searches the title field.
@@ -147,11 +148,14 @@
     (at least one user, e.g. [{"id": <user_id>, "entity": "user"}]).
 
     Before creating, ask the user for: title (required); start/end datetime
-    (required — convert to UTC via get_current_user +
-    parse_datetime_to_utc_iso_tool); participants (required — resolve via
-    lookup_meeting_related_entity with entity_type="invitee", pick the row
+    (required — convert to UTC via get_current_user, then resolve
+    datetime.parse_to_utc); participants (required — resolve via
+    meeting.lookup_related with entity_type="invitee", pick the row
     with the correct entity type); related entities (optional — resolve IDs
-    first via the same lookup tool); location and allDay (optional).
+    first via the same meeting.lookup_related id); location and allDay
+    (optional). Both datetime.parse_to_utc and meeting.lookup_related are
+    resolved via list_tool -> build_payload -> execute_request, not called
+    as standalone tools.
 
     CRITICAL RULES FOR INVITEES: only leads/contacts with a VALID EMAIL can
     be added as invitees (check the emails array from the lookup result).
@@ -169,13 +173,14 @@
 
     Resolving entity IDs — never guess: Meeting owner/conductor (CRM
     users/sales reps) — always lookup_users, never lookup contacts/leads/
-    companies for sales reps. Participants/organizer — lookup_meeting_related_entity
+    companies for sales reps. Participants/organizer — meeting.lookup_related
     with entity_type="invitee" (organizer is usually the row with
-    entity="user"). relatedTo leads/contacts/deals/companies — same tool with
+    entity="user"). relatedTo leads/contacts/deals/companies — same id with
     entity_type="lead"/"contact"/"deal"/"company" respectively.
 
-    timezone: use the timezone picklist ID from get_meeting_field_instructions,
-    not a bare string. customFieldValues: {"<internalName>": <value>} — never
+    timezone: use the timezone picklist ID from this same build_payload
+    response's "tenant_fields", not a bare string. customFieldValues:
+    {"<internalName>": <value>} — never
     use field ID as the key. Picklist fields: use Option ID (number) from the
     live tenant_fields below.
   example:
@@ -195,7 +200,7 @@
     Meetings do not support multi-field free-text search — this searches the
     "title" field ONLY (contains match). Do NOT use this to find meetings by
     owner or organizer name; look up their user ID via lookup_users or
-    lookup_meeting_related_entity(entity_type="invitee") instead, then use
+    meeting.lookup_related with entity_type="invitee" instead, then use
     meeting.search with an "owner" or "organizer" filter.
 
     Use this ONLY when the user provides a specific search term. NEVER use

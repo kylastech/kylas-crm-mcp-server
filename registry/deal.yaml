@@ -186,8 +186,10 @@
     (string).
 
     Date / datetime fields: call get_current_user to get the user's
-    timezone, then call parse_datetime_to_utc_iso_tool(datetime_string,
-    timezone) and put the returned UTC ISO string directly in the payload.
+    timezone, then resolve datetime.parse_to_utc (list_tool -> build_payload
+    -> execute_request; not a standalone tool) with {local_datetime:
+    datetime_string, timezone} and put the returned UTC ISO string directly
+    in the payload.
 
     Never guess IDs: ownedBy and any other user reference — call
     lookup_users(query) first; if multiple matches, list them and ask the

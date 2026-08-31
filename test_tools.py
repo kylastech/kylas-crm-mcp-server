@@ -906,8 +906,8 @@ async def test_search_idle_entities_invalid_type():
 
 
 @pytest.mark.asyncio
-async def test_load_entity_labels_success():
-    """Test successfully loading entity labels from API."""
+async def test_fetch_entity_labels_success():
+    """Test successfully fetching entity labels from API, live, with no caching."""
     mock_labels = {
         "LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"},
         "DEAL": {"displayName": "Deeeel", "displayNamePlural": "Deeeels"},
@@ -921,51 +921,40 @@ async def test_load_entity_labels_success():
         mock_client.get.return_value = mock_response
         mock_get_client.return_value.__aenter__.return_value = mock_client
 
-        result = await main._load_entity_labels()
+        result = await main._fetch_entity_labels()
 
         assert result == mock_labels
         mock_client.get.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_label_refresh_loop():
-    """Test that refresh loop updates labels periodically."""
-    initial_labels = {
-        "LEAD": {"displayName": "Lead", "displayNamePlural": "Leads"}
-    }
-    updated_labels = {
-        "LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"},
-        "DEAL": {"displayName": "Deeeel", "displayNamePlural": "Deeeels"}
-    }
+async def test_fetch_entity_labels_not_cached():
+    """Two calls must each hit the API — nothing is cached process-wide.
+
+    This is the isolation fix itself: the server runs stateless_http, so a
+    module-level cache would leak one tenant's labels into another tenant's
+    request. Every call must resolve auth (and therefore labels) fresh.
+    """
+    first_tenant_labels = {"LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"}}
+    second_tenant_labels = {"LEAD": {"displayName": "Prospect", "displayNamePlural": "Prospects"}}
 
     with patch("main.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
-        # First call returns initial, second returns updated
-        mock_response.json.side_effect = [initial_labels, updated_labels]
+        mock_response.json.side_effect = [first_tenant_labels, second_tenant_labels]
         mock_client.get.return_value = mock_response
         mock_get_client.return_value.__aenter__.return_value = mock_client
 
-        # Load initial labels
-        await main._load_entity_labels()
-        assert main._ENTITY_LABELS == initial_labels
+        result_a = await main._fetch_entity_labels()
+        result_b = await main._fetch_entity_labels()
 
-        # This function doesn't exist yet, test will fail
-        refresh_task = asyncio.create_task(main._label_refresh_loop())
-
-        # Let it run for a moment (won't actually refresh yet)
-        await asyncio.sleep(0.1)
-
-        # Cancel the task
-        refresh_task.cancel()
-        try:
-            await refresh_task
-        except asyncio.CancelledError:
-            pass
+        assert result_a == first_tenant_labels
+        assert result_b == second_tenant_labels
+        assert mock_client.get.call_count == 2
 
 
 @pytest.mark.asyncio
-async def test_load_entity_labels_api_error():
+async def test_fetch_entity_labels_api_error():
     """Test graceful handling when label fetch fails."""
     with patch("main.get_client") as mock_get_client:
         mock_client = AsyncMock()
@@ -973,10 +962,9 @@ async def test_load_entity_labels_api_error():
         mock_get_client.return_value.__aenter__.return_value = mock_client
 
         # Should not raise, should return empty dict
-        result = await main._load_entity_labels()
+        result = await main._fetch_entity_labels()
 
         assert result == {}
-        assert main._ENTITY_LABELS == {}
 
 
 def test_format_entity_labels_for_instructions():
@@ -1005,9 +993,6 @@ async def test_system_instructions_include_labels():
         "LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"},
         "DEAL": {"displayName": "Deeeel", "displayNamePlural": "Deeeels"},
     }
-
-    # Manually set labels
-    main._ENTITY_LABELS = test_labels
 
     # Format labels
     formatted = main._format_entity_labels_for_instructions(test_labels)

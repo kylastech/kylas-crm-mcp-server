@@ -1,36 +1,46 @@
 """
-Kylas CRM MCP Server
+Kylas CRM MCP Server — Generic Registry Architecture
 
-Model Context Protocol server for Kylas CRM operations:
+Model Context Protocol server for Kylas CRM operations (lead, contact,
+deal, task, company, meeting, call_log, quotation). There is no
+per-entity tool surface any more — every operation is reached through
+exactly 5 advertised tools; everything else is internal Python that those
+5 tools dispatch to. See SYSTEM_INSTRUCTIONS below (the actual text served
+to a connecting MCP client as its `instructions`) for the full, current
+contract — this docstring is a short map for a human reading the source,
+not duplicated guidance for the client.
 
-GENERIC CRUD (use these instead of entity-specific tools):
-- create_entity(entity_type, field_values)  — create any entity
-- update_entity(entity_type, entity_id, field_values)  — update any entity
-  Supported entity_type values: lead, contact, deal, task, company, meeting, call_log
+STANDALONE TOOLS (2 — deliberately outside the registry flow):
+- get_entity_labels() — MANDATORY, call first, every session (this tenant
+  may have renamed CRM entities; every other tool only takes the standard
+  type, never the tenant's custom display name). Fetched live, per call,
+  never cached server-side — see _fetch_entity_labels's docstring.
+- get_current_user() — the calling user's profile/timezone; call before
+  any date/datetime conversion.
 
-PER-ENTITY FIELD INSTRUCTIONS (call FIRST to get schema before create/update):
-- get_lead_field_instructions
-- get_contact_field_instructions
-- get_task_field_instructions
-- get_deal_field_instructions
-- get_company_field_instructions
+THE GENERIC REGISTRY FLOW (3 tools):
+- list_tool(bucket?, intent?) — find the id of the operation you need.
+- build_payload(id, fields?) — get that one id's real method/path/
+  usage_notes/schema/example, with this tenant's live custom
+  fields/picklist options folded in where relevant.
+- execute_request(id, payload) — actually run it, via this repo's
+  existing, already-tested *_logic implementation for that id — never a
+  reimplemented HTTP call.
 
-PER-ENTITY GET (fetch full record by ID):
-- get_lead, get_contact, get_task, get_deal, get_company, get_meeting, get_call_log
+Every CRUD operation (get/search/search_by_term/search_idle/create/update)
+across every bucket goes through these 3. So does every operation that used
+to be its own standalone tool — user/product/pipeline lookups, per-entity
+relation lookups (meeting participants, task associations, call logs by
+entity), datetime conversion (datetime.parse_to_utc), and the
+tasks-with-any-relation search (task.search_any_relation) — each reached as
+a registry id, dispatched via _REGISTRY_ID_TO_META_TOOL /
+_META_LOOKUP_ROUTERS to the same real Python function that operation
+always used, not a new implementation.
 
-SEARCH:
-- search_entity(entity_type, filters) — filter any entity by criteria
-- search_entity_by_term(entity_type, term) — full-text search
-- search_idle_entities(entity_type, days) — no activity for N days
-
-PIPELINE:
-- lookup_pipelines, get_pipeline_stages, get_pipeline_details
-
-SHARED UTILITIES:
-- get_current_user (timezone, ID; use for date/datetime handling)
-- lookup_users (resolve user names to IDs for ownerId, createdBy, updatedBy)
-- lookup_products (find products for field_values)
-- parse_datetime_to_utc_iso_tool (convert user timezone to UTC ISO)
+Registry source of truth: registry/*.yaml (what each operation is, how to
+use it) + this file's runtime schemas (the authoritative request shape) —
+see registry/_meta.yaml's header comment for why those two are deliberately
+kept separate.
 """
 
 import asyncio
@@ -49,7 +59,6 @@ import phonenumbers
 import yaml
 from dateutil import parser as dateutil_parser
 from fastmcp.server import FastMCP
-from fastmcp.server.middleware import Middleware, MiddlewareContext
 from dotenv import load_dotenv
 import json
 
@@ -166,8 +175,17 @@ def _get_default_timezone() -> str:
 
 DEFAULT_TIMEZONE = _get_default_timezone()
 
-# Entity label mapping (tenant-specific display names)
-_ENTITY_LABELS: Dict[str, Dict[str, str]] = {}
+# Entity label mapping (tenant-specific display names).
+#
+# Deliberately NOT cached process-wide. This server runs stateless_http=True
+# (see run()) — every request is its own fresh transport with no session
+# continuity (mcp/server/streamable_http_manager.py sets mcp_session_id=None
+# in stateless mode) — so there is no per-tenant or per-session slot to cache
+# this in safely. A module-level dict here previously caused tenant A's
+# labels to leak to tenant B (and, via a background refresh loop with no
+# request context, to whatever KYLAS_API_KEY the env fell back to). Always
+# fetch live, scoped to the resolved auth of the current request. The extra
+# /entities/label round-trip is the accepted cost of correctness.
 
 
 def _threshold_iso_days_ago(days: int, time_zone: str) -> str:
@@ -251,58 +269,31 @@ def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) ->
     return "\n".join(lines)
 
 
-async def _load_entity_labels() -> Dict[str, Dict[str, str]]:
+async def _fetch_entity_labels() -> Dict[str, Dict[str, str]]:
     """
-    Fetch entity labels from /v1/entities/label endpoint.
+    Fetch entity labels from /v1/entities/label endpoint, live, for the caller's
+    own resolved auth (get_client() reads x-api-key/OAuth off the current request).
     Returns mapping like: {"LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"}, ...}
-    Returns empty dict if fetch fails.
+    Returns empty dict if fetch fails — callers fall back to standard names.
+
+    Not cached anywhere — this server runs stateless_http (see run()), so there's no
+    session or tenant-scoped slot to cache this in without either leaking across
+    tenants (the old bug) or reintroducing per-tenant credential storage for a
+    background refresh. Call this fresh wherever the labels are needed.
     """
-    global _ENTITY_LABELS
     try:
         async with get_client() as client:
             resp = await client.get(f"{BASE_URL}/entities/label")
-            _ENTITY_LABELS = resp.json()
-            # Log with display names in clear format
+            labels = resp.json()
             summary = "\n".join(
                 f"  • {etype:8} => {data.get('displayName', etype)} / {data.get('displayNamePlural', etype)}"
-                for etype, data in sorted(_ENTITY_LABELS.items())
+                for etype, data in sorted(labels.items())
             )
-            logger.info(f"\n📦 Loaded Entity Labels:\n{summary}")
-            return _ENTITY_LABELS
+            logger.debug(f"\n📦 Fetched entity labels:\n{summary}")
+            return labels
     except Exception as e:
-        logger.warning(f"Failed to load entity labels: {e}")
-        _ENTITY_LABELS = {}
+        logger.warning(f"Failed to fetch entity labels: {e}")
         return {}
-
-
-async def _label_refresh_loop(interval_seconds: int = 1800) -> None:
-    """
-    Background task: periodically refresh entity labels.
-    Default interval: 1800 seconds (30 minutes).
-    Runs forever until cancelled. Updates _ENTITY_LABELS in-place and
-    rebuilds MCP server instructions so new labels are picked up immediately.
-    """
-    global _ENTITY_LABELS
-    while True:
-        try:
-            await asyncio.sleep(interval_seconds)
-            logger.debug("Refreshing entity labels...")
-            async with get_client() as client:
-                resp = await client.get(f"{BASE_URL}/entities/label")
-                new_labels = resp.json()
-                _ENTITY_LABELS.clear()
-                _ENTITY_LABELS.update(new_labels)
-                logger.info(f"🔄 Refreshed entity labels: {list(_ENTITY_LABELS.keys())}")
-                # SYSTEM_INSTRUCTIONS is fixed for the server's lifetime now (no more
-                # per-tool-description patching either, since every entity-specific tool
-                # this used to patch is always stripped down to the 3 registry tools) —
-                # refreshed labels are cached in _ENTITY_LABELS but no longer rebuild
-                # anything client-visible. See the finalization note near `mcp = FastMCP(...)`.
-        except asyncio.CancelledError:
-            logger.info("Label refresh loop cancelled")
-            break
-        except Exception as e:
-            logger.warning(f"Label refresh failed: {e}. Keeping cached labels.")
 
 
 if not API_KEY:
@@ -317,13 +308,31 @@ SYSTEM_INSTRUCTIONS = """
 
 This server does not expose one dedicated tool per CRM operation. Every
 operation (lead, contact, deal, task, company, meeting, call_log, quotation,
-plus shared user/product/pipeline lookups) is reached through exactly 3
-generic tools, plus a small set of standalone utility tools that don't fit
-the id-based flow (listed below). There is no per-entity instructions block
-loaded up front — everything you need to use any operation correctly is
-either below (rules that apply across every operation) or returned by the
-tools themselves, on demand, scoped to the one operation you're actually
-performing.
+plus shared user/product/pipeline/datetime lookups) is reached through
+exactly 3 generic tools, plus exactly 2 standalone tools that don't fit the
+id-based flow: get_current_user and get_entity_labels (see MANDATORY FIRST
+CALL, immediately below — read that before anything else in this document).
+There is no per-entity instructions block loaded up front — everything you
+need to use any operation correctly is either below (rules that apply
+across every operation) or returned by the tools themselves, on demand,
+scoped to the one operation you're actually performing.
+
+## MANDATORY FIRST CALL — get_entity_labels()
+
+Call get_entity_labels() FIRST, before any other tool, at the start of
+EVERY session — before list_tool, before answering the user's actual
+request, before anything else. This is not optional and not a one-time
+setup step to skip on a hunch that "this tenant probably hasn't renamed
+anything."
+
+Why: this tenant may have renamed standard CRM entities to its own display
+names (e.g. "Lid" instead of "Lead", "Deeeel" instead of "Deal"). Every
+registry id, every bucket name, every field in a payload still uses the
+STANDARD type (lead/contact/deal/task/company/meeting/call_log/quotation)
+— never the tenant's custom name. get_entity_labels() returns the mapping
+from this tenant's custom names to those standard types. Without calling it
+first, a user asking for their "Lids" reads as a request for an entity type
+that doesn't exist, when it's actually just "lead" under a different name.
 
 ## The 3-step flow
 
@@ -376,31 +385,40 @@ performing.
 ## What's registered right now (call list_tool to confirm, don't assume)
 Buckets: lead, contact, meeting, call_log, deal, task, company, quotation,
 plus a bucket-less "_meta" group for shared lookups (user.lookup,
-product.lookup, pipeline.lookup, pipeline.details). Not every bucket has
-every intent:
+product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc).
+Not every bucket has every intent:
   - lead, deal, company: get, search, search_by_term, search_idle, create, update (all 6)
   - contact, meeting: get, search, search_by_term, create, update (no search_idle)
-  - task: get, search, search_by_term, create, update, lookup (task.lookup_entity — no search_idle)
+  - task: get, search, search_by_term, create, update, lookup (task.lookup_entity, task.search_any_relation — no search_idle)
   - call_log: search, create, update, lookup (call_log.by_entity — no get, no search_by_term, no search_idle)
   - meeting also has lookup (meeting.lookup_related), beyond the get/search/search_by_term/create/update above
   - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
-  - _meta: lookup only
+  - _meta: lookup only (user.lookup, product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc)
 Always call list_tool(bucket=...) to see exactly which ids exist for a
 bucket before assuming one does.
 
-## Standalone utility tools (outside the 3-step flow)
-Only 3 tools don't fit the id-based flow above and stay independently
+## Standalone tools (outside the 3-step flow)
+Exactly 2 tools don't fit the id-based flow above and stay independently
 callable — everything else lookup/get-shaped lives in the registry instead
 (see pipeline.details, meeting.lookup_related, task.lookup_entity,
-call_log.by_entity above):
+task.search_any_relation, call_log.by_entity, datetime.parse_to_utc above):
+- get_entity_labels() — MANDATORY, call this first, every session, before
+  anything else. See the MANDATORY FIRST CALL section at the top of this
+  document — not repeated here.
 - get_current_user() — current user's profile/timezone; call before any
-  date/datetime conversion. No bucket concept applies — it's about the
-  calling user, not a CRM entity.
-- parse_datetime_to_utc_iso_tool(local_datetime, timezone) — convert a
-  local datetime to the UTC ISO string create/update payloads need. A pure
-  conversion function; doesn't call the Kylas API at all.
-- search_tasks_with_any_relation(page, size, sort) — tasks linked to ANY
-  entity (4 parallel is_not_null calls, deduplicated) — an OR across 4
+  date/datetime conversion (before resolving datetime.parse_to_utc). No
+  bucket concept applies — it's about the calling user, not a CRM entity.
+
+Two operations that used to be standalone tools are now registry ids —
+resolve them the same way as any other id (list_tool -> build_payload ->
+execute_request), do NOT try to call them as bare functions:
+- datetime.parse_to_utc (local_datetime, timezone) — convert a local
+  datetime to the UTC ISO string create/update payloads need. Call
+  get_current_user first to get the timezone. A pure conversion; doesn't
+  call the Kylas API at all, but is still resolved through execute_request
+  like every other id, not called directly.
+- task.search_any_relation (page, size, sort) — tasks linked to ANY entity
+  (4 parallel is_not_null calls, deduplicated server-side) — an OR across 4
   association fields that a single jsonRule-based filter set (what
   task.search's payload actually is) cannot express as one filter.
 
@@ -740,127 +758,13 @@ async def handle_api_response(response: httpx.Response, operation: str) -> Dict[
 # ---------------------------------------------------------------------------
 
 
-def _format_label_summary() -> str:
-    """One-line summary of entity labels for tool description."""
-    if not _ENTITY_LABELS:
-        return ""
-    parts = []
-    for entity_type in sorted(_ENTITY_LABELS.keys()):
-        label_data = _ENTITY_LABELS[entity_type]
-        display_name = label_data.get("displayName", entity_type)
-        display_plural = label_data.get("displayNamePlural", entity_type)
-        std_type = entity_type.lower()
-        parts.append(f'"{display_name}"/"{display_plural}"={std_type}')
-    return ", ".join(parts)
-
-
-def _update_tool_description(app: FastMCP) -> None:
-    """Patch get_entity_labels tool description with live label data so Claude sees it in the tool list.
-
-    UNUSED since the 3-tool registry surface became the server's only mode: get_entity_labels
-    is always stripped out (see _REGISTRY_ONLY_TOOL_NAMES/_finalize_tool_surface below), so this is a
-    no-op in practice — kept, not deleted, in case a future per-tool-description patching need
-    reappears; not currently called from anywhere.
-    """
-    tool = app.local_provider._components.get("get_entity_labels")
-    if not tool:
-        return
-    summary = _format_label_summary()
-    if summary:
-        tool.description = (
-            f"REQUIRED: Call this ONCE per session before any other action.\n"
-            f"THIS TENANT'S ENTITY NAMES: {summary}\n"
-            f"Returns the full mapping. Use standard types (right of =) in all tool calls."
-        )
-        logger.info(f"Updated get_entity_labels tool description: {summary}")
-
-
-# Maps entity type keys to tool name substrings for description patching
-_ENTITY_TOOL_SUBSTRINGS: Dict[str, str] = {
-    "CONTACT": "contact",
-    "LEAD": "lead",
-    "DEAL": "deal",
-    "TASK": "task",
-    "COMPANY": "company",
-    "MEETING": "meeting",
-    "CALL_LOG": "call_log",
-}
-
-# Stores original tool descriptions so refreshes don't stack the prefix
-_ORIGINAL_TOOL_DESCRIPTIONS: Dict[str, str] = {}
-
-_ENTITY_LABELS_RESOURCE_URI = "kylas://entity-labels"
-
-
-def _patch_entity_tool_descriptions(app: FastMCP) -> None:
-    """
-    Prepend a one-line resource reference to each entity tool's description.
-    Claude reads tool descriptions before deciding which tool to call; seeing the
-    resource URI there prompts it to read kylas://entity-labels for name resolution.
-
-    UNUSED since the 3-tool registry surface became the server's only mode: every
-    entity-specific tool this iterates over (matched by _ENTITY_TOOL_SUBSTRINGS) is
-    always stripped out, so this is a no-op in practice — kept, not deleted, for the
-    same reason as _update_tool_description above; not currently called from anywhere.
-    """
-    if not _ENTITY_LABELS:
-        return
-    for entity_type, substring in _ENTITY_TOOL_SUBSTRINGS.items():
-        label_data = _ENTITY_LABELS.get(entity_type)
-        if not label_data:
-            continue
-        display_name = label_data.get("displayName", "")
-        display_plural = label_data.get("displayNamePlural", "")
-        std_type = entity_type.lower()
-        prefix = (
-            f'[Tenant entity name: "{display_name}" / "{display_plural}" = {std_type}. '
-            f"If user uses a custom name, read resource `{_ENTITY_LABELS_RESOURCE_URI}` to resolve it.]\n"
-        )
-        for tool_name, tool in app.local_provider._components.items():
-            if substring in tool_name.lower() and tool_name != "get_entity_labels":
-                if tool_name not in _ORIGINAL_TOOL_DESCRIPTIONS:
-                    _ORIGINAL_TOOL_DESCRIPTIONS[tool_name] = tool.description
-                tool.description = prefix + _ORIGINAL_TOOL_DESCRIPTIONS[tool_name]
-    logger.info("Patched entity tool descriptions with resource reference")
-
-
-_entity_labels_lock = asyncio.Lock()
-
-
-class _EnsureEntityLabelsMiddleware(Middleware):
-    """Lazily load entity labels on the first tool call that arrives with a valid API key."""
-
-    async def on_call_tool(self, context: MiddlewareContext, call_next):
-        if not _ENTITY_LABELS:
-            async with _entity_labels_lock:
-                # Double-check inside lock — another request may have loaded them first
-                if not _ENTITY_LABELS:
-                    await _load_entity_labels()
-                    if _ENTITY_LABELS:
-                        # SYSTEM_INSTRUCTIONS is fixed at FastMCP construction time and
-                        # never rebuilt from entity labels — the 3-tool registry surface is
-                        # the server's only mode now, no per-tool-description patching to do.
-                        logger.info("Lazily loaded entity labels on first request")
-        return await call_next(context)
-
-
 @asynccontextmanager
 async def _app_lifespan(app: FastMCP):
-    """Startup: attempt eager label load (works if KYLAS_API_KEY env var set), else labels load lazily on first request."""
-    await _load_entity_labels()
-    if _ENTITY_LABELS:
-        logger.info("🚀 Entity labels loaded at startup (cached for future use; SYSTEM_INSTRUCTIONS is fixed and not rebuilt from them)")
-    else:
-        logger.info("Entity labels not loaded at startup — will load lazily on first request")
-    refresh_task = asyncio.create_task(_label_refresh_loop(interval_seconds=1800))
+    """Startup/shutdown. Entity labels are fetched live per-request (see
+    _fetch_entity_labels) — nothing to warm or refresh here."""
     try:
         yield {}
     finally:
-        refresh_task.cancel()
-        try:
-            await refresh_task
-        except asyncio.CancelledError:
-            pass
         # Release the pooled HTTP client held by the token verifier.
         if _kylas_token_verifier is not None:
             try:
@@ -883,7 +787,6 @@ auth_provider, _kylas_token_verifier = create_kylas_auth(
 
 
 mcp = FastMCP("Kylas CRM", instructions=SYSTEM_INSTRUCTIONS, lifespan=_app_lifespan, auth=auth_provider)
-mcp.add_middleware(_EnsureEntityLabelsMiddleware())
 
 
 # ---------------------------------------------------------------------------
@@ -1083,12 +986,13 @@ async def get_entity_labels() -> str:
     Without this, you will fail to recognize entity requests from users.
     After calling this, when the user mentions a custom name, map it to the standard type for all tool calls.
     """
-    if not _ENTITY_LABELS:
+    labels = await _fetch_entity_labels()
+    if not labels:
         return "No custom entity labels configured for this tenant. Standard names apply: lead, contact, deal, task, company, meeting, call_log."
     lines = ["# Entity Label Mapping — Custom Names for This Tenant\n"]
     lines.append("When the user says one of the custom names below, use the corresponding STANDARD TYPE in all tool calls.\n")
-    for entity_type in sorted(_ENTITY_LABELS.keys()):
-        label_data = _ENTITY_LABELS[entity_type]
+    for entity_type in sorted(labels.keys()):
+        label_data = labels[entity_type]
         display_name = label_data.get("displayName", entity_type)
         display_plural = label_data.get("displayNamePlural", entity_type)
         std_type = entity_type.lower()
@@ -1108,15 +1012,16 @@ async def get_entity_labels() -> str:
     ),
     mime_type="text/plain",
 )
-def entity_labels_resource() -> str:
+async def entity_labels_resource() -> str:
     """Serve current entity label mapping as a readable resource."""
-    if not _ENTITY_LABELS:
+    labels = await _fetch_entity_labels()
+    if not labels:
         return "No custom entity labels. Standard names apply: lead, contact, deal, task, company, meeting, call_log."
     lines = ["# Entity Label Mapping — Tenant-Specific Custom Names", ""]
     lines.append("When the user says a custom name, use the STANDARD TYPE (right of →) in all tool calls.")
     lines.append("")
-    for entity_type in sorted(_ENTITY_LABELS.keys()):
-        label_data = _ENTITY_LABELS[entity_type]
+    for entity_type in sorted(labels.keys()):
+        label_data = labels[entity_type]
         display_name = label_data.get("displayName", entity_type)
         display_plural = label_data.get("displayNamePlural", entity_type)
         std_type = entity_type.lower()
@@ -2747,10 +2652,11 @@ async def lookup_entity_for_task(entity_type: str, search_term: str = "") -> str
         _reset_api_call_count()
         etype = entity_type.lower().strip()
 
-        lead_label = _ENTITY_LABELS.get("lead", {}).get("displayName", "Lead")
-        contact_label = _ENTITY_LABELS.get("contact", {}).get("displayName", "Contact")
-        deal_label = _ENTITY_LABELS.get("deal", {}).get("displayName", "Deal")
-        company_label = _ENTITY_LABELS.get("company", {}).get("displayName", "Company")
+        labels = await _fetch_entity_labels()
+        lead_label = labels.get("lead", {}).get("displayName", "Lead")
+        contact_label = labels.get("contact", {}).get("displayName", "Contact")
+        deal_label = labels.get("deal", {}).get("displayName", "Deal")
+        company_label = labels.get("company", {}).get("displayName", "Company")
 
         if etype == "lead":
             result = await lookup_leads_for_task(search_term)
@@ -2879,10 +2785,11 @@ async def _search_tasks_with_any_relation_logic(
     if not paginated:
         return f"No tasks on page {page + 1} (total found: {len(all_tasks)})."
 
-    lead_label = _ENTITY_LABELS.get("lead", {}).get("displayName", "Lead")
-    contact_label = _ENTITY_LABELS.get("contact", {}).get("displayName", "Contact")
-    deal_label = _ENTITY_LABELS.get("deal", {}).get("displayName", "Deal")
-    company_label = _ENTITY_LABELS.get("company", {}).get("displayName", "Company")
+    labels = await _fetch_entity_labels()
+    lead_label = labels.get("lead", {}).get("displayName", "Lead")
+    contact_label = labels.get("contact", {}).get("displayName", "Contact")
+    deal_label = labels.get("deal", {}).get("displayName", "Deal")
+    company_label = labels.get("company", {}).get("displayName", "Company")
     entity_type_label_map = {
         "LEAD": lead_label,
         "CONTACT": contact_label,
@@ -6462,17 +6369,25 @@ def list_tool(
 
     Registry contents right now (this will grow — always confirm here rather than
     assuming an id exists, since not every bucket has every intent):
-      buckets: lead, contact, meeting, call_log, _meta
+      buckets: lead, contact, deal, task, company, meeting, call_log, quotation, _meta
       intents: get, search, search_by_term, search_idle, create, update, lookup
-      (lead has all of get/search/search_by_term/search_idle/create/update;
-      contact and meeting have get/search/search_by_term/create/update but no
-      search_idle; call_log has only search/create/update — no get and no
-      search_by_term; _meta is bucket-less and only has lookup entries, e.g.
-      "user.lookup". Call list_tool(bucket=...) to see exactly which intents
-      a given bucket actually has — don't assume parity across buckets.)
+      (lead/deal/company have all of get/search/search_by_term/search_idle/
+      create/update; contact/meeting have the same 5 minus search_idle;
+      task has get/search/search_by_term/create/update plus lookup
+      (task.lookup_entity, task.search_any_relation), no search_idle;
+      call_log has only search/create/update plus lookup (call_log.by_entity)
+      — no get, no search_by_term, no search_idle; meeting also has lookup
+      (meeting.lookup_related) on top of its other 4; quotation is READ-ONLY
+      — get/search/search_by_term/search_idle only, no create/update; _meta
+      is bucket-less and has lookup entries only (user.lookup,
+      product.lookup, pipeline.lookup, pipeline.details,
+      datetime.parse_to_utc). Call list_tool(bucket=...) to see exactly
+      which intents a given bucket actually has — don't assume parity
+      across buckets.)
 
-    bucket: restrict to one bucket (e.g. "lead", "contact", "meeting", "call_log",
-      "_meta"). Omit to search every bucket.
+    bucket: restrict to one bucket (e.g. "lead", "contact", "deal", "task",
+      "company", "meeting", "call_log", "quotation", "_meta"). Omit to search
+      every bucket.
     intent: restrict to one intent — "get", "search", "search_by_term",
       "search_idle", "create", "update", or "lookup". Omit to match any.
 
@@ -7138,30 +7053,50 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
 # to FastMCP(...) below) is the server's one and only instructions text.
 # ---------------------------------------------------------------------------
 
-# The tools kept advertised to a connecting client. Beyond the 3 core
-# registry tools, this also keeps a small number of standalone utility tools
-# that genuinely cannot be expressed as a registry id:
+# The tools kept advertised to a connecting client: the 3 core registry
+# tools, plus exactly 2 standalone tools that deliberately do NOT go through
+# the id-based flow:
 #   - get_current_user: no bucket at all — it's about the calling user, not
-#     any CRM entity.
-#   - parse_datetime_to_utc_iso_tool: a pure conversion function, doesn't
-#     even call the Kylas API — not a get/search/create/update on anything.
-#   - search_tasks_with_any_relation: makes 4 parallel is_not_null calls (one
-#     per association field) and dedupes — an OR across 4 fields that a
-#     single jsonRule-based filter set (what task.search's payload actually
-#     is) cannot express as one filter.
-# get_pipeline_details, lookup_meeting_related_entity, lookup_entity_for_task,
-# and get_call_logs used to live here too — they're genuinely lookup/get-shaped
-# (unlike the 3 above) and have since been folded into the registry instead,
-# as pipeline.details (_meta), meeting.lookup_related, task.lookup_entity,
-# and call_log.by_entity respectively — see _REGISTRY_ID_TO_META_TOOL /
-# _META_LOOKUP_ROUTERS below for their dispatch. lookup_users/lookup_products/
-# lookup_pipelines were never listed here either, for the same reason —
-# they're reachable through the _meta bucket (user.lookup/product.lookup/
-# pipeline.lookup).
+#     any CRM entity. Needed to resolve the caller's own timezone before any
+#     datetime conversion.
+#   - get_entity_labels: MUST be called before any other tool, every
+#     session (this tenant may have renamed CRM entities — e.g. "Lid"
+#     instead of "Lead" — and every other tool/registry id only ever takes
+#     the STANDARD type, never the tenant's custom display name). That
+#     "call me first, unconditionally" contract is a stronger, session-level
+#     precondition than what the registry's "lookup" intent models (an
+#     on-demand resolution called when a specific field needs it) — see the
+#     MANDATORY FIRST CALL section of SYSTEM_INSTRUCTIONS. Deliberately NOT
+#     cached anywhere server-side and NOT folded into the registry as a
+#     _meta lookup id — see _fetch_entity_labels's own docstring for why
+#     (this server runs stateless_http; a process-wide cache leaked one
+#     tenant's labels into another's requests, which is what motivated
+#     pulling this back out to a live, always-fresh call).
+#
+# Every other former standalone tool has been folded into the registry
+# instead, reached via list_tool -> build_payload -> execute_request rather
+# than called directly:
+#   - get_pipeline_details, lookup_meeting_related_entity,
+#     lookup_entity_for_task, get_call_logs -> pipeline.details (_meta),
+#     meeting.lookup_related, task.lookup_entity, call_log.by_entity
+#   - lookup_users, lookup_products, lookup_pipelines -> user.lookup,
+#     product.lookup, pipeline.lookup (all _meta)
+#   - parse_datetime_to_utc_iso_tool -> datetime.parse_to_utc (_meta). Being
+#     a pure conversion with no Kylas API call at all doesn't block this —
+#     the router just calls the same Python function directly, same as
+#     every other _meta/lookup router.
+#   - search_tasks_with_any_relation -> task.search_any_relation. Its 4
+#     parallel is_not_null calls still can't be expressed as one
+#     task.search filter set, but that only ruled out modeling it as a
+#     search.* variant — the lookup-intent router dispatch (same mechanism
+#     task.lookup_entity already used) bypasses that limitation entirely.
+# See _REGISTRY_ID_TO_META_TOOL / _META_LOOKUP_ROUTERS below for how each of
+# these is actually dispatched — the underlying Python function for every
+# one of them still exists in this file unchanged, just no longer
+# separately advertised.
 _REGISTRY_ONLY_TOOL_NAMES = {
     "list_tool", "build_payload", "execute_request",
-    "get_current_user", "parse_datetime_to_utc_iso_tool",
-    "search_tasks_with_any_relation",
+    "get_current_user", "get_entity_labels",
 }
 
 
@@ -7209,6 +7144,7 @@ for _name in (
     "lookup_users", "lookup_products", "lookup_pipelines",
     "get_pipeline_details", "lookup_meeting_related_entity",
     "lookup_entity_for_task", "get_call_logs",
+    "parse_datetime_to_utc_iso_tool", "search_tasks_with_any_relation",
 ):
     _snapshot_original_tool_parameters(_name)
 
@@ -7226,6 +7162,8 @@ _REGISTRY_ID_TO_META_TOOL: Dict[str, str] = {
     "meeting.lookup_related": "lookup_meeting_related_entity",
     "task.lookup_entity": "lookup_entity_for_task",
     "call_log.by_entity": "get_call_logs",
+    "datetime.parse_to_utc": "parse_datetime_to_utc_iso_tool",
+    "task.search_any_relation": "search_tasks_with_any_relation",
 }
 
 
@@ -7303,16 +7241,40 @@ async def _call_log_by_entity_router(payload: Dict[str, Any]) -> str:
     )
 
 
+async def _datetime_parse_router(payload: Dict[str, Any]) -> str:
+    # parse_datetime_to_utc_iso_tool is a plain sync function (no Kylas API
+    # call at all — pure local conversion), unlike every other router here.
+    # It self-catches its own parse errors and returns an "Error: ..."
+    # string rather than raising, same asymmetry already documented on the
+    # search_*_logic routers execute_request calls elsewhere.
+    return parse_datetime_to_utc_iso_tool(
+        local_datetime=payload["local_datetime"],
+        timezone=payload["timezone"],
+    )
+
+
+async def _task_search_any_relation_router(payload: Dict[str, Any]) -> str:
+    # search_tasks_with_any_relation self-catches KylasAPIError/Exception
+    # and returns a "✗ ..." string rather than raising — same asymmetry
+    # already documented on the search_*_logic routers above.
+    return await search_tasks_with_any_relation(
+        page=payload.get("page", 0),
+        size=payload.get("size", 20),
+        sort=payload.get("sort", "createdAt,desc"),
+    )
+
+
 # "_meta" entries (and the bucket-scoped lookups below) are NOT
 # entity-CRUD-shaped like lead/contact — each one is its own standalone old
 # tool with its own real signature, so (unlike get/search/create/update)
 # there's no single generic _ENTITY_CONFIG-style router to reuse for
 # "lookup" intents; the old system never had one either (lookup_users/
 # lookup_products/lookup_pipelines/get_pipeline_details/
-# lookup_meeting_related_entity/lookup_entity_for_task/get_call_logs were
-# always separate, unrelated tools). One small explicit map, one line per
-# id, is the honest shape here — add a line per new "lookup" id, same as
-# any other dict-based dispatch already in this file.
+# lookup_meeting_related_entity/lookup_entity_for_task/get_call_logs/
+# parse_datetime_to_utc_iso_tool/search_tasks_with_any_relation were always
+# separate, unrelated tools). One small explicit map, one line per id, is
+# the honest shape here — add a line per new "lookup" id, same as any other
+# dict-based dispatch already in this file.
 _META_LOOKUP_ROUTERS: Dict[str, Any] = {
     "user.lookup": _lookup_users_router,
     "product.lookup": _lookup_products_router,
@@ -7321,6 +7283,8 @@ _META_LOOKUP_ROUTERS: Dict[str, Any] = {
     "meeting.lookup_related": _meeting_lookup_related_router,
     "task.lookup_entity": _task_lookup_entity_router,
     "call_log.by_entity": _call_log_by_entity_router,
+    "datetime.parse_to_utc": _datetime_parse_router,
+    "task.search_any_relation": _task_search_any_relation_router,
 }
 
 
