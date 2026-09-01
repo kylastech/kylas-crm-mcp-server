@@ -52,8 +52,8 @@
 #
 # Deliberately has NO call_log.get entry: there is no get-a-single-call-log-
 # by-id endpoint anywhere in the old system — the only real read path is
-# get_call_logs(entity_id, entity_type), which lists call logs FOR a lead/
-# contact/deal, not a single call log by its own ID (confirmed: no
+# call_log.by_entity (entity_id, entity_type), which lists call logs FOR a
+# lead/contact/deal, not a single call log by its own ID (confirmed: no
 # get_call_log_logic exists in main.py). Not an omission; adding a .get
 # entry would be inventing a capability that never existed. That real
 # by-entity read path IS represented below, though — as call_log.by_entity,
@@ -91,8 +91,9 @@
     call_log — an empty filter list returns all call logs, it does not
     error.
 
-    Only [FILTERABLE] fields (from get_call_log_field_instructions) are
-    allowed. Picklist fields that use internal name (string) instead of
+    Only [FILTERABLE] fields (see "tenant_filterable_fields" in this same
+    build_payload response) are allowed. Picklist fields that use internal
+    name (string) instead of
     Option ID: outcome, callType, overallSentiment, callDisposition,
     customerEmotion.
 
@@ -104,14 +105,17 @@
     convert filter values to UTC.
 
     Never guess IDs — always resolve first: Users (createdBy, updatedBy,
-    owner, etc.) — call lookup_users(query); if multiple matches, list them
-    and ask user to pick. Entity IDs (for relatedTo filters) — search for
-    the lead/contact/deal first to get its real ID; never invent IDs.
+    owner, etc.) — resolve user.lookup (list_tool -> build_payload ->
+    execute_request; not a standalone tool) with {query}; if multiple
+    matches, list them and ask user to pick. Entity IDs (for relatedTo
+    filters) — search for the lead/contact/deal first to get its real ID;
+    never invent IDs.
 
     Each result's "relatedTo" shows which lead/contact/deal the call belongs
     to — to see full details of that entity together with all its call
-    logs, use get_call_logs(entity_id, entity_type) instead of paging
-    through call_log.search results one at a time.
+    logs, resolve call_log.by_entity (list_tool -> build_payload ->
+    execute_request; not a standalone tool) with {entity_id, entity_type}
+    instead of paging through call_log.search results one at a time.
 
     Pagination: always use the largest page size available. Do NOT
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
@@ -135,9 +139,9 @@
     Before creating, ask for: which entity (lead, contact, or deal — search
     to get its real ID); phone number; call type (incoming/outgoing);
     outcome (connected/rejected/busy/no_answer/missed_call/in_progress);
-    start time (convert to UTC via get_current_user +
-    parse_datetime_to_utc_iso_tool). Duration (seconds) and notes are
-    optional.
+    start time (convert to UTC via get_current_user, then resolve
+    datetime.parse_to_utc — list_tool -> build_payload -> execute_request,
+    not a standalone tool). Duration (seconds) and notes are optional.
 
     Payload — lead or contact:
     {"outcome": "connected", "callType": "outgoing",

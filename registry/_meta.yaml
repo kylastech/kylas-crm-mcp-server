@@ -160,3 +160,31 @@
 
     pipeline_id: the pipeline's ID, from pipeline.lookup's results.
   example: {pipeline_id: 12345}
+
+- id: datetime.parse_to_utc
+  bucket: _meta
+  intent: lookup
+  method: LOCAL
+  path: (no HTTP call — pure conversion, runs in-process)
+  dynamic_fields: false
+  description: "Convert a datetime string in the user's local timezone to the UTC ISO string create/update payloads need."
+  usage_notes: >
+    Call get_current_user FIRST to get the user's IANA timezone (e.g.
+    Asia/Calcutta) — never guess it or assume UTC. Then call this with the
+    datetime exactly as the user said it. Use the returned string directly
+    in any date/datetime field of a *.create or *.update payload.
+
+    local_datetime: the datetime as the user said it (e.g. "11 Feb 2026
+    7:30 AM", "11th Feb 2026 at 7:30 am") — pass it through close to
+    verbatim, do not pre-parse or reformat it yourself first. timezone: the
+    IANA timezone string from get_current_user (e.g. "Asia/Calcutta"), not
+    a UTC offset or abbreviation.
+
+    This makes no Kylas API call at all — it is a pure local conversion, so
+    it never fails on rate limits or auth and there is nothing to retry.
+    A malformed local_datetime returns an "Error: ..." string in "data"
+    rather than raising — execute_request's envelope still reads
+    {"ok": true, ...} in that case, so check the returned string itself for
+    an "Error:" prefix before trusting it, the same caveat that already
+    applies to the other _meta lookup ids that self-catch their own errors.
+  example: {local_datetime: "11 Feb 2026 7:30 AM", timezone: "Asia/Calcutta"}
