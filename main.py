@@ -910,7 +910,7 @@ def _build_search_json_rule(
         if not field_name:
             return {}, f"Filter #{i + 1}: missing 'field'."
         if field_name not in filterable_map:
-            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only [FILTERABLE] fields from get_lead_field_instructions."
+            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only a field listed as [FILTERABLE] in this endpoint's build_payload response (tenant_filterable_fields)."
         meta = filterable_map[field_name]
         api_type = meta.get("type", "TEXT_FIELD")
         allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
@@ -997,8 +997,8 @@ async def get_entity_labels() -> str:
         display_plural = label_data.get("displayNamePlural", entity_type)
         std_type = entity_type.lower()
         lines.append(f'- User says "{display_name}" or "{display_plural}" → use standard type: "{std_type}"')
-    lines.append('\n**Example:** User says "get animals" → map "animals" to "contact" → call search_contacts(...)')
-    lines.append('**Example:** User says "show cars" → map "cars" to "deal" → call search_deals(...)')
+    lines.append('\n**Example:** User says "get animals" → map "animals" to "contact" → use "contact.search" (list_tool -> build_payload -> execute_request)')
+    lines.append('**Example:** User says "show cars" → map "cars" to "deal" → use "deal.search" (list_tool -> build_payload -> execute_request)')
     return "\n".join(lines)
 
 
@@ -1029,8 +1029,8 @@ async def entity_labels_resource() -> str:
     lines.extend([
         "",
         "Examples:",
-        '  User says "get animals" → standard type is "contact" → call search_contacts(...)',
-        '  User says "show cars"   → standard type is "deal"    → call search_deals(...)',
+        '  User says "get animals" → standard type is "contact" → use "contact.search" (list_tool -> build_payload -> execute_request)',
+        '  User says "show cars"   → standard type is "deal"    → use "deal.search" (list_tool -> build_payload -> execute_request)',
     ])
     return "\n".join(lines)
 
@@ -1296,7 +1296,7 @@ async def lookup_pipelines_logic(
         name = p.get("name", p.get("displayName", "—"))
         lines.append(f"  • ID: {pid}  |  Name: {name}")
     lines.append("-" * 50)
-    lines.append("Ask the user to confirm which pipeline to use (list id and name). Do NOT call get_pipeline_stages until the user has confirmed. After confirmation, call get_pipeline_stages with that pipeline ID only, then search or update with pipeline + pipelineStage filters.")
+    lines.append("Ask the user to confirm which pipeline to use (list id and name). Do NOT resolve pipeline.details until the user has confirmed. After confirmation, resolve pipeline.details (list_tool -> build_payload -> execute_request; not a standalone tool) with that pipeline ID only, then search or update with pipeline + pipelineStage filters.")
     return "\n".join(lines)
 
 
@@ -1444,7 +1444,7 @@ async def get_pipeline_details_logic(pipeline_id: int) -> str:
     else:
         lines.append("  (none configured)")
     lines.append("")
-    lines.append("When updating lead to Closed Lost or Closed Unqualified, ask the user to pick one reason from the list above, then call update_lead with pipelineStageReason set to that exact string.")
+    lines.append("When updating a lead or deal to Closed Lost or Closed Unqualified, ask the user to pick one reason from the list above, then resolve lead.update or deal.update (list_tool -> build_payload -> execute_request; not a standalone tool) with pipelineStageReason set to that exact string.")
     return "\n".join(lines)
 
 
@@ -2101,7 +2101,7 @@ async def search_idle_leads_logic(
         if name in filterable_map:
             filters.append({"field": name, **base})
     if not filters:
-        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_lead_field_instructions."
+        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check build_payload(\"lead.search\")'s tenant_filterable_fields."
     return await search_leads_logic(filters, page=page, size=size, sort=sort)
 
 
@@ -2959,7 +2959,7 @@ def _build_deal_search_json_rule(
         if not field_name:
             return {}, f"Filter #{i + 1}: missing 'field'."
         if field_name not in filterable_map:
-            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only [FILTERABLE] fields from get_deal_field_instructions."
+            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only a field listed as [FILTERABLE] in build_payload(\"deal.search\")'s tenant_filterable_fields."
         meta = filterable_map[field_name]
         api_type = meta.get("type", "TEXT_FIELD")
         allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
@@ -3582,7 +3582,7 @@ async def search_idle_deals_logic(
         if name in filterable_map:
             filters.append({"field": name, **base})
     if not filters:
-        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_deal_field_instructions."
+        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check build_payload(\"deal.search\")'s tenant_filterable_fields."
     return await search_deals_logic(filters, page=page, size=size, sort=sort)
 
 
@@ -3623,7 +3623,7 @@ async def search_idle_companies_logic(
         if name in filterable_map:
             filters.append({"field": name, **base})
     if not filters:
-        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_company_field_instructions."
+        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check build_payload(\"company.search\")'s tenant_filterable_fields."
     return await search_companies_logic(filters, page=page, size=size, sort=sort)
 
 
@@ -3725,7 +3725,7 @@ def _build_company_search_json_rule(
         if not field_name:
             return {}, f"Filter #{i + 1}: missing 'field'."
         if field_name not in filterable_map:
-            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only [FILTERABLE] fields from get_company_field_instructions."
+            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only a field listed as [FILTERABLE] in build_payload(\"company.search\")'s tenant_filterable_fields."
         meta = filterable_map[field_name]
         api_type = meta.get("type", "TEXT_FIELD")
         allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
@@ -4250,7 +4250,8 @@ def _build_meeting_search_json_rule(
         else:
             return {}, (
                 f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. "
-                "Use [FILTERABLE] from get_meeting_field_instructions, or synthetic meeting fields: "
+                "Use a field listed as [FILTERABLE] in build_payload(\"meeting.search\")'s tenant_filterable_fields, "
+                "or synthetic meeting fields: "
                 "associatedLeads, associatedContacts, associatedDeals, associatedCompanies (LOOK_UP; equal / is_null / is_not_null)."
             )
         api_type = meta.get("type", "TEXT_FIELD")
@@ -4990,7 +4991,7 @@ def _build_call_log_search_json_rule(
         if not field_name:
             return {}, f"Filter #{i + 1}: missing 'field'."
         if field_name not in filterable_map:
-            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only [FILTERABLE] fields from get_call_log_field_instructions."
+            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only a field listed as [FILTERABLE] in build_payload(\"call_log.search\")'s tenant_filterable_fields."
         meta = filterable_map[field_name]
         api_type = meta.get("type", "TEXT_FIELD")
         allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
@@ -5148,8 +5149,8 @@ async def search_call_logs_logic(
     for log in results:
         lines.append(_format_call_log_for_display(log))
         lines.append("")
-    lines.append("💡 HINT: For call logs showing 'Related: contact#123' or 'lead#456', use:")
-    lines.append("  • get_call_logs(entity_id=123, entity_type='contact') to see full contact details with their call logs")
+    lines.append("💡 HINT: For call logs showing 'Related: contact#123' or 'lead#456', resolve:")
+    lines.append("  • call_log.by_entity (list_tool -> build_payload -> execute_request; not a standalone tool) with {entity_id: 123, entity_type: 'contact'} to see full contact details with their call logs")
     return "\n".join(lines)
 
 
@@ -5694,7 +5695,7 @@ async def search_idle_quotations_logic(
         if name in filterable_map:
             filters.append({"field": name, **base})
     if not filters:
-        return "Error: 'updatedAt' is not filterable for quotations in this tenant. Check get_quotation_field_instructions."
+        return "Error: 'updatedAt' is not filterable for quotations in this tenant. Check build_payload(\"quotation.search\")'s tenant_filterable_fields."
     return await search_quotations_logic(filters, page=page, size=size, sort=sort)
 
 
