@@ -547,7 +547,7 @@ OPERATOR_SYMBOL_MAP = {
 }
 
 # Picklist fields that use internal name (string) in search; all others use Option ID (long)
-PICKLIST_FIELDS_USE_INTERNAL_NAME = {"requirementCurrency", "companyBusinessType", "country", "timezone", "companyIndustry"}
+PICKLIST_FIELDS_USE_INTERNAL_NAME = {"requirementCurrency", "companyBusinessType", "country", "timezone", "companyIndustry","companyCountry"}
 
 # ---------------------------------------------------------------------------
 # API call throttle: 100–500 ms random delay between subsequent calls per tool
@@ -6606,8 +6606,12 @@ async def _fold_field_metadata_into_schema(
             # path still emits it only where it already did — below, on an
             # omitted picklist, where the caller has no options to reason
             # from and silence is the worse of the two errors.
-            if for_search and rules_authored:
-                summary["uses_internal_name"] = field_name in internal_name_fields
+            if rules_authored:
+                summary["uses_internal_name"] = (
+                    "Use internal 'name' string for this picklist"
+                    if field_name in internal_name_fields
+                    else "Use numeric option 'id' for this picklist"
+                )
             if field_name in large_fields and field_name not in requested_picklists_set:
                 # Oversized picklist the caller didn't ask for. Emit a stub
                 # instead of the array. The stub is deliberately self-
@@ -6622,12 +6626,6 @@ async def _fold_field_metadata_into_schema(
                     f"re-call build_payload(id, fields=[\"{name}\"]) to get them. "
                     f"Do NOT guess an option id or name."
                 )
-                # Without the inline options the caller can no longer see
-                # whether this field wants "IN" or 175 — so say it outright.
-                # Read per-bucket: the same field name disagrees across
-                # entities (lead's timezone is a name, meeting's is an id).
-                if rules_authored and not for_search:
-                    summary["uses_internal_name"] = field_name in internal_name_fields
             else:
                 summary["options"] = opts
         return summary
@@ -6720,11 +6718,10 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
                        a fetch failure, and "options_omitted" tells you exactly
                        how to get the real options when you need them.
                        Per-field keys worth knowing:
-                         uses_internal_name - on a picklist: true means send
-                           the option's "name" string, false means send its
-                           numeric "id". Absent means this entity's rule has
-                           not been verified — read usage_notes instead of
-                           assuming either shape.
+                         uses_internal_name - on a picklist: explicit self-describing
+                           instruction string stating whether to send the option's
+                           internal "name" string or numeric "id". Absent means this
+                           entity's rule has not been verified — read usage_notes instead.
                          filter_field_path - search only: the exact string to
                            put in a filter's "field" key. Copy it verbatim;
                            custom fields use a dotted path here.
