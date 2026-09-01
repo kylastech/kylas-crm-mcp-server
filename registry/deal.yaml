@@ -123,14 +123,16 @@
     timezone; pass timeZone in the filter (or omit — server uses it). Do NOT
     convert filter values to UTC.
 
-    Finding deals by product: call lookup_products(query) to resolve the
-    product name to an ID, then filter {"field": "products", "operator":
-    "equal", "value": <product_id>}.
+    Finding deals by product: resolve product.lookup (list_tool ->
+    build_payload -> execute_request; not a standalone tool) with {query}
+    to resolve the product name to an ID, then filter {"field": "products",
+    "operator": "equal", "value": <product_id>}.
 
     Never guess IDs — always resolve first: Users (createdBy, updatedBy,
-    owner, ownedBy, etc.) — call lookup_users(query); if multiple matches,
-    list them and ask user to pick. Products — call lookup_products(query);
-    if multiple matches, list and ask.
+    owner, ownedBy, etc.) — resolve user.lookup (list_tool -> build_payload
+    -> execute_request; not a standalone tool) with {query}; if multiple
+    matches, list them and ask user to pick. Products — resolve
+    product.lookup the same way; if multiple matches, list and ask.
 
     Pagination: always use the largest page size available. Do NOT
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
@@ -162,19 +164,22 @@
     {"currencyId": <id>, "value": <number>} — never a plain number, the API
     rejects it. Example: "estimatedValue": {"currencyId": 431, "value": 32}.
 
-    Owner (ownedBy): {"id": <user_id>} — resolve via lookup_users first.
+    Owner (ownedBy): {"id": <user_id>} — resolve via user.lookup (list_tool
+    -> build_payload -> execute_request; not a standalone tool) first.
     Example: "ownedBy": {"id": 7236}.
 
-    Pipeline and stage: call lookup_pipelines(entity_type="DEAL") first.
-    List pipelines and confirm with the user, even if only one exists. If
-    the target pipeline has sequentialStageFlow=true (visible in
-    get_pipeline_details output) and the requested stage isn't the first
+    Pipeline and stage: resolve pipeline.lookup (list_tool -> build_payload
+    -> execute_request; not a standalone tool) with {entity_type: "DEAL"}
+    first. List pipelines and confirm with the user, even if only one
+    exists. If the target pipeline has sequentialStageFlow=true (visible in
+    pipeline.details' output) and the requested stage isn't the first
     stage, the server automatically creates the deal in stage 1 first, then
     advances it stage-by-stage to the requested target — pass the desired
     target stage directly, the sequential advancement is handled
     transparently; you do not need to do anything differently.
 
-    Products: ask the user for product name (resolve via lookup_products),
+    Products: ask the user for product name (resolve via product.lookup —
+    list_tool -> build_payload -> execute_request; not a standalone tool),
     quantity, price per unit, currency, and optional discount before
     adding — do NOT add products without confirming price, quantity, and
     currency first. Shape: {"products": [{"id": <product_id>, "quantity":
@@ -191,9 +196,10 @@
     datetime_string, timezone} and put the returned UTC ISO string directly
     in the payload.
 
-    Never guess IDs: ownedBy and any other user reference — call
-    lookup_users(query) first; if multiple matches, list them and ask the
-    user to pick.
+    Never guess IDs: ownedBy and any other user reference — resolve
+    user.lookup (list_tool -> build_payload -> execute_request; not a
+    standalone tool) with {query} first; if multiple matches, list them and
+    ask the user to pick.
   example:
     name: "Big Deal"
     closingDate: "2026-06-30T00:00:00.000Z"
@@ -265,8 +271,9 @@
     {"entity_id": <id>, "pipelineStage": <stage_id>}. Move to a DIFFERENT
     pipeline: set the payload to {"entity_id": <id>, "pipeline": {...},
     "forecastingType": "..."} with the full pipeline object including the
-    nested target stage. Closing reasons (Closed Lost/Unqualified): call
-    get_pipeline_details for the valid reasons, ask the user to pick, then
+    nested target stage. Closing reasons (Closed Lost/Unqualified): resolve
+    pipeline.details (list_tool -> build_payload -> execute_request; not a
+    standalone tool) for the valid reasons, ask the user to pick, then
     pass {"entity_id": <id>, "pipelineStage": stage_id, "pipelineStageReason":
     reason}. If the pipeline has sequentialStageFlow=true, the same automatic
     first-stage fallback described in deal.create applies here too.

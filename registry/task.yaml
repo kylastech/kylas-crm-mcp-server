@@ -160,8 +160,9 @@
     association fields.
 
     Never guess IDs — always resolve first: Users (assignedTo, createdBy,
-    updatedBy, etc.) — call lookup_users(query); if multiple matches, list
-    them and ask user to pick.
+    updatedBy, etc.) — resolve user.lookup (list_tool -> build_payload ->
+    execute_request; not a standalone tool) with {query}; if multiple
+    matches, list them and ask user to pick.
 
     Pagination: always use the largest page size available. Do NOT
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
@@ -202,9 +203,10 @@
     {local_datetime: datetime_string, timezone} and put the returned UTC ISO
     string directly in the payload.
 
-    Never guess IDs: assignedTo and any other user reference — call
-    lookup_users(query) first; if multiple matches, list them and ask the
-    user to pick.
+    Never guess IDs: assignedTo and any other user reference — resolve
+    user.lookup (list_tool -> build_payload -> execute_request; not a
+    standalone tool) with {query} first; if multiple matches, list them and
+    ask the user to pick.
   example:
     name: "Follow up"
     dueDate: "2026-05-01T18:29:59.999Z"

@@ -105,9 +105,11 @@
     convert filter values to UTC.
 
     Never guess IDs — always resolve first: Users (createdBy, updatedBy,
-    owner, etc.) — call lookup_users(query); if multiple matches, list them
-    and ask user to pick. Entity IDs (for relatedTo filters) — search for
-    the lead/contact/deal first to get its real ID; never invent IDs.
+    owner, etc.) — resolve user.lookup (list_tool -> build_payload ->
+    execute_request; not a standalone tool) with {query}; if multiple
+    matches, list them and ask user to pick. Entity IDs (for relatedTo
+    filters) — search for the lead/contact/deal first to get its real ID;
+    never invent IDs.
 
     Each result's "relatedTo" shows which lead/contact/deal the call belongs
     to — to see full details of that entity together with all its call

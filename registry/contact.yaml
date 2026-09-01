@@ -100,11 +100,14 @@
     convert filter values to UTC.
 
     Never guess IDs — always resolve first: Users (createdBy, updatedBy,
-    owner, ownerId, assignedTo, etc.) — call lookup_users(query); never use
-    contact or lead lookup tools for employees/users; if multiple matches,
-    list them and ask user to pick. Products — call lookup_products(query);
-    if multiple matches, list and ask. Entity IDs (for association filters) —
-    search for the entity first to get its real ID; never invent IDs.
+    owner, ownerId, assignedTo, etc.) — resolve user.lookup (list_tool ->
+    build_payload -> execute_request; not a standalone tool) with {query};
+    never use contact or lead lookup tools for employees/users; if multiple
+    matches, list them and ask user to pick. Products — resolve
+    product.lookup (list_tool -> build_payload -> execute_request; not a
+    standalone tool) with {query}; if multiple matches, list and ask. Entity
+    IDs (for association filters) — search for the entity first to get its
+    real ID; never invent IDs.
 
     Pagination: always use the largest page size available. Do NOT
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
@@ -159,9 +162,10 @@
     in the payload.
 
     Never guess IDs: ownerId and any other user reference (createdBy,
-    updatedBy, assignedTo, etc.) — call lookup_users(query) first; never use
-    contact or lead lookup tools for employees/users; if multiple matches,
-    list them and ask the user to pick.
+    updatedBy, assignedTo, etc.) — resolve user.lookup (list_tool ->
+    build_payload -> execute_request; not a standalone tool) with {query}
+    first; never use contact or lead lookup tools for employees/users; if
+    multiple matches, list them and ask the user to pick.
 
     This payload's exact shape, flat, no wrapper key (lead/contact share the
     same shape): {"firstName": "Jane", "lastName": "Doe", "email":

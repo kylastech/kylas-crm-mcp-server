@@ -122,12 +122,13 @@
     numeric id) or by participants (entity_type="invitee" — use the FULL
     returned object, e.g. {"id": 123, "entity": "lead", "name": "...",
     "emails": [...]}, not just the id). For owner: resolve the user via
-    lookup_users(query) first, then filter {"field": "owner", "operator":
-    "equal", "value": <user_id>}. For organizer: resolve via
+    user.lookup (list_tool -> build_payload -> execute_request; not a
+    standalone tool) with {query} first, then filter {"field": "owner",
+    "operator": "equal", "value": <user_id>}. For organizer: resolve via
     meeting.lookup_related with {entity_type: "invitee", query} first, then
     filter {"field": "organizer", "operator": "equal", "value": <user_id>}.
-    Never use search_entity_by_term to search meetings by owner or organizer
-    name — it only searches the title field.
+    Never use meeting.search_by_term to search meetings by owner or
+    organizer name — it only searches the title field.
 
     Pagination: always use the largest page size available. Do NOT
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
@@ -172,8 +173,10 @@
     "location": "Office", "description": "..."}
 
     Resolving entity IDs — never guess: Meeting owner/conductor (CRM
-    users/sales reps) — always lookup_users, never lookup contacts/leads/
-    companies for sales reps. Participants/organizer — meeting.lookup_related
+    users/sales reps) — always resolve user.lookup (list_tool ->
+    build_payload -> execute_request; not a standalone tool), never lookup
+    contacts/leads/companies for sales reps. Participants/organizer —
+    meeting.lookup_related
     with entity_type="invitee" (organizer is usually the row with
     entity="user"). relatedTo leads/contacts/deals/companies — same id with
     entity_type="lead"/"contact"/"deal"/"company" respectively.
@@ -199,9 +202,10 @@
   usage_notes: >
     Meetings do not support multi-field free-text search — this searches the
     "title" field ONLY (contains match). Do NOT use this to find meetings by
-    owner or organizer name; look up their user ID via lookup_users or
-    meeting.lookup_related with entity_type="invitee" instead, then use
-    meeting.search with an "owner" or "organizer" filter.
+    owner or organizer name; look up their user ID via user.lookup or
+    meeting.lookup_related with entity_type="invitee" instead (both
+    list_tool -> build_payload -> execute_request; not standalone tools),
+    then use meeting.search with an "owner" or "organizer" filter.
 
     Use this ONLY when the user provides a specific search term. NEVER use
     this tool with wildcard characters ("*"), empty strings, or blank terms.
