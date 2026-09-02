@@ -49,13 +49,11 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
 import httpx
-import phonenumbers
 import yaml
 import json
 
 from shared.config import (
     logger,
-    BASE_URL,
     API_KEY,
     SERVER_VERSION,
 )
@@ -63,9 +61,6 @@ from shared.app import mcp
 from shared.constants import (
     OPERATOR_MAPPING,
     OPERATOR_SYMBOL_MAP,
-    EMAIL_TYPES,
-    PHONE_TYPES,
-    _COUNTRY_CODE_ALIASES,
     PICKLIST_FIELDS_USE_INTERNAL_NAME,
 )
 from shared.throttle import _reset_api_call_count
@@ -90,78 +85,18 @@ from shared.fields import (
     _rule_type_for_value,
     _build_search_json_rule,
 )
-
-# Entity label mapping (tenant-specific display names).
-#
-# Deliberately NOT cached process-wide. This server runs stateless_http=True
-# (see run()) — every request is its own fresh transport with no session
-# continuity (mcp/server/streamable_http_manager.py sets mcp_session_id=None
-# in stateless mode) — so there is no per-tenant or per-session slot to cache
-# this in safely. A module-level dict here previously caused tenant A's
-# labels to leak to tenant B (and, via a background refresh loop with no
-# request context, to whatever KYLAS_API_KEY the env fell back to). Always
-# fetch live, scoped to the resolved auth of the current request. The extra
-# /entities/label round-trip is the accepted cost of correctness.
-
-
-def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) -> str:
-    """
-    Format entity labels as action-oriented routing rules for system instructions.
-    Returns empty string if no labels.
-    """
-    if not labels:
-        return ""
-
-    lines = [
-        "## ENTITY NAME ROUTING — CALL get_entity_labels() FIRST, THEN USE THESE RULES",
-        "",
-        "This tenant has renamed CRM entities. When the user mentions any of the names below,",
-        "call get_entity_labels() to confirm, then use the standard type for all tool calls:",
-        "",
-    ]
-
-    for entity_type in sorted(labels.keys()):
-        label_data = labels[entity_type]
-        display_name = label_data.get("displayName", entity_type)
-        display_plural = label_data.get("displayNamePlural", entity_type)
-        std_type = entity_type.lower()
-        lines.append(
-            f'- If user says "{display_name}" or "{display_plural}" → call get_entity_labels(), '
-            f'then use standard type "{std_type}" in all tool calls'
-        )
-
-    lines.append("")
-    lines.append('DO NOT tell the user an entity "doesn\'t exist" before calling get_entity_labels().')
-
-    return "\n".join(lines)
-
-
-async def _fetch_entity_labels() -> Dict[str, Dict[str, str]]:
-    """
-    Fetch entity labels from /v1/entities/label endpoint, live, for the caller's
-    own resolved auth (get_client() reads x-api-key/OAuth off the current request).
-    Returns mapping like: {"LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"}, ...}
-    Returns empty dict if fetch fails — callers fall back to standard names.
-
-    Not cached anywhere — this server runs stateless_http (see run()), so there's no
-    session or tenant-scoped slot to cache this in without either leaking across
-    tenants (the old bug) or reintroducing per-tenant credential storage for a
-    background refresh. Call this fresh wherever the labels are needed.
-    """
-    try:
-        async with get_client() as client:
-            resp = await client.get(f"{BASE_URL}/entities/label")
-            labels = resp.json()
-            summary = "\n".join(
-                f"  • {etype:8} => {data.get('displayName', etype)} / {data.get('displayNamePlural', etype)}"
-                for etype, data in sorted(labels.items())
-            )
-            logger.debug(f"\n📦 Fetched entity labels:\n{summary}")
-            return labels
-    except Exception as e:
-        logger.warning(f"Failed to fetch entity labels: {e}")
-        return {}
-
+from shared.normalize import (
+    _normalize_country_code,
+    _ensure_single_primary,
+    _normalize_field_values,
+)
+from shared.labels import _format_entity_labels_for_instructions, _fetch_entity_labels
+from shared.labels_tools import get_entity_labels, entity_labels_resource
+from shared.pipeline import (
+    lookup_pipelines_logic,
+    get_pipeline_details_logic,
+    _get_pipeline_details_raw,
+)
 
 if not API_KEY:
     logger.info("KYLAS_API_KEY not set. Server will rely on per-request 'x-api-key' header.")
@@ -213,64 +148,6 @@ async def get_lead_field_instructions_logic() -> str:
         for f in custom:
             lines.extend(_format_field(f, include_filterable=True))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def get_entity_labels() -> str:
-    """
-    Returns the mapping of this tenant's custom entity display names to standard CRM entity types.
-    CALL THIS ONCE at the start of every session, before any other tool.
-    This tenant uses custom names (e.g. "animals" instead of contacts, "cars" instead of deals).
-    Without this, you will fail to recognize entity requests from users.
-    After calling this, when the user mentions a custom name, map it to the standard type for all tool calls.
-    """
-    labels = await _fetch_entity_labels()
-    if not labels:
-        return "No custom entity labels configured for this tenant. Standard names apply: lead, contact, deal, task, company, meeting, call_log."
-    lines = ["# Entity Label Mapping — Custom Names for This Tenant\n"]
-    lines.append("When the user says one of the custom names below, use the corresponding STANDARD TYPE in all tool calls.\n")
-    for entity_type in sorted(labels.keys()):
-        label_data = labels[entity_type]
-        display_name = label_data.get("displayName", entity_type)
-        display_plural = label_data.get("displayNamePlural", entity_type)
-        std_type = entity_type.lower()
-        lines.append(f'- User says "{display_name}" or "{display_plural}" → use standard type: "{std_type}"')
-    lines.append('\n**Example:** User says "get animals" → map "animals" to "contact" → use "contact.search" (list_tool -> build_payload -> execute_request)')
-    lines.append('**Example:** User says "show cars" → map "cars" to "deal" → use "deal.search" (list_tool -> build_payload -> execute_request)')
-    return "\n".join(lines)
-
-
-@mcp.resource(
-    "kylas://entity-labels",
-    name="Entity Label Mapping",
-    description=(
-        "Tenant-specific entity name mapping. Read this to resolve custom entity names to standard CRM types. "
-        "Example: 'animals' may map to 'contact', 'cars' may map to 'deal'. "
-        "Always read this resource when the user refers to an entity by an unfamiliar name."
-    ),
-    mime_type="text/plain",
-)
-async def entity_labels_resource() -> str:
-    """Serve current entity label mapping as a readable resource."""
-    labels = await _fetch_entity_labels()
-    if not labels:
-        return "No custom entity labels. Standard names apply: lead, contact, deal, task, company, meeting, call_log."
-    lines = ["# Entity Label Mapping — Tenant-Specific Custom Names", ""]
-    lines.append("When the user says a custom name, use the STANDARD TYPE (right of →) in all tool calls.")
-    lines.append("")
-    for entity_type in sorted(labels.keys()):
-        label_data = labels[entity_type]
-        display_name = label_data.get("displayName", entity_type)
-        display_plural = label_data.get("displayNamePlural", entity_type)
-        std_type = entity_type.lower()
-        lines.append(f'- "{display_name}" / "{display_plural}" → "{std_type}"')
-    lines.extend([
-        "",
-        "Examples:",
-        '  User says "get animals" → standard type is "contact" → use "contact.search" (list_tool -> build_payload -> execute_request)',
-        '  User says "show cars"   → standard type is "deal"    → use "deal.search" (list_tool -> build_payload -> execute_request)',
-    ])
     return "\n".join(lines)
 
 
@@ -496,282 +373,8 @@ async def lookup_products(query: str, page: int = 0, size: int = 50) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 3c: Lookup Pipelines (for pipeline + stage filters on leads)
-# ---------------------------------------------------------------------------
-
-async def lookup_pipelines_logic(
-    query: str = "",
-    entity_type: str = "LEAD",
-    page: int = 0,
-    size: int = 50,
-) -> str:
-    """
-    Call GET /pipelines/lookup?entityType=<entity_type>&q=<query> and return a formatted list of pipelines (id, name).
-    Use when the user asks for leads by stage (e.g. open/closed/won) but pipeline is not specified; then ask user to select a pipeline.
-    """
-    q = str(query).strip() if query else ""
-    if ":" not in q and q:
-        q = f"name:{q}"
-    # Empty q: some APIs return all pipelines when q=name:
-    if not q:
-        q = "name:"
-    async with get_client() as client:
-        response = await client.get(
-            "/pipelines/lookup",
-            params={"entityType": entity_type, "q": q, "page": page, "size": min(size, 50)},
-        )
-        data = await handle_api_response(response, "Pipeline lookup")
-    content = data.get("content", data.get("data", []))
-    total = data.get("totalElements", data.get("total", len(content)))
-    total_pages = data.get("totalPages", 1)
-    if not content:
-        return f"No pipelines found for entity {entity_type}" + (f" matching '{q}'." if q else ".")
-    lines = [
-        f"Found {len(content)} pipeline(s) (entityType={entity_type}, total {total}, page {page + 1} of {total_pages})",
-        "-" * 50,
-    ]
-    for p in content:
-        pid = p.get("id", "?")
-        name = p.get("name", p.get("displayName", "—"))
-        lines.append(f"  • ID: {pid}  |  Name: {name}")
-    lines.append("-" * 50)
-    lines.append("Ask the user to confirm which pipeline to use (list id and name). Do NOT resolve pipeline.details until the user has confirmed. After confirmation, resolve pipeline.details (list_tool -> build_payload -> execute_request; not a standalone tool) with that pipeline ID only, then search or update with pipeline + pipelineStage filters.")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def lookup_pipelines(
-    query: str = "",
-    entity_type: str = "LEAD",
-    page: int = 0,
-    size: int = 50,
-) -> str:
-    """
-    Look up pipelines by name for leads or deals. Use when the user asks for items by stage but does not specify which pipeline.
-
-    **For Leads:** lookup_pipelines(query="", entity_type="LEAD")
-    **For Deals:** lookup_pipelines(query="", entity_type="DEAL")
-
-    Workflow:
-    - Call this first; do NOT call get_pipeline_stages until after the user confirms the pipeline.
-    - Present the pipeline(s) (id and name) and ask the user which pipeline they mean. If only one pipeline is found, still ask for confirmation.
-    - Only after the user confirms, call get_pipeline_stages with that pipeline ID to get stages, then search_leads or update_deal/update_lead.
-
-    query: Search string. Use "name:<pipeline_name>" or just the pipeline name; empty string returns all pipelines for the entity.
-    entity_type: Entity type - "LEAD" (default) or "DEAL".
-    page: 0-based page (default 0).
-    size: Max 50 (default 50).
-    """
-    try:
-        _reset_api_call_count()
-        logger.info("Pipeline lookup: entityType=%s q=%s", entity_type, query)
-        return await lookup_pipelines_logic(query, entity_type, page, size)
-    except KylasAPIError as e:
-        return f"Error: {e.message}"
-    except Exception as e:
-        logger.exception("lookup_pipelines")
-        return f"Unexpected error: {str(e)}"
-
-
-async def get_pipeline_stages_logic(pipeline_id: int) -> str:
-    """
-    Call POST /pipelines/summary with jsonRule filtering by pipeline id(s). Returns pipeline name and list of stages (id, name, forecastingType).
-    Use after the user has selected a pipeline; then map user intent (open/closed/won/lost) to stage id(s) and call search_leads.
-    """
-    payload = {
-        "jsonRule": {
-            "condition": "AND",
-            "rules": [{"operator": "in", "id": "id", "field": "id", "type": "long", "value": [pipeline_id]}],
-            "valid": True,
-        }
-    }
-    async with get_client() as client:
-        response = await client.post("/pipelines/summary", json=payload)
-        data = await handle_api_response(response, "Pipeline summary")
-    # Response is array of {id, name, stages: [{id, name, position, forecastingType}]}
-    pipelines = data if isinstance(data, list) else data.get("content", data.get("data", []))
-    if not pipelines:
-        return f"No pipeline found with ID {pipeline_id}."
-    lines = []
-    for pl in pipelines:
-        pl_id = pl.get("id", "?")
-        pl_name = pl.get("name", "—")
-        lines.append(f"Pipeline: {pl_name} (ID: {pl_id})")
-        stages = pl.get("stages", [])
-        if not stages:
-            lines.append("  (no stages)")
-        else:
-            for s in stages:
-                sid = s.get("id", "?")
-                sname = s.get("name", "—")
-                ftype = s.get("forecastingType", "")
-                lines.append(f"  • Stage ID: {sid}  |  Name: {sname}  |  forecastingType: {ftype}")
-        lines.append("")
-    lines.append("Map user intent to stage: 'open' → OPEN; 'won' → CLOSED_WON; 'lost' → CLOSED_LOST; 'closed unqualified' → CLOSED_UNQUALIFIED. If multiple stages match (e.g. several OPEN stages), ask the user which stage they mean, then use that stage ID in search_leads with pipeline and pipelineStage filters.")
-    return "\n".join(lines).strip()
-
-
-@mcp.tool()
-async def get_pipeline_stages(pipeline_id: int) -> str:
-    """
-    Get stages for a pipeline. Call this only after the user has confirmed which pipeline to use (from lookup_pipelines). Do not call before pipeline confirmation.
-    Returns pipeline name and list of stages for that pipeline only, with id, name, and forecastingType (OPEN, CLOSED_WON, CLOSED_LOST, CLOSED_UNQUALIFIED).
-    Use the stage IDs in search_leads: filters [{"field": "pipeline", "operator": "equal", "value": pipeline_id}, {"field": "pipelineStage", "operator": "equal", "value": stage_id}].
-    If the user said "open leads" or "closed leads" and more than one stage has the same forecastingType, ask which stage they mean.
-    pipeline_id: The pipeline ID (from lookup_pipelines).
-    """
-    try:
-        pipeline_id = int(pipeline_id)
-    except (TypeError, ValueError):
-        return "Error: pipeline_id must be a number."
-    try:
-        _reset_api_call_count()
-        logger.info("Pipeline stages: pipeline_id=%s", pipeline_id)
-        return await get_pipeline_stages_logic(pipeline_id)
-    except KylasAPIError as e:
-        return f"Error: {e.message}"
-    except Exception as e:
-        logger.exception("get_pipeline_stages")
-        return f"Unexpected error: {str(e)}"
-
-
-# ---------------------------------------------------------------------------
-# Tool 3d: Get pipeline details (GET /pipelines/{id}) – stages + lost/unqualified reasons
-# ---------------------------------------------------------------------------
-
-async def get_pipeline_details_logic(pipeline_id: int) -> str:
-    """
-    Call GET /pipelines/{id}. Returns pipeline name, stages (id, name, forecastingType),
-    sequentialStageFlow flag, unqualifiedReasons (for Closed Unqualified), and lostReasons (for Closed Lost).
-    Use when moving a lead to Closed Lost or Closed Unqualified: get reasons, ask the user to pick one,
-    then update_lead with pipelineStageReason set to that exact string.
-    """
-    pipeline_id = int(pipeline_id)
-    data = await _get_pipeline_details_raw(pipeline_id)
-    name = data.get("name", "—")
-    sequential = data.get("sequentialStageFlow", False)
-    lines = [
-        f"Pipeline: {name} (ID: {pipeline_id})",
-        f"Sequential Stage Flow: {'YES — stages must be moved one at a time in order' if sequential else 'NO — any stage can be targeted directly'}",
-        "",
-        "Stages (ordered by position):",
-    ]
-    for s in sorted(data.get("stages", []), key=lambda x: x.get("position", 0)):
-        sid = s.get("id", "?")
-        sname = s.get("name", "—")
-        ftype = s.get("forecastingType", "")
-        pos = s.get("position", "?")
-        lines.append(f"  • Position {pos} | Stage ID: {sid}  |  Name: {sname}  |  forecastingType: {ftype}")
-    unq = data.get("unqualifiedReasons") or []
-    lost = data.get("lostReasons") or []
-    lines.extend([
-        "",
-        "Closed Unqualified reasons (use exact string as pipelineStageReason when moving to Closed Unqualified):",
-    ])
-    if unq:
-        for r in unq:
-            lines.append(f"  • \"{r}\"")
-    else:
-        lines.append("  (none configured)")
-    lines.extend([
-        "",
-        "Closed Lost reasons (use exact string as pipelineStageReason when moving to Closed Lost):",
-    ])
-    if lost:
-        for r in lost:
-            lines.append(f"  • \"{r}\"")
-    else:
-        lines.append("  (none configured)")
-    lines.append("")
-    lines.append("When updating a lead or deal to Closed Lost or Closed Unqualified, ask the user to pick one reason from the list above, then resolve lead.update or deal.update (list_tool -> build_payload -> execute_request; not a standalone tool) with pipelineStageReason set to that exact string.")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def get_pipeline_details(pipeline_id: int) -> str:
-    """
-    Get full pipeline details by ID (GET /pipelines/{id}): stages plus unqualifiedReasons and lostReasons.
-    Call this when moving a lead to Closed Lost or Closed Unqualified. Present the relevant reasons list to the user,
-    ask them to pick one, then call update_lead with pipelineStageReason set to that exact string (e.g. "No followup", "Booked with competitor").
-    pipeline_id: The pipeline ID (from the lead's current pipeline or from lookup_pipelines).
-    """
-    try:
-        pipeline_id = int(pipeline_id)
-    except (TypeError, ValueError):
-        return "Error: pipeline_id must be a number."
-    try:
-        _reset_api_call_count()
-        logger.info("Pipeline details: pipeline_id=%s", pipeline_id)
-        return await get_pipeline_details_logic(pipeline_id)
-    except KylasAPIError as e:
-        return f"Error: {e.message}"
-    except Exception as e:
-        logger.exception("get_pipeline_details")
-        return f"Unexpected error: {str(e)}"
-
-
-# ---------------------------------------------------------------------------
 # Tool 4: Create Lead (single tool, dynamic field_values)
 # ---------------------------------------------------------------------------
-
-
-def _normalize_country_code(code: Optional[str]) -> str:
-    """Normalize user-provided country code/dial prefix to a Kylas 2-letter ISO region code.
-
-    Accepts:
-      - Dial prefixes: "+91" → "IN", "+1" → "US", "+44" → "GB", all 190+ countries
-      - ISO 3166-1 alpha-2 codes: "IN", "US", "GB", etc. (validated via phonenumbers)
-      - Common aliases: "UK" → "GB", "USA" → "US", "INDIA" → "IN"
-
-    Returns empty string if the code is absent or unrecognised (caller enforces presence when phone given).
-    """
-    if not code or not str(code).strip():
-        return ""
-    raw = str(code).strip()
-
-    # Dial code prefix e.g. "+91", "+1", "+44"
-    if raw.startswith("+"):
-        try:
-            calling_code = int(raw[1:])
-            region = phonenumbers.region_code_for_country_code(calling_code)
-            if region and region != "ZZ":
-                return region
-        except (ValueError, Exception):
-            pass
-
-    upper = raw.upper()
-
-    # Non-standard aliases (UK, USA, INDIA, …)
-    if upper in _COUNTRY_CODE_ALIASES:
-        return _COUNTRY_CODE_ALIASES[upper]
-
-    # Validate 2-letter ISO region code via phonenumbers (returns 0 for unknown regions)
-    if phonenumbers.country_code_for_region(upper) != 0:
-        return upper
-
-    return ""
-
-
-def _ensure_single_primary(entries: List[Dict[str, Any]], allowed_types: List[str], default_type: str) -> List[Dict[str, Any]]:
-    """Ensure exactly one entry has primary=True. Use first entry marked primary by user, else first entry. Types restricted to allowed_types."""
-    if not entries or not isinstance(entries, list):
-        return entries
-    result = []
-    for e in entries:
-        if not e or not isinstance(e, dict):
-            continue
-        entry = dict(e)
-        t = (entry.get("type") or default_type).upper()
-        entry["type"] = t if t in allowed_types else default_type
-        result.append(entry)
-    primary_idx = 0
-    for i, entry in enumerate(result):
-        if entry.get("primary"):
-            primary_idx = i
-            break
-    for i, entry in enumerate(result):
-        entry["primary"] = i == primary_idx
-    return result
 
 
 # Kylas error code returned when trying to skip a stage on a pipeline with sequentialStageFlow=true
@@ -787,13 +390,6 @@ def _is_stage_lock_error(error: KylasAPIError) -> bool:
         return body.get("code") == STAGE_LOCK_ERROR_CODE
     except (json.JSONDecodeError, AttributeError, TypeError):
         return False
-
-
-async def _get_pipeline_details_raw(pipeline_id: int) -> Dict[str, Any]:
-    """Fetch raw pipeline details dict from GET /pipelines/{id}."""
-    async with get_client() as client:
-        response = await client.get(f"/pipelines/{int(pipeline_id)}")
-        return await handle_api_response(response, "Get pipeline details")
 
 
 async def _advance_deal_to_stage_sequentially(
@@ -841,118 +437,6 @@ async def _advance_deal_to_stage_sequentially(
             logger.info("Deal %s advanced to stage %s (%s)", deal_id, stage_id, stage.get("name", ""))
 
     return result
-
-
-def _normalize_field_values(
-    field_values: Dict[str, Any],
-    custom_field_id_to_name: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
-    """
-    Build Kylas create-lead payload from dynamic field_values.
-    - Custom fields (numeric keys or in customFieldValues) → customFieldValues with INTERNAL NAME as key (never ID).
-    - Explicit "customFieldValues" dict → merged; keys must be internal names (e.g. cfLeadCheck).
-    - "email" string → emails array (type OFFICE, primary true). One email must be primary.
-    - "phone" / "phoneNumber" + "phone_country_code" (required when phone given) + "phone_type" (required when phone given; one of MOBILE|WORK|HOME|PERSONAL) → phoneNumbers array. Caller must ask user for country/dial code AND phone type when either is missing; do not assume or infer. One phone must be primary.
-    - emails/phoneNumbers arrays: allowed types email OFFICE|PERSONAL, phone MOBILE|WORK|HOME|PERSONAL; exactly one primary (first if unspecified).
-    - Rest → top-level payload (standard fields)
-    """
-    payload: Dict[str, Any] = {}
-    custom: Dict[str, Any] = {}
-    fv = dict(field_values)
-    id_to_name = custom_field_id_to_name or {}
-
-    phone_country_raw = fv.pop("phone_country_code", None)
-    phone_country = _normalize_country_code(phone_country_raw)
-    phone_type_raw = fv.pop("phone_type", None)
-    phone_type = phone_type_raw.strip().upper() if isinstance(phone_type_raw, str) else None
-    if phone_type and phone_type not in PHONE_TYPES:
-        raise ValueError(
-            f"Invalid phone type '{phone_type}'. Must be one of: {', '.join(PHONE_TYPES)}."
-        )
-    has_phone_data = (
-        fv.get("phone") or fv.get("phoneNumber")
-        or (isinstance(fv.get("phoneNumbers"), list) and len(fv["phoneNumbers"]) > 0)
-    )
-    # Require explicit phone_country_code whenever any phone number is present (do not assume India).
-    # This applies even if phoneNumbers array already has "code" on each entry—caller must pass
-    # phone_country_code at top level so we know the user was asked, not assumed.
-    if has_phone_data and not phone_country:
-        raise ValueError(
-            "Phone number(s) were provided but country/dial code was not. "
-            "Ask the user which country and dial code to use (e.g. India: IN or +91, US: US or +1) and include 'phone_country_code' in field_values."
-        )
-
-    # Explicit customFieldValues: merge into custom (keys must be internal names, e.g. cfLeadCheck)
-    if "customFieldValues" in fv:
-        cf = fv.pop("customFieldValues")
-        if isinstance(cf, dict):
-            for k, v in cf.items():
-                if v is not None:
-                    custom[str(k)] = v
-
-    for key, value in fv.items():
-        if value is None:
-            continue
-        # Custom field: key is numeric string (Field ID) → use internal name in customFieldValues
-        if str(key).isdigit():
-            custom_key = id_to_name.get(str(key), str(key))
-            custom[custom_key] = value
-            continue
-        # Normalize single email string to Kylas emails array
-        if key == "email" and isinstance(value, str):
-            payload["emails"] = _ensure_single_primary(
-                [{"type": "OFFICE", "value": value.strip(), "primary": True}],
-                EMAIL_TYPES,
-                "OFFICE",
-            )
-            continue
-        # Normalize single phone string to Kylas phoneNumbers array (code = 2-letter; required when phone given)
-        if key in ("phone", "phoneNumber") and isinstance(value, str):
-            if not phone_country:
-                raise ValueError(
-                    "Phone number was provided but country/dial code was not. "
-                    "Ask the user which country and dial code to use (e.g. India: IN or +91, US: US or +1) and include 'phone_country_code' in field_values."
-                )
-            if not phone_type:
-                raise ValueError(
-                    "Phone number was provided but type was not specified. "
-                    "Ask the user whether this number is MOBILE, WORK, HOME, or PERSONAL and include 'phone_type' in field_values."
-                )
-            payload["phoneNumbers"] = _ensure_single_primary(
-                [{"type": phone_type, "code": phone_country, "value": value.strip(), "primary": True}],
-                PHONE_TYPES,
-                "MOBILE",
-            )
-            continue
-        # Already in API shape: ensure single primary and allowed types
-        if key == "emails":
-            payload["emails"] = _ensure_single_primary(
-                value if isinstance(value, list) else [],
-                EMAIL_TYPES,
-                "OFFICE",
-            )
-            continue
-        if key == "phoneNumbers":
-            # Normalize code to 2-letter for each entry; use phone_country when entry missing code (already validated above)
-            raw_phones = value if isinstance(value, list) else []
-            phones = []
-            for p in raw_phones:
-                if not isinstance(p, dict):
-                    continue
-                entry = dict(p)
-                if "code" not in entry or not entry.get("code"):
-                    entry["code"] = phone_country
-                elif len(str(entry["code"])) > 2:
-                    entry["code"] = _normalize_country_code(entry["code"]) or entry["code"]
-                phones.append(entry)
-            payload["phoneNumbers"] = _ensure_single_primary(phones, PHONE_TYPES, "MOBILE")
-            continue
-        # All other standard fields at top level
-        payload[key] = value
-
-    if custom:
-        payload["customFieldValues"] = custom
-    return payload
 
 
 async def create_lead_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:

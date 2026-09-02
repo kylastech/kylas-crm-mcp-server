@@ -914,7 +914,7 @@ async def test_fetch_entity_labels_success():
         "CONTACT": {"displayName": "Quontact", "displayNamePlural": "Quontacts"},
     }
 
-    with patch("main.get_client") as mock_get_client:
+    with patch("shared.labels.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = mock_labels
@@ -938,7 +938,7 @@ async def test_fetch_entity_labels_not_cached():
     first_tenant_labels = {"LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"}}
     second_tenant_labels = {"LEAD": {"displayName": "Prospect", "displayNamePlural": "Prospects"}}
 
-    with patch("main.get_client") as mock_get_client:
+    with patch("shared.labels.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.side_effect = [first_tenant_labels, second_tenant_labels]
@@ -956,7 +956,7 @@ async def test_fetch_entity_labels_not_cached():
 @pytest.mark.asyncio
 async def test_fetch_entity_labels_api_error():
     """Test graceful handling when label fetch fails."""
-    with patch("main.get_client") as mock_get_client:
+    with patch("shared.labels.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_client.get.side_effect = Exception("API connection failed")
         mock_get_client.return_value.__aenter__.return_value = mock_client
