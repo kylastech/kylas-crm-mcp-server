@@ -237,6 +237,62 @@ def _convert_date_value_to_utc(value: Any, timezone_str: str) -> Any:
     return _convert_single(value)
 
 
+def _epoch_to_iso_utc(value: Any) -> Any:
+    """
+    Convert a Kylas epoch timestamp to a UTC ISO string. Anything else is
+    returned EXACTLY as received.
+
+    Kylas is not consistent about this: the same field on the same record comes
+    back as epoch milliseconds from one endpoint and as an ISO string from
+    another (verified on task 11613888 — POST /tasks/search returned
+    1789070400000, GET /tasks/{id} returned "2026-09-10T20:00:00.000+0000" for
+    the same dueDate, same instant). A bare integer reaching the LLM is not a
+    timestamp it can read, so it guesses — that is how a task due 7:00 PM was
+    reported as 6:40 PM. This converts the epoch case only; ISO strings, None,
+    and everything else pass through untouched, by design.
+
+    Epoch is detected by TYPE first, then magnitude — never by field name:
+      - milliseconds: 1e11 .. 4.1e12   (~1973 .. ~2100)
+      - seconds:      1e9  .. 4.1e9    (~2001 .. ~2100)
+    The two ranges cannot overlap: epoch seconds do not reach 1e11 until the
+    year 5138, so a seconds value can never be misread as milliseconds.
+    Anything outside both ranges is left alone rather than guessed at.
+    """
+    # bool is a subclass of int — exclude it before any numeric check.
+    if isinstance(value, bool) or value is None:
+        return value
+
+    number = value
+    if isinstance(value, str):
+        stripped = value.strip()
+        # Only a plain integer literal counts; "2026-09-10T..." must not match.
+        if not (stripped.lstrip("-").isdigit() and stripped.lstrip("-")):
+            return value
+        try:
+            number = int(stripped)
+        except ValueError:
+            return value
+    elif not isinstance(value, (int, float)):
+        return value
+
+    magnitude = abs(number)
+    if 1e11 <= magnitude <= 4.1e12:
+        seconds = number / 1000.0
+    elif 1e9 <= magnitude <= 4.1e9:
+        seconds = float(number)
+    else:
+        # A number, but not in any plausible epoch range — leave it exactly as
+        # it came rather than inventing a date from it.
+        return value
+
+    try:
+        dt = datetime.fromtimestamp(seconds, tz=ZoneInfo("UTC"))
+    except (OverflowError, OSError, ValueError):
+        logger.warning("Could not convert epoch %r to a UTC datetime; passing through unchanged.", value)
+        return value
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
 def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) -> str:
     """
     Format entity labels as action-oriented routing rules for system instructions.
@@ -1892,8 +1948,8 @@ def _format_lead_for_display(lead: Dict[str, Any]) -> str:
         lines.append(f"Pipeline: {pipeline}")
     lines.append(f"Pipeline Stage Reason: {lead.get('pipelineStageReason') or '—'}")
     lines.append(f"Owner ID: {lead.get('ownerId', '—')}")
-    lines.append(f"Created At: {lead.get('createdAt', '—')}")
-    lines.append(f"Updated At: {lead.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(lead.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(lead.get('updatedAt', '—'))}")
     # Custom fields
     custom = lead.get("customFieldValues") or {}
     if custom:
@@ -2205,8 +2261,8 @@ def _format_contact_for_display(contact: Dict[str, Any]) -> str:
     else:
         lines.append("Phone: —")
     lines.append(f"Owner ID: {contact.get('ownerId', '—')}")
-    lines.append(f"Created At: {contact.get('createdAt', '—')}")
-    lines.append(f"Updated At: {contact.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(contact.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(contact.get('updatedAt', '—'))}")
     ad = contact.get("associatedDeals") or []
     if ad:
         lines.append(f"Associated deal IDs: {ad}")
@@ -2480,11 +2536,11 @@ def _format_task_for_display(task: Dict[str, Any]) -> str:
     lines.append(f"Description: {task.get('description') or '—'}")
     lines.append(f"Status: {task.get('status') or '—'}")
     lines.append(f"Priority: {task.get('priority') or '—'}")
-    lines.append(f"Due Date: {task.get('dueDate') or '—'}")
+    lines.append(f"Due Date: {_epoch_to_iso_utc(task.get('dueDate')) or '—'}")
     lines.append(f"Assigned To: {task.get('assignedTo') or '—'}")
     lines.append(f"Reminder: {task.get('reminder') or '—'}")
-    lines.append(f"Created At: {task.get('createdAt', '—')}")
-    lines.append(f"Updated At: {task.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(task.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(task.get('updatedAt', '—'))}")
     # Custom fields
     custom = task.get("customFieldValues") or {}
     if custom:
@@ -2599,7 +2655,7 @@ async def search_tasks_logic(
         name = task.get("name", "—")
         status = task.get("status", "—")
         priority = task.get("priority", "—")
-        due_date = task.get("dueDate", "—")
+        due_date = _epoch_to_iso_utc(task.get("dueDate", "—"))
         lines.append(f"• ID: {tid} | Name: {name} | Status: {status} | Priority: {priority} | Due: {due_date}")
     lines.append("-" * 60)
     return "\n".join(lines)
@@ -2806,7 +2862,7 @@ async def _search_tasks_with_any_relation_logic(
         name = task.get("name", "—")
         status = task.get("status", "—")
         priority = task.get("priority", "—")
-        due = task.get("dueDate", "—")
+        due = _epoch_to_iso_utc(task.get("dueDate", "—"))
         relation = task.get("relation") or []
         rel_parts = []
         for r in relation:
@@ -3287,7 +3343,7 @@ def _format_deal_for_display(deal: Dict[str, Any]) -> str:
     lines.append(f"Name: {deal.get('name', '—')}")
     lines.append(f"Value: {deal.get('value', '—')}")
     lines.append(f"Currency: {deal.get('currency', '—')}")
-    lines.append(f"Closing Date: {deal.get('closingDate', '—')}")
+    lines.append(f"Closing Date: {_epoch_to_iso_utc(deal.get('closingDate', '—'))}")
     # Emails
     emails = deal.get("emails") or []
     if emails:
@@ -3320,8 +3376,8 @@ def _format_deal_for_display(deal: Dict[str, Any]) -> str:
     else:
         lines.append(f"Pipeline: {pipeline}")
     lines.append(f"Owner ID: {deal.get('ownerId', '—')}")
-    lines.append(f"Created At: {deal.get('createdAt', '—')}")
-    lines.append(f"Updated At: {deal.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(deal.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(deal.get('updatedAt', '—'))}")
     # Products
     products = deal.get("products") or []
     lines.append("")
@@ -3849,8 +3905,8 @@ def _format_company_for_display(company: Dict[str, Any]) -> str:
     else:
         lines.append("Phone: —")
     lines.append(f"Owner ID: {company.get('ownerId', '—')}")
-    lines.append(f"Created At: {company.get('createdAt', '—')}")
-    lines.append(f"Updated At: {company.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(company.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(company.get('updatedAt', '—'))}")
     # Custom fields
     custom = company.get("customFieldValues") or {}
     if custom:
@@ -4379,8 +4435,8 @@ def _format_meeting_for_display(meeting: Dict[str, Any]) -> str:
     lines.append(f"ID: {meeting.get('id', '—')}")
     lines.append(f"Title: {meeting.get('title', '—')}")
     lines.append(f"Status: {meeting.get('status', '—')}")
-    lines.append(f"From: {meeting.get('from', '—')}")
-    lines.append(f"To: {meeting.get('to', '—')}")
+    lines.append(f"From: {_epoch_to_iso_utc(meeting.get('from', '—'))}")
+    lines.append(f"To: {_epoch_to_iso_utc(meeting.get('to', '—'))}")
     lines.append(f"All Day: {meeting.get('allDay', False)}")
     lines.append(f"Location: {meeting.get('location', '—')}")
     lines.append(f"Description: {meeting.get('description', '—')}")
@@ -4425,8 +4481,8 @@ def _format_meeting_for_display(meeting: Dict[str, Any]) -> str:
                 lines.append(f"  • {rname} ({rentity}, ID: {rid})")
     # Metadata
     lines.append(f"Created By: {(meeting.get('createdBy') or {}).get('name', '—')}")
-    lines.append(f"Created At: {meeting.get('createdAt', '—')}")
-    lines.append(f"Updated At: {meeting.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(meeting.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(meeting.get('updatedAt', '—'))}")
     # Custom fields
     custom = meeting.get("customFieldValues") or {}
     if custom:
@@ -4543,8 +4599,8 @@ def _format_meeting_summary_line(m: Dict[str, Any]) -> str:
     mid = m.get("id", "?")
     title = m.get("title", "—")
     status = m.get("status", "—")
-    from_dt = m.get("from", "—")
-    to_dt = m.get("to", "—")
+    from_dt = _epoch_to_iso_utc(m.get("from", "—"))
+    to_dt = _epoch_to_iso_utc(m.get("to", "—"))
     location = m.get("location") or "—"
     
     # Extract owner
@@ -4831,7 +4887,7 @@ def _format_call_log_for_display(log: Dict[str, Any]) -> str:
     lines.append(f"Call Type: {log.get('callType', '—')}")
     lines.append(f"Outcome: {log.get('outcome', '—')}")
     lines.append(f"Phone Number: {log.get('phoneNumber', '—')}")
-    lines.append(f"Start Time: {log.get('startTime', '—')}")
+    lines.append(f"Start Time: {_epoch_to_iso_utc(log.get('startTime', '—'))}")
     lines.append(f"Duration: {log.get('duration', '—')} seconds")
     # Related To
     related = log.get("relatedTo") or {}
@@ -4869,8 +4925,8 @@ def _format_call_log_for_display(log: Dict[str, Any]) -> str:
     owner = log.get("owner") or {}
     if isinstance(owner, dict):
         lines.append(f"Logged By: {owner.get('name', '—')} (ID: {owner.get('id', '—')})")
-    lines.append(f"Created At: {log.get('createdAt', '—')}")
-    lines.append(f"Updated At: {log.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(log.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(log.get('updatedAt', '—'))}")
     lines.append("=" * 60)
     return "\n".join(lines)
 
@@ -5038,7 +5094,7 @@ def _extract_call_log_data(log: Dict[str, Any]) -> dict:
     call_type = log.get("callType", "—")
     outcome = log.get("outcome", "—")
     phone = log.get("phoneNumber", "—")
-    start = log.get("startTime", "—")
+    start = _epoch_to_iso_utc(log.get("startTime", "—"))
     duration = log.get("duration", "—")
 
     # Extract sentiment: overallSentiment + customerEmotion (first one)
@@ -5330,7 +5386,7 @@ async def search_tasks_by_term_logic(
         name = task.get("name", "—")
         status = task.get("status", "—")
         priority = task.get("priority", "—")
-        due_date = task.get("dueDate", "—")
+        due_date = _epoch_to_iso_utc(task.get("dueDate", "—"))
         lines.append(f"• ID: {tid} | Name: {name} | Status: {status} | Priority: {priority} | Due: {due_date}")
     lines.append("-" * 60)
     return "\n".join(lines)
@@ -5496,15 +5552,15 @@ def _format_quotation_for_display(q: Dict[str, Any]) -> str:
 
     lines.append(f"Sub Total: {_money(q.get('subTotal'))}")
     lines.append(f"Grand Total: {_money(q.get('grandTotal'))}")
-    lines.append(f"Valid Till: {q.get('validTill', '—')}")
+    lines.append(f"Valid Till: {_epoch_to_iso_utc(q.get('validTill', '—'))}")
     lines.append(f"Owner: {_name_of(q.get('owner'))}")
     lines.append(f"Associated Deal: {_name_of(q.get('associatedDeal'))}")
     lines.append(f"Associated Company: {_name_of(q.get('associatedCompany'))}")
     contacts = q.get("associatedContacts") or []
     if contacts:
         lines.append("Associated Contacts: " + ", ".join(_name_of(c) for c in contacts))
-    lines.append(f"Created At: {q.get('createdAt', '—')}")
-    lines.append(f"Updated At: {q.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(q.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(q.get('updatedAt', '—'))}")
     # Products
     products = q.get("products") or []
     lines.append("")
