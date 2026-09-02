@@ -46,3 +46,4 @@ kylas-crm-mcp-server = "main:run"
 
 [tool.setuptools]
 py-modules = ["main"]
+packages = ["shared"]
