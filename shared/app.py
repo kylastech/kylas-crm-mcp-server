@@ -1,24 +1,52 @@
 """
-The FastMCP application: its one instructions text, its lifespan (OAuth
-token-verifier cleanup on shutdown), OAuth wiring (kylas_oauth.py), and the
-`mcp` instance every tool/resource in this server registers against.
+The foundational/root module: environment config + logging (nothing else in
+shared/ may depend on anything that depends on this file, else importing it
+would cycle), and the FastMCP application built on top of it — its one
+instructions text, its lifespan (OAuth token-verifier cleanup on shutdown),
+OAuth wiring (kylas_oauth.py), and the `mcp` instance every tool/resource in
+this server registers against.
 
-Import `mcp` from here wherever a module needs `@mcp.tool()` /
-`@mcp.resource()` / `mcp.get_context()` / `mcp.local_provider`.
+Import `mcp` (and logger/config values) from here wherever a module needs
+`@mcp.tool()` / `@mcp.resource()` / `mcp.get_context()` /
+`mcp.local_provider`. Everything else in shared/ (including shared/meta.py)
+depends on this file directly or transitively — that's why its own content
+must stay dependency-free (stdlib + fastmcp + kylas_oauth only), and why it
+can't itself absorb shared/meta.py's content the other way around.
 """
 
+import logging
+import os
 from contextlib import asynccontextmanager
+from importlib.metadata import version as _pkg_version, PackageNotFoundError
 
+from dotenv import load_dotenv
 from fastmcp.server import FastMCP
 
-from shared.config import (
-    logger,
-    BASE_URL,
-    KYLAS_CLIENT_ID,
-    KYLAS_CLIENT_SECRET,
-    MCP_SERVER_BASE_URL,
-    KYLAS_TOKEN_CACHE_TTL_SECONDS,
+# ---------------------------------------------------------------------------
+# Configuration & Logging
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
+logger = logging.getLogger("kylas-mcp")
+
+BASE_URL = os.getenv("KYLAS_BASE_URL", "https://api.kylas.io/v1")
+API_KEY = os.getenv("KYLAS_API_KEY")
+KYLAS_CLIENT_ID = os.getenv("KYLAS_CLIENT_ID")
+KYLAS_CLIENT_SECRET = os.getenv("KYLAS_CLIENT_SECRET")
+MCP_SERVER_BASE_URL = os.getenv("MCP_SERVER_BASE_URL", "http://localhost:8000")
+# Positive-verification cache TTL (seconds). FastMCP verifies the token on every request;
+# a short cache avoids calling Kylas /users/me for every call. 0 disables the cache.
+KYLAS_TOKEN_CACHE_TTL_SECONDS = float(os.getenv("KYLAS_TOKEN_CACHE_TTL", "30"))
+
+try:
+    SERVER_VERSION = _pkg_version("kylas-crm-mcp-server")
+except PackageNotFoundError:
+    SERVER_VERSION = "unknown"
 
 # ---------------------------------------------------------------------------
 # System Instructions: the actual text served to a connecting MCP client as

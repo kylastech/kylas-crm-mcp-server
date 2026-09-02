@@ -1,17 +1,81 @@
 """
-HTTP client to the Kylas API: auth header resolution, request/response
-logging, the throttled client itself (see shared/throttle.py), and uniform
-error handling via KylasAPIError.
+HTTP client to the Kylas API: the throttle (100-500ms delay between
+subsequent calls in the same tool run), auth header resolution,
+request/response logging, the throttled client itself, and uniform error
+handling via KylasAPIError. Nothing else in shared/ needs the throttle
+without also needing this file, so it lives here rather than its own file.
 """
 
+import asyncio
+import contextvars
 import json
+import random
 from typing import Any, Dict, Optional
 
 import httpx
 
-from shared.app import mcp
-from shared.config import logger, API_KEY, BASE_URL, SERVER_VERSION
-from shared.throttle import _ThrottledClient
+from shared.app import mcp, logger, API_KEY, BASE_URL, SERVER_VERSION
+
+# ---------------------------------------------------------------------------
+# API call throttle: 100–500 ms random delay between subsequent calls per
+# tool. A single MCP tool call often makes several Kylas API calls in a row
+# (e.g. fetch fields, then create). The first call in a tool run goes out
+# immediately; every call after it gets a small random delay, tracked per
+# async task via a contextvar so concurrent tool calls don't interfere with
+# each other's counts.
+# ---------------------------------------------------------------------------
+
+_api_call_count: contextvars.ContextVar[int] = contextvars.ContextVar("api_call_count", default=0)
+
+
+async def _before_api_call() -> None:
+    """If this is not the first API call in this tool run, sleep 100–500 ms at random."""
+    n = _api_call_count.get()
+    if n > 0:
+        delay = random.uniform(0.1, 0.5)
+        await asyncio.sleep(delay)
+
+
+def _after_api_call() -> None:
+    """Mark that one API call has completed (for throttle counting)."""
+    _api_call_count.set(_api_call_count.get() + 1)
+
+
+def _reset_api_call_count() -> None:
+    """Reset at the start of each tool so only subsequent calls within the same tool are delayed."""
+    _api_call_count.set(0)
+
+
+class _ThrottledClient:
+    """Wraps httpx.AsyncClient to add 100–500 ms random delay before 2nd, 3rd, … request in the same tool."""
+
+    def __init__(self, client: httpx.AsyncClient):
+        self._client = client
+
+    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        await _before_api_call()
+        try:
+            return await self._client.get(url, **kwargs)
+        finally:
+            _after_api_call()
+
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        await _before_api_call()
+        try:
+            return await self._client.post(url, **kwargs)
+        finally:
+            _after_api_call()
+
+    async def put(self, url: str, **kwargs: Any) -> httpx.Response:
+        await _before_api_call()
+        try:
+            return await self._client.put(url, **kwargs)
+        finally:
+            _after_api_call()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
 
 # ---------------------------------------------------------------------------
 # Logging Helpers
