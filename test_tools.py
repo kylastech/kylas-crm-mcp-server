@@ -430,7 +430,7 @@ def test_build_search_json_rule_date_datetime():
         "convertedAt": {"type": "DATETIME_PICKER", "standard": True},
     }
     # today operator: value null, timeZone from default (patch so tests are deterministic)
-    with patch("main.DEFAULT_TIMEZONE", "Asia/Calcutta"):
+    with patch("shared.fields.DEFAULT_TIMEZONE", "Asia/Calcutta"):
         rules, err = _build_search_json_rule(
             [{"field": "createdAt", "operator": "today", "value": None}],
             filterable_map,
@@ -459,7 +459,7 @@ def test_build_search_json_rule_date_datetime():
     assert rules2["rules"][0]["timeZone"] == "Asia/Calcutta"
 
     # is_not_null: value null (uses default timeZone)
-    with patch("main.DEFAULT_TIMEZONE", "Asia/Calcutta"):
+    with patch("shared.fields.DEFAULT_TIMEZONE", "Asia/Calcutta"):
         rules3, err3 = _build_search_json_rule(
             [{"field": "convertedAt", "operator": "is_not_null", "value": None}],
             filterable_map,

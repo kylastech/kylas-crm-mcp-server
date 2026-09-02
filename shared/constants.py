@@ -62,6 +62,14 @@ OPERATOR_SYMBOL_MAP = {
     "not_equals": "not_equal",
 }
 
+# Picklist fields that use internal name (string) in search; all others use
+# Option ID (long). This is the default/shared set — shared/fields.py's
+# _format_field and _rule_type_for_value read this directly. deal, company,
+# meeting, and call_log each have their own *_PICKLIST_FIELDS_USE_INTERNAL_NAME
+# set instead and bypass this one for their own search-rule building; lead,
+# contact, task, and the generic search_entity path use this one.
+PICKLIST_FIELDS_USE_INTERNAL_NAME = {"requirementCurrency", "companyBusinessType", "country", "timezone", "companyIndustry","companyCountry"}
+
 # ---------------------------------------------------------------------------
 # Email / phone entry types accepted by Kylas across entities
 # ---------------------------------------------------------------------------

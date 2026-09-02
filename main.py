@@ -45,15 +45,12 @@ kept separate.
 
 import asyncio
 import os
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
-from zoneinfo import ZoneInfo
 
 import httpx
 import phonenumbers
 import yaml
-from dateutil import parser as dateutil_parser
 import json
 
 from shared.config import (
@@ -69,6 +66,7 @@ from shared.constants import (
     EMAIL_TYPES,
     PHONE_TYPES,
     _COUNTRY_CODE_ALIASES,
+    PICKLIST_FIELDS_USE_INTERNAL_NAME,
 )
 from shared.throttle import _reset_api_call_count
 from shared.http_client import (
@@ -79,17 +77,19 @@ from shared.http_client import (
     _resolve_auth_headers,
     _ThrottledClientContext,
 )
-
-
-def _get_default_timezone() -> str:
-    """
-    Default timezone for date/datetime filters. Used when the user doesn't pass timeZone in a filter.
-    Fixed to Asia/Calcutta for now.
-    """
-    return "Asia/Calcutta"
-
-
-DEFAULT_TIMEZONE = _get_default_timezone()
+from shared.datetime_tools import (
+    DEFAULT_TIMEZONE,
+    _threshold_iso_days_ago,
+    _convert_date_value_to_utc,
+    parse_datetime_to_utc_iso,
+    parse_datetime_to_utc_iso_tool,
+)
+from shared.fields import (
+    _format_field,
+    _get_filterable_fields_map,
+    _rule_type_for_value,
+    _build_search_json_rule,
+)
 
 # Entity label mapping (tenant-specific display names).
 #
@@ -102,55 +102,6 @@ DEFAULT_TIMEZONE = _get_default_timezone()
 # request context, to whatever KYLAS_API_KEY the env fell back to). Always
 # fetch live, scoped to the resolved auth of the current request. The extra
 # /entities/label round-trip is the accepted cost of correctness.
-
-
-def _threshold_iso_days_ago(days: int, time_zone: str) -> str:
-    """Return (now - days) in the given timezone as ISO string (UTC with Z)."""
-    try:
-        tz = ZoneInfo(time_zone)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    now = datetime.now(tz)
-    threshold = now - timedelta(days=days)
-    return threshold.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-
-def _convert_date_value_to_utc(value: Any, timezone_str: str) -> Any:
-    """
-    Convert date/datetime filter value(s) from user's local timezone to UTC.
-    Handles single ISO string, list of ISO strings (for between operator), or None.
-    Strips trailing 'Z' before parsing so the value is treated as local time.
-    """
-    if value is None:
-        return value
-
-    try:
-        tz = ZoneInfo(timezone_str)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    utc = ZoneInfo("UTC")
-
-    def _convert_single(v: str) -> str:
-        if not isinstance(v, str):
-            return v
-        # Strip trailing Z so we treat it as naive local time
-        clean = v.rstrip("Z").rstrip("z")
-        try:
-            # Try parsing with milliseconds first
-            try:
-                dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S.%f")
-            except ValueError:
-                dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S")
-            # Attach the user's timezone, then convert to UTC
-            local_dt = dt.replace(tzinfo=tz)
-            utc_dt = local_dt.astimezone(utc)
-            return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc_dt.microsecond // 1000:03d}Z"
-        except Exception:
-            return v  # Return as-is if parsing fails
-
-    if isinstance(value, list):
-        return [_convert_single(v) for v in value]
-    return _convert_single(value)
 
 
 def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) -> str:
@@ -216,52 +167,8 @@ if not API_KEY:
     logger.info("KYLAS_API_KEY not set. Server will rely on per-request 'x-api-key' header.")
 
 # ---------------------------------------------------------------------------
-# Search: Operator mapping by field type & picklists that use internal name
-# ---------------------------------------------------------------------------
-
-# Picklist fields that use internal name (string) in search; all others use Option ID (long)
-PICKLIST_FIELDS_USE_INTERNAL_NAME = {"requirementCurrency", "companyBusinessType", "country", "timezone", "companyIndustry","companyCountry"}
-
-# ---------------------------------------------------------------------------
 # Tool 1: Get Lead Field Instructions (call FIRST)
 # ---------------------------------------------------------------------------
-
-def _format_field(field: Dict[str, Any], include_filterable: bool = False) -> List[str]:
-    lines = []
-    label = field.get("displayName") or field.get("label") or "Unknown"
-    name = field.get("name", "")
-    field_id = field.get("id", "")
-    field_type = field.get("type", "UNKNOWN")
-    is_standard = field.get("standard", False)
-    is_required = field.get("required", False)
-    filterable = field.get("filterable", False)
-    prefix = "[STANDARD]" if is_standard else "[CUSTOM]"
-    if is_standard:
-        identifier = f"API Name: '{name}'"
-    else:
-        identifier = f"Field ID: '{field_id}', Internal Name for customFieldValues: '{name}'"
-    required_marker = " *REQUIRED*" if is_required else ""
-    filterable_marker = " [FILTERABLE]" if (include_filterable and filterable) else ""
-    lines.append(f"{prefix} '{label}' ({identifier}) - Type: {field_type}{required_marker}{filterable_marker}")
-    if field_type in ["PICK_LIST", "MULTI_PICKLIST"]:
-        picklist = field.get("picklist") or {}
-        # Deals use "picklistValues", Leads use "values"
-        values = picklist.get("values") or picklist.get("picklistValues", [])
-        if values:
-            use_name = name in PICKLIST_FIELDS_USE_INTERNAL_NAME
-            lines.append("  └─ Options (use internal name in search)" if use_name else "  └─ Options (use ID in search):")
-            for val in values:
-                if not isinstance(val, dict):
-                    continue
-                val_label = val.get("displayName") or val.get("label") or val.get("name") or "Unknown"
-                val_id = val.get("id", "")
-                val_name = val.get("name", "")
-                if use_name and val_name:
-                    lines.append(f"     • {val_label} (internal name: '{val_name}')")
-                else:
-                    lines.append(f"     • {val_label} (ID: {val_id})")
-    return lines
-
 
 async def _fetch_lead_fields() -> List[Dict[str, Any]]:
     """Fetch lead field metadata from Kylas API. Returns list of field dicts."""
@@ -285,107 +192,6 @@ async def _get_custom_field_id_to_name() -> Dict[str, str]:
     fields = await _fetch_lead_fields()
     custom = [f for f in fields if not f.get("standard", False)]
     return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
-
-
-def _get_filterable_fields_map(fields: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Return map of field name -> {type, standard} for active+filterable fields only."""
-    return {
-        (f.get("name") or str(f.get("id", ""))): {"type": f.get("type", "TEXT_FIELD"), "standard": f.get("standard", False)}
-        for f in fields
-        if f.get("active", True) and f.get("filterable", False) and (f.get("name") or f.get("id") is not None)
-    }
-
-
-def _rule_type_for_value(field_type: str, field_name: str, value: Any) -> str:
-    """Return jsonRule rule 'type' (string, long, or date) for the given field type and value."""
-    if field_type in ("PICK_LIST", "MULTI_PICKLIST"):
-        return "string" if field_name in PICKLIST_FIELDS_USE_INTERNAL_NAME else "long"
-    if field_type == "NUMBER":
-        return "double"
-    # MONEY (deal estimatedValue/actualValue, company annualRevenue, quotation
-    # subTotal/grandTotal) is an ordered numeric field: OPERATOR_MAPPING gives it
-    # greater/less/between, but without this branch it fell through to "string"
-    # below and the API rejected every one of those with 003014 "Invalid string
-    # operation". "double", not "long" — money carries decimals.
-    if field_type == "MONEY":
-        return "double"
-    # User look-up fields: createdBy, updatedBy, convertedBy, ownerId, importedBy — value is user ID (long)
-    if field_type in ("LOOK_UP", "ENTITY_FIELDS", "MEETING_ORGANIZER"):
-        return "long"
-    # Date/datetime: standard and custom (e.g. cfDateField); value = single ISO string, [start,end], or null
-    if field_type in ("DATETIME_PICKER", "DATE", "DATE_PICKER"):
-        return "date"
-    if field_type == "PARTICIPANTS_LOOKUP":
-        return "participants_lookup"
-    return "string"
-
-
-def _build_search_json_rule(
-    filters: List[Dict[str, Any]],
-    filterable_map: Dict[str, Dict[str, Any]],
-    default_timezone: Optional[str] = None,
-) -> Tuple[Dict[str, Any], Optional[str]]:
-    """
-    Build jsonRule for POST /search/lead. Returns (jsonRule, error_message).
-    Each filter: { "field": "<name>", "operator": "<op>", "value": <val>, "type": "<FIELD_TYPE>" }.
-    default_timezone: used for date/datetime rules when filter has no timeZone (e.g. from get_current_user).
-    """
-    tz_for_date = default_timezone or DEFAULT_TIMEZONE
-    rules = []
-    for i, f in enumerate(filters):
-        field_name = f.get("field")
-        operator = (f.get("operator") or "equal").strip().lower().replace(" ", "_")
-        # Convert operator symbols (>, <, >=, <=, !=, ==) to operator names
-        operator = OPERATOR_SYMBOL_MAP.get(operator, operator)
-        value = f.get("value")
-        field_type_key = (f.get("type") or "TEXT_FIELD").strip().upper().replace(" ", "_")
-
-        if not field_name:
-            return {}, f"Filter #{i + 1}: missing 'field'."
-        if field_name not in filterable_map:
-            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only a field listed as [FILTERABLE] in this endpoint's build_payload response (tenant_filterable_fields)."
-        meta = filterable_map[field_name]
-        api_type = meta.get("type", "TEXT_FIELD")
-        allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
-        if operator not in allowed:
-            return {}, f"Filter #{i + 1}: operator '{operator}' not allowed for field '{field_name}' (type {api_type}). Allowed: {', '.join(allowed)}."
-
-        rule_type = _rule_type_for_value(api_type, field_name, value)
-        if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
-            try:
-                value = float(value) if rule_type == "double" else int(value)
-            except (TypeError, ValueError):
-                value = value
-        # Date/datetime fields: convert date values from user's timezone to UTC
-        # e.g. "11th Aug 00:00" in Asia/Calcutta → "10th Aug 18:30" UTC
-        if rule_type == "date" and value is not None:
-            filter_tz = f.get("timeZone") or tz_for_date
-            value = _convert_date_value_to_utc(value, filter_tz)
-
-        # Custom fields: API expects field path "customFieldValues.cfFruits" or "customFieldValues.cfDateField"; standard fields use field name only
-        is_custom = not meta.get("standard", True)
-        rule_field = f"customFieldValues.{field_name}" if is_custom else field_name
-
-        rule = {
-            "operator": operator,
-            "id": field_name,
-            "field": rule_field,
-            "type": rule_type,
-            "value": value,
-            "relatedFieldIds": None,
-        }
-        # Pipeline/pipelineStage: API expects dependentFieldIds and relatedFieldIds for lead search
-        if field_name == "pipeline":
-            rule["dependentFieldIds"] = ["pipelineStage", ""
-                                                          ""]
-        elif field_name == "pipelineStage":
-            rule["relatedFieldIds"] = ["pipeline"]
-        # Date/datetime fields: API requires timeZone; use filter's timeZone or current user's (default_timezone) or fallback
-        if rule_type == "date":
-            rule["timeZone"] = f.get("timeZone") or tz_for_date
-        rules.append(rule)
-
-    return {"rules": rules, "condition": "AND", "valid": True}, None
 
 
 async def get_lead_field_instructions_logic() -> str:
@@ -902,42 +708,6 @@ async def get_pipeline_details(pipeline_id: int) -> str:
     except Exception as e:
         logger.exception("get_pipeline_details")
         return f"Unexpected error: {str(e)}"
-
-
-# ---------------------------------------------------------------------------
-# Tool 3a: Parse datetime in user timezone to UTC ISO (for create_lead datetime fields)
-# ---------------------------------------------------------------------------
-
-def parse_datetime_to_utc_iso(local_datetime: str, timezone: str) -> str:
-    """
-    Parse a datetime string as given in the user's local timezone and return UTC ISO string for the Kylas API.
-    Use when creating a lead with a date/datetime field: the user says e.g. "11th Feb 2026 at 7:30 AM" in their timezone;
-    call get_current_user to get timezone, then call this with (user's datetime string, user's timezone) and put the result in field_values.
-    """
-    try:
-        tz = ZoneInfo(timezone)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    dt = dateutil_parser.parse(local_datetime)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tz)
-    utc_dt = dt.astimezone(ZoneInfo("UTC"))
-    return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-
-@mcp.tool()
-def parse_datetime_to_utc_iso_tool(local_datetime: str, timezone: str) -> str:
-    """
-    Parse a datetime string in the user's timezone and return UTC ISO string for the Kylas API.
-    Call get_current_user first to get the user's timezone. Use the returned string in create_lead field_values for date/datetime fields.
-    Example: user says "create lead with follow-up 11th Feb 2026 at 7:30 AM" → get_current_user → timezone Asia/Calcutta → parse_datetime_to_utc_iso_tool("11 Feb 2026 7:30 AM", "Asia/Calcutta") → use result in field_values.
-    local_datetime: Datetime as the user said it (e.g. "11 Feb 2026 7:30 AM", "11th Feb 2026 at 7:30 am").
-    timezone: IANA timezone from get_current_user (e.g. Asia/Calcutta).
-    """
-    try:
-        return parse_datetime_to_utc_iso(local_datetime, timezone)
-    except Exception as e:
-        return f"Error: {e}"
 
 
 # ---------------------------------------------------------------------------
