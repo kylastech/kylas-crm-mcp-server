@@ -48,7 +48,6 @@ import os
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
-import httpx
 import yaml
 import json
 
@@ -69,19 +68,15 @@ from shared.meta import (
     DEFAULT_TIMEZONE,
     _threshold_iso_days_ago,
     _convert_date_value_to_utc,
-    parse_datetime_to_utc_iso,
     parse_datetime_to_utc_iso_tool,
     _format_field,
     _get_filterable_fields_map,
     _rule_type_for_value,
     _build_search_json_rule,
     _normalize_country_code,
-    _ensure_single_primary,
     _normalize_field_values,
     _format_entity_labels_for_instructions,
     _fetch_entity_labels,
-    get_entity_labels,
-    entity_labels_resource,
     lookup_pipelines_logic,
     get_pipeline_details_logic,
     _get_pipeline_details_raw,
