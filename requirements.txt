@@ -5,6 +5,14 @@ phonenumbers>=8.13.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 python-dateutil>=2.8.0
+# Required at runtime, not optional. python:3.11-slim (see Dockerfile) ships a
+# trimmed IANA database with the legacy "backward" aliases stripped:
+# ZoneInfo("Asia/Kolkata") resolves there, but ZoneInfo("Asia/Calcutta") raises.
+# Kylas returns the "Asia/Calcutta" alias for some tenants, and every timezone
+# lookup in main.py falls back to UTC on failure without raising — so without
+# this package those tenants' datetimes were silently shifted by 5:30 and
+# returned with ok/200 (a task created for 7:30 PM stored as 1:00 AM next day).
+tzdata>=2024.1
 py-key-value-aio==0.4.5
 PyYAML>=6.0
 
