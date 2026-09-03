@@ -137,6 +137,14 @@
     for task. page: 0-based (default 0). size: page size, max 100
     (default 20). sort: e.g. "createdAt,desc" (default).
 
+    Date/datetime fields (filter/search — e.g. dueDate, createdAt): keep the
+    value in the user's timezone; pass timeZone in the filter (or omit —
+    server uses it). Do NOT convert filter values to UTC, and do NOT resolve
+    datetime.parse_to_utc for them — that tool is for task.create/task.update
+    payloads ONLY. The server converts filter values itself from the timeZone
+    you pass; converting first shifts the window twice and the search then
+    silently misses the very records you are looking for.
+
     No pipeline, pipelineStage, emails, or phoneNumbers fields exist for
     tasks. Only [FILTERABLE] fields (from the live tenant_filterable_fields
     below) are allowed, plus these association fields (filterable even if

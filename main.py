@@ -207,6 +207,26 @@ def _convert_date_value_to_utc(value: Any, timezone_str: str) -> Any:
     Convert date/datetime filter value(s) from user's local timezone to UTC.
     Handles single ISO string, list of ISO strings (for between operator), or None.
     Strips trailing 'Z' before parsing so the value is treated as local time.
+
+    Parsing uses dateutil, the same parser datetime.parse_to_utc already uses,
+    rather than the two hardcoded strptime formats this used to accept. Those
+    two covered "2026-09-03T19:30:00.000" and "2026-09-03T19:30:00" and NOTHING
+    else — a space instead of the "T", or omitted seconds, fell through to a
+    bare `return v` and shipped the caller's local time to Kylas unconverted,
+    silently and with no log line. The filter then searched a window offset by
+    the timezone and quietly returned the wrong records:
+        '2026-09-03 19:30:00'       -> passed through unconverted
+        '3 September 2026 7:30 PM'  -> passed through unconverted
+        '2026-09-03T19:30'          -> passed through unconverted
+    All three convert correctly now.
+
+    Timezone handling is unchanged for the normal case and stricter for one
+    edge case: a naive value (including one with a trailing 'Z', which callers
+    routinely add to a local time they were told to send as local) is still
+    interpreted in `timezone_str`. But a value carrying a REAL utc offset, e.g.
+    "2026-09-03T19:30:00+05:30", is now honoured as written instead of having
+    its offset overwritten by timezone_str — previously such a value failed
+    both strptime formats and was passed through untouched.
     """
     if value is None:
         return value
@@ -214,26 +234,34 @@ def _convert_date_value_to_utc(value: Any, timezone_str: str) -> Any:
     try:
         tz = ZoneInfo(timezone_str)
     except Exception:
+        # Never silently pretend the caller meant UTC — that returns a wrong
+        # timestamp with no error anywhere. See the tzdata note in requirements.txt.
+        logger.error(
+            "Filter timezone %r could not be resolved — falling back to UTC. Date filter "
+            "values will NOT be shifted and the search window will be wrong by that "
+            "zone's offset. Ensure the 'tzdata' package is installed in the runtime.",
+            timezone_str,
+        )
         tz = ZoneInfo("UTC")
     utc = ZoneInfo("UTC")
 
-    def _convert_single(v: str) -> str:
-        if not isinstance(v, str):
+    def _convert_single(v: Any) -> Any:
+        if not isinstance(v, str) or not v.strip():
             return v
-        # Strip trailing Z so we treat it as naive local time
-        clean = v.rstrip("Z").rstrip("z")
+        # Strip trailing Z so a local time sent with a "Z" is still read as local.
+        clean = v.strip().rstrip("Zz")
         try:
-            # Try parsing with milliseconds first
-            try:
-                dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S.%f")
-            except ValueError:
-                dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S")
-            # Attach the user's timezone, then convert to UTC
-            local_dt = dt.replace(tzinfo=tz)
-            utc_dt = local_dt.astimezone(utc)
-            return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc_dt.microsecond // 1000:03d}Z"
-        except Exception:
-            return v  # Return as-is if parsing fails
+            dt = dateutil_parser.parse(clean)
+        except (ValueError, OverflowError, TypeError):
+            logger.warning(
+                "Could not parse date filter value %r; sending it to Kylas unconverted. "
+                "The search window may be wrong by the timezone offset.", v,
+            )
+            return v
+        # An explicit offset in the value wins; a naive value means local time.
+        local_dt = dt if dt.tzinfo is not None else dt.replace(tzinfo=tz)
+        utc_dt = local_dt.astimezone(utc)
+        return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc_dt.microsecond // 1000:03d}Z"
 
     if isinstance(value, list):
         return [_convert_single(v) for v in value]
