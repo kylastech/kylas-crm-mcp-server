@@ -15,8 +15,11 @@ STANDALONE TOOLS (2 — deliberately outside the registry flow):
   may have renamed CRM entities; every other tool only takes the standard
   type, never the tenant's custom display name). Fetched live, per call,
   never cached server-side — see _fetch_entity_labels's docstring.
-- get_current_user() — the calling user's profile/timezone; call before
-  any date/datetime conversion.
+- get_current_user() — MANDATORY, call first, every session, alongside
+  get_entity_labels(). Returns the calling user's IANA timezone and id.
+  Every timestamp Kylas returns is UTC; the timezone from this call is what
+  turns it into something the user actually recognises. Call it ONCE per
+  session and reuse the result — it is not cached server-side.
 
 THE GENERIC REGISTRY FLOW (3 tools):
 - list_tool(bucket?, intent?) — find the id of the operation you need.
@@ -367,19 +370,25 @@ operation (lead, contact, deal, task, company, meeting, call_log, quotation,
 plus shared user/product/pipeline/datetime lookups) is reached through
 exactly 3 generic tools, plus exactly 2 standalone tools that don't fit the
 id-based flow: get_current_user and get_entity_labels (see MANDATORY FIRST
-CALL, immediately below — read that before anything else in this document).
+CALLS, immediately below — read that before anything else in this document).
 There is no per-entity instructions block loaded up front — everything you
 need to use any operation correctly is either below (rules that apply
 across every operation) or returned by the tools themselves, on demand,
 scoped to the one operation you're actually performing.
 
-## MANDATORY FIRST CALL — get_entity_labels()
+## MANDATORY FIRST CALLS — get_entity_labels() and get_current_user()
 
-Call get_entity_labels() FIRST, before any other tool, at the start of
-EVERY session — before list_tool, before answering the user's actual
-request, before anything else. This is not optional and not a one-time
-setup step to skip on a hunch that "this tenant probably hasn't renamed
-anything."
+Call BOTH of these FIRST, before any other tool, at the start of EVERY
+session — before list_tool, before answering the user's actual request,
+before anything else. Neither is optional, and neither is a setup step to
+skip on a hunch that "this tenant probably hasn't renamed anything" or
+"this question probably isn't about dates."
+
+Call each ONCE per session and reuse the result for the rest of that
+session. Do NOT re-call either one before individual operations later on —
+the answers do not change mid-session. Call again only if the original
+result is no longer visible to you (e.g. a long conversation where it has
+dropped out of context).
 
 Why: this tenant may have renamed standard CRM entities to its own display
 names (e.g. "Lid" instead of "Lead", "Deeeel" instead of "Deal"). Every
@@ -389,6 +398,15 @@ STANDARD type (lead/contact/deal/task/company/meeting/call_log/quotation)
 from this tenant's custom names to those standard types. Without calling it
 first, a user asking for their "Lids" reads as a request for an entity type
 that doesn't exist, when it's actually just "lead" under a different name.
+
+Why get_current_user(): every timestamp Kylas returns is UTC (e.g.
+"2026-09-10T20:00:00.000Z"), but the user thinks, asks and reads in their
+own timezone. You need their IANA timezone BEFORE you show them any date,
+not after. Without it you will either dump a raw UTC timestamp the user has
+to decode, or guess the offset and be wrong — a task genuinely due 7:00 PM
+gets reported as 1:30 AM the next day, and nothing about the response looks
+wrong. The same timezone is also what you pass as timeZone in date filters,
+and what datetime.parse_to_utc needs for create/update payloads.
 
 ## The 3-step flow
 
@@ -461,9 +479,12 @@ task.search_any_relation, call_log.by_entity, datetime.parse_to_utc above):
 - get_entity_labels() — MANDATORY, call this first, every session, before
   anything else. See the MANDATORY FIRST CALL section at the top of this
   document — not repeated here.
-- get_current_user() — current user's profile/timezone; call before any
-  date/datetime conversion (before resolving datetime.parse_to_utc). No
-  bucket concept applies — it's about the calling user, not a CRM entity.
+- get_current_user() — MANDATORY, call this first, every session, before
+  anything else, alongside get_entity_labels(). See the MANDATORY FIRST
+  CALLS section at the top of this document — not repeated here. Reuse its
+  timezone for the whole session (date filters, datetime.parse_to_utc, and
+  every date you display); do not re-call it per operation. No bucket
+  concept applies — it's about the calling user, not a CRM entity.
 
 Two operations that used to be standalone tools are now registry ids —
 resolve them the same way as any other id (list_tool -> build_payload ->
@@ -520,8 +541,26 @@ it empty. Never call *.search_by_term with "*" or a blank term — it returns
 nothing; use *.search with a date filter for "all"/"list" queries instead.
 Tell the user: "Showing records updated in the last 3 months. Specify a
 date range for older records." If the user gives their own date range, use
-that instead. Call get_current_user first if the user's timezone is
-unknown.
+that instead. Use the timezone from the session-start get_current_user()
+call — do not call it again here.
+
+## SHOWING DATES TO THE USER — applies to every date you ever display
+Every timestamp in a tool response is UTC. Some arrive as
+"2026-09-10T20:00:00.000Z", some as "2026-09-10T20:00:00.000+0000" — both
+are UTC, treat them identically.
+
+NEVER show the user a raw UTC timestamp, and never show a bare number.
+Convert to the user's timezone (from the session-start get_current_user()
+call) and write it the way a person reads it:
+
+  "2026-09-10T20:00:00.000Z"  ->  "11 Sep 2026, 1:30 AM (Asia/Kolkata)"
+
+This applies to EVERY date field you present: dueDate, createdAt,
+updatedAt, closingDate, completedAt, meeting from/to, call log startTime,
+quotation validTill, and any custom date field. It also applies when you
+reason about a date out loud ("this task is overdue", "due in 3 days") —
+compare in the user's timezone, not in UTC, or you will be off by the
+offset and state it with confidence.
 
 ## REPORT FORMATTING — apply whenever presenting 3+ records or a summary
 Structure every report like this:
@@ -1125,11 +1164,17 @@ async def _fetch_current_user() -> Dict[str, Any]:
 async def get_current_user() -> str:
     """
     Get the current authenticated user's profile from Kylas (GET /users/me).
-    Call this whenever a date or datetime-related query is involved, or whenever
-    you need the current user's own ID (e.g. to set ownerId/createdBy to "me").
-    Returns id, timezone (IANA, e.g. Asia/Calcutta), recordActions (call, email, sms, etc.), name, and other profile fields.
-    - For filtering (search_leads, search_idle_leads): use the returned timezone as the timeZone in date/datetime filters; keep the user's date/datetime as-is (do not convert to UTC).
-    - For create_lead: when the user provides a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone, convert to UTC using parse_datetime_to_utc_iso, and send the UTC ISO string in field_values.
+
+    MANDATORY: call this ONCE at the start of every session, before any other
+    tool, alongside get_entity_labels(). Then REUSE the result for the rest of
+    the session — do not call it again before individual date operations; the
+    answer does not change mid-session. Call again only if that first result is
+    no longer visible to you.
+
+    Returns id, timezone (IANA, e.g. Asia/Kolkata), recordActions (call, email, sms, etc.), name, and other profile fields.
+    - Displaying ANY date: every timestamp from every tool is UTC. Convert it to this timezone before showing it, and say which zone (e.g. "11 Sep 2026, 1:30 AM (Asia/Kolkata)"). Never show the user a raw UTC timestamp or a bare epoch number.
+    - For filtering (*.search, *.search_idle): pass this timezone as timeZone in date/datetime filters and keep the user's date/datetime as-is — do NOT convert filter values to UTC, the server does that itself.
+    - For create/update (*.create, *.update): when the user gives a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone and convert it to UTC by resolving datetime.parse_to_utc (list_tool -> build_payload -> execute_request) with {local_datetime, timezone}, then put the returned UTC ISO string in the payload.
     - For ownerId/createdBy referring to the current user (e.g. "assign to me", "create a lead owned by me"): use the returned id directly — do NOT call user.lookup/lookup_users to resolve yourself by name.
     """
     try:
