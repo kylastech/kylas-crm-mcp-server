@@ -196,6 +196,33 @@ def test_format_field_custom_with_picklist():
     assert "Large (ID: 67890)" in lines[3]
 
 
+def test_format_field_omits_large_picklist_options():
+    """A picklist named in large_fields gets a short stub instead of every option."""
+    field = {
+        "id": 200,
+        "displayName": "Timezone",
+        "name": "timezone",
+        "type": "PICK_LIST",
+        "standard": True,
+        "picklist": {
+            "values": [
+                {"id": 1, "displayName": "Asia/Calcutta"},
+                {"id": 2, "displayName": "America/New_York"},
+            ]
+        },
+    }
+    lines = _format_field(field, large_fields={"timezone"})
+    joined = "\n".join(lines)
+    assert "omitted" in joined
+    assert "build_payload(id, fields=[\"timezone\"])" in joined
+    assert "Asia/Calcutta" not in joined
+
+    # Not in large_fields -> unaffected, full list still shown.
+    lines_full = _format_field(field, large_fields={"country"})
+    joined_full = "\n".join(lines_full)
+    assert "Asia/Calcutta" in joined_full
+
+
 def test_normalize_field_values_standard_only():
     fv = {"firstName": "John", "lastName": "Doe"}
     payload = _normalize_field_values(fv)
@@ -347,6 +374,47 @@ async def test_get_lead_field_instructions_success():
         assert "KYLAS CRM - LEAD FIELDS CHEAT SHEET" in result
         assert "[STANDARD] 'First Name' (API Name: 'firstName')" in result
         assert "[CUSTOM] 'Company Size' (Field ID: '57300'" in result
+        assert "Website (ID: 1001)" in result
+        assert "Small (ID: 12345)" in result
+
+
+@pytest.mark.asyncio
+async def test_get_lead_field_instructions_omits_large_picklist():
+    """timezone is one of lead's 'large' picklists (_BUCKET_PICKLIST_RULES) -
+    get_lead_field_instructions should stub it out, same as build_payload does,
+    while leaving an ordinary picklist (leadSource) untouched."""
+    mock_response_with_timezone = MOCK_FIELDS_RESPONSE + [
+        {
+            "id": 300,
+            "displayName": "Timezone",
+            "name": "timezone",
+            "type": "PICK_LIST",
+            "standard": True,
+            "active": True,
+            "picklist": {
+                "values": [
+                    {"id": 1, "displayName": "Asia/Calcutta"},
+                    {"id": 2, "displayName": "America/New_York"},
+                ]
+            },
+        }
+    ]
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = mock_response_with_timezone
+        mock_response.raise_for_status = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await get_lead_field_instructions_logic()
+
+        assert "omitted" in result
+        assert 'build_payload(id, fields=["timezone"])' in result
+        assert "Asia/Calcutta" not in result
+        # Non-large picklists are unaffected.
         assert "Website (ID: 1001)" in result
         assert "Small (ID: 12345)" in result
 

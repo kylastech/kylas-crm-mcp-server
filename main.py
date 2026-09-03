@@ -916,7 +916,11 @@ mcp = FastMCP("Kylas CRM", instructions=SYSTEM_INSTRUCTIONS, lifespan=_app_lifes
 # Tool 1: Get Lead Field Instructions (call FIRST)
 # ---------------------------------------------------------------------------
 
-def _format_field(field: Dict[str, Any], include_filterable: bool = False) -> List[str]:
+def _format_field(
+    field: Dict[str, Any],
+    include_filterable: bool = False,
+    large_fields: Optional[set] = None,
+) -> List[str]:
     lines = []
     label = field.get("displayName") or field.get("label") or "Unknown"
     name = field.get("name", "")
@@ -938,18 +942,22 @@ def _format_field(field: Dict[str, Any], include_filterable: bool = False) -> Li
         # Deals use "picklistValues", Leads use "values"
         values = picklist.get("values") or picklist.get("picklistValues", [])
         if values:
-            use_name = name in PICKLIST_FIELDS_USE_INTERNAL_NAME
-            lines.append("  └─ Options (use internal name in search)" if use_name else "  └─ Options (use ID in search):")
-            for val in values:
-                if not isinstance(val, dict):
-                    continue
-                val_label = val.get("displayName") or val.get("label") or val.get("name") or "Unknown"
-                val_id = val.get("id", "")
-                val_name = val.get("name", "")
-                if use_name and val_name:
-                    lines.append(f"     • {val_label} (internal name: '{val_name}')")
-                else:
-                    lines.append(f"     • {val_label} (ID: {val_id})")
+            if name.strip().lower() in (large_fields or set()):
+                lines.append(f"  └─ {len(values)} options omitted to keep this reference compact.")
+                lines.append(f"     Call build_payload(id, fields=[\"{name}\"]) to get them. Do NOT guess an option id or name.")
+            else:
+                use_name = name in PICKLIST_FIELDS_USE_INTERNAL_NAME
+                lines.append("  └─ Options (use internal name in search)" if use_name else "  └─ Options (use ID in search):")
+                for val in values:
+                    if not isinstance(val, dict):
+                        continue
+                    val_label = val.get("displayName") or val.get("label") or val.get("name") or "Unknown"
+                    val_id = val.get("id", "")
+                    val_name = val.get("name", "")
+                    if use_name and val_name:
+                        lines.append(f"     • {val_label} (internal name: '{val_name}')")
+                    else:
+                        lines.append(f"     • {val_label} (ID: {val_id})")
     return lines
 
 
@@ -1082,6 +1090,7 @@ async def get_lead_field_instructions_logic() -> str:
     fields = await _fetch_lead_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("lead", {}).get("large", set())}
     lines = [
         "=" * 60,
         "KYLAS CRM - LEAD FIELDS CHEAT SHEET",
@@ -1091,11 +1100,11 @@ async def get_lead_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -2359,9 +2368,10 @@ async def get_contact_field_instructions() -> str:
     try:
         _reset_api_call_count()
         fields = await _fetch_contact_fields()
+        large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("contact", {}).get("large", set())}
         lines = ["# Contact Field Reference", ""]
         for field in fields:
-            lines.extend(_format_field(field, include_filterable=True))
+            lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields))
         return "\n".join(lines)
     except KylasAPIError as e:
         return f"✗ Failed to fetch fields: {e.message}"
@@ -2634,9 +2644,10 @@ async def get_task_field_instructions() -> str:
     try:
         _reset_api_call_count()
         fields = await _fetch_task_fields()
+        large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("task", {}).get("large", set())}
         lines = ["# Task Field Reference", ""]
         for field in fields:
-            lines.extend(_format_field(field, include_filterable=True))
+            lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields))
         return "\n".join(lines)
     except KylasAPIError as e:
         return f"✗ Failed to fetch fields: {e.message}"
@@ -3026,6 +3037,7 @@ async def get_deal_field_instructions_logic() -> str:
     fields = await _fetch_deal_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("deal", {}).get("large", set())}
     lines = [
         "=" * 60,
         "KYLAS CRM - DEAL FIELDS CHEAT SHEET",
@@ -3035,11 +3047,11 @@ async def get_deal_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -3792,6 +3804,7 @@ async def get_company_field_instructions_logic() -> str:
     fields = await _fetch_company_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("company", {}).get("large", set())}
     lines = [
         "=" * 60,
         "KYLAS CRM - COMPANY FIELDS CHEAT SHEET",
@@ -3801,11 +3814,11 @@ async def get_company_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -4099,7 +4112,7 @@ async def _get_meeting_custom_field_id_to_name() -> Dict[str, str]:
     return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
 
 
-def _format_meeting_field(field: Dict[str, Any]) -> List[str]:
+def _format_meeting_field(field: Dict[str, Any], large_fields: Optional[set] = None) -> List[str]:
     """Format a single meeting field for the cheat sheet."""
     lines = []
     name = field.get("name", "")
@@ -4121,14 +4134,21 @@ def _format_meeting_field(field: Dict[str, Any]) -> List[str]:
         picklist = field.get("picklist") or {}
         values = picklist.get("picklistValues") or picklist.get("values", [])
         if values and field_type != "PICK_LIST":
-            # For ENTITY_PICKLIST like status/medium, show internal names
-            lines.append("  └─ Options (use internal name):")
-            for val in values:
-                if not isinstance(val, dict):
-                    continue
-                val_label = val.get("displayName") or val.get("name") or "Unknown"
-                val_name = val.get("name", "")
-                lines.append(f"     • {val_label} (name: '{val_name}')")
+            if name.strip().lower() in (large_fields or set()):
+                # Oversized picklist (e.g. timezone) — same omission rule
+                # build_payload's _field_summary applies, kept in sync via the
+                # shared _BUCKET_PICKLIST_RULES table.
+                lines.append(f"  └─ {len(values)} options omitted to keep this reference compact.")
+                lines.append(f"     Call build_payload(id, fields=[\"{name}\"]) to get them. Do NOT guess an option id or name.")
+            else:
+                # For ENTITY_PICKLIST like status/medium, show internal names
+                lines.append("  └─ Options (use internal name):")
+                for val in values:
+                    if not isinstance(val, dict):
+                        continue
+                    val_label = val.get("displayName") or val.get("name") or "Unknown"
+                    val_name = val.get("name", "")
+                    lines.append(f"     • {val_label} (name: '{val_name}')")
     return lines
 
 
@@ -4136,6 +4156,7 @@ async def get_meeting_field_instructions_logic() -> str:
     fields = await _fetch_meeting_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("meeting", {}).get("large", set())}
     lines = [
         "=" * 60,
         "KYLAS CRM - MEETING FIELDS CHEAT SHEET",
@@ -4145,11 +4166,11 @@ async def get_meeting_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_meeting_field(f))
+        lines.extend(_format_meeting_field(f, large_fields=large_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_meeting_field(f))
+            lines.extend(_format_meeting_field(f, large_fields=large_fields))
     lines.extend([
         "",
         "## CREATE MEETING PAYLOAD FORMAT",
@@ -4850,6 +4871,7 @@ async def get_call_log_field_instructions_logic() -> str:
     fields = await _fetch_call_log_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("call_log", {}).get("large", set())}
     lines = [
         "=" * 60,
         "KYLAS CRM - CALL LOG FIELDS CHEAT SHEET",
@@ -4859,11 +4881,11 @@ async def get_call_log_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_meeting_field(f))
+        lines.extend(_format_meeting_field(f, large_fields=large_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_meeting_field(f))
+            lines.extend(_format_meeting_field(f, large_fields=large_fields))
     lines.extend([
         "",
         "## CREATE CALL LOG PAYLOAD FORMAT",
@@ -5570,6 +5592,7 @@ async def get_quotation_field_instructions_logic() -> str:
     fields = await _fetch_quotation_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("quotation", {}).get("large", set())}
     lines = [
         "=" * 60,
         "KYLAS CRM - QUOTATION FIELDS CHEAT SHEET",
@@ -5579,11 +5602,11 @@ async def get_quotation_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
