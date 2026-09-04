@@ -113,7 +113,7 @@
     IDs (for association filters) — search for the entity first to get its
     real ID; never invent IDs.
 
-    Pagination: always use the largest page size available. Do NOT
+    Pagination: always use the minimum page size available. Do NOT
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
     if the user wants more. If you receive a 429 error: stop, wait at least
     5 seconds, then retry once.
