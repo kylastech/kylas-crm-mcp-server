@@ -138,7 +138,7 @@
     Never use meeting.search_by_term to search meetings by owner or
     organizer name — it only searches the title field.
 
-    Pagination: always use the largest page size available. Do NOT
+    Pagination: always use the minimum page size available. Do NOT
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
     if the user wants more. If you receive a 429 error: stop, wait at least
     5 seconds, then retry once.

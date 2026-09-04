@@ -544,7 +544,7 @@ execute_request), do NOT try to call them as bare functions:
 - For *.search endpoints: fetch one page, show the user what came back, and
   only fetch further pages if they ask for more — don't loop and fetch
   everything automatically. Every search response carries "totalPages" —
-  use the largest page size available (usually 50-100 max) to minimize
+  use the minimum page size available (usually 50-100 max) to minimize
   calls, and never auto-fetch multiple pages in one reasoning step.
 - Never tell the user an action succeeded (a record was created, updated, or
   found) unless execute_request's own envelope actually said
