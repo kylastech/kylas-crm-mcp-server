@@ -922,6 +922,7 @@ def _format_field(
     include_filterable: bool = False,
     large_fields: Optional[set] = None,
     requested_picklists: Optional[set] = None,
+    internal_name_fields: Optional[set] = None,
 ) -> List[str]:
     lines = []
     label = field.get("displayName") or field.get("label") or "Unknown"
@@ -948,7 +949,7 @@ def _format_field(
                 lines.append(f"  └─ {len(values)} options omitted to keep this reference compact.")
                 lines.append(f"     Call build_payload(id, fields=[\"{name}\"]) to get them. Do NOT guess an option id or name.")
             else:
-                use_name = name in PICKLIST_FIELDS_USE_INTERNAL_NAME
+                use_name = name in (internal_name_fields or set())
                 lines.append("  └─ Options (use internal name in search)" if use_name else "  └─ Options (use ID in search):")
                 for val in values:
                     if not isinstance(val, dict):
@@ -996,10 +997,24 @@ def _get_filterable_fields_map(fields: List[Dict[str, Any]]) -> Dict[str, Dict[s
     }
 
 
-def _rule_type_for_value(field_type: str, field_name: str, value: Any) -> str:
-    """Return jsonRule rule 'type' (string, long, or date) for the given field type and value."""
+def _rule_type_for_value(
+    field_type: str,
+    field_name: str,
+    value: Any,
+    internal_name_fields: Optional[set] = None,
+) -> str:
+    """Return jsonRule rule 'type' (string, long, or date) for the given field type and value.
+
+    internal_name_fields: this bucket's set of picklist fields that take the
+    option's internal name (string) instead of its numeric id — from
+    _BUCKET_PICKLIST_RULES[bucket]["internal_name"]. Defaults to the lead/
+    contact set for backward compatibility with callers that don't pass it.
+    """
     if field_type in ("PICK_LIST", "MULTI_PICKLIST"):
-        return "string" if field_name in PICKLIST_FIELDS_USE_INTERNAL_NAME else "long"
+        allowed_internal_names = (
+            internal_name_fields if internal_name_fields is not None else PICKLIST_FIELDS_USE_INTERNAL_NAME
+        )
+        return "string" if field_name in allowed_internal_names else "long"
     if field_type == "NUMBER":
         return "double"
     # MONEY (deal estimatedValue/actualValue, company annualRevenue, quotation
@@ -1024,11 +1039,14 @@ def _build_search_json_rule(
     filters: List[Dict[str, Any]],
     filterable_map: Dict[str, Dict[str, Any]],
     default_timezone: Optional[str] = None,
+    internal_name_fields: Optional[set] = None,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """
     Build jsonRule for POST /search/lead. Returns (jsonRule, error_message).
     Each filter: { "field": "<name>", "operator": "<op>", "value": <val>, "type": "<FIELD_TYPE>" }.
     default_timezone: used for date/datetime rules when filter has no timeZone (e.g. from get_current_user).
+    internal_name_fields: this bucket's _BUCKET_PICKLIST_RULES[...]["internal_name"]
+    set, forwarded to _rule_type_for_value for PICK_LIST/MULTI_PICKLIST fields.
     """
     tz_for_date = default_timezone or DEFAULT_TIMEZONE
     rules = []
@@ -1050,7 +1068,7 @@ def _build_search_json_rule(
         if operator not in allowed:
             return {}, f"Filter #{i + 1}: operator '{operator}' not allowed for field '{field_name}' (type {api_type}). Allowed: {', '.join(allowed)}."
 
-        rule_type = _rule_type_for_value(api_type, field_name, value)
+        rule_type = _rule_type_for_value(api_type, field_name, value, internal_name_fields)
         if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
             try:
                 value = float(value) if rule_type == "double" else int(value)
@@ -1096,6 +1114,7 @@ async def get_lead_field_instructions_logic(
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
     large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("lead", {}).get("large", set())}
+    internal_name_fields = _BUCKET_PICKLIST_RULES.get("lead", {}).get("internal_name", set())
     lines = [
         "=" * 60,
         "KYLAS CRM - LEAD FIELDS CHEAT SHEET",
@@ -1105,11 +1124,11 @@ async def get_lead_field_instructions_logic(
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -2116,7 +2135,10 @@ async def search_leads_logic(
             except Exception:
                 default_tz = DEFAULT_TIMEZONE
             break
-    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    json_rule, err = _build_search_json_rule(
+        filters, filterable_map, default_timezone=default_tz,
+        internal_name_fields=_BUCKET_PICKLIST_RULES.get("lead", {}).get("internal_name", set()),
+    )
     if err:
         return f"Invalid filters: {err}"
     payload = {
@@ -2370,9 +2392,10 @@ async def get_contact_field_instructions_logic(
 ) -> str:
     fields = fields_meta if fields_meta is not None else await _fetch_contact_fields()
     large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("contact", {}).get("large", set())}
+    internal_name_fields = _BUCKET_PICKLIST_RULES.get("contact", {}).get("internal_name", set())
     lines = ["# Contact Field Reference", ""]
     for field in fields:
-        lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
+        lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     return "\n".join(lines)
 
 
@@ -2442,7 +2465,10 @@ async def search_contacts_logic(
             except Exception:
                 default_tz = DEFAULT_TIMEZONE
             break
-    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    json_rule, err = _build_search_json_rule(
+        filters, filterable_map, default_timezone=default_tz,
+        internal_name_fields=_BUCKET_PICKLIST_RULES.get("contact", {}).get("internal_name", set()),
+    )
     if err:
         return f"Invalid filters: {err}"
     payload = {
@@ -2558,6 +2584,9 @@ async def lookup_companies_for_task(search_term: str = "") -> Dict[str, Any]:
         return await handle_api_response(response, "Lookup companies for task")
 
 
+TASK_PICKLIST_FIELDS_USE_INTERNAL_NAME = {"reminder"}
+
+
 async def _fetch_task_fields() -> List[Dict[str, Any]]:
     """Fetch task field metadata from Kylas API."""
     async with get_client() as client:
@@ -2653,9 +2682,10 @@ async def get_task_field_instructions_logic(
 ) -> str:
     fields = fields_meta if fields_meta is not None else await _fetch_task_fields()
     large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("task", {}).get("large", set())}
+    internal_name_fields = _BUCKET_PICKLIST_RULES.get("task", {}).get("internal_name", set())
     lines = ["# Task Field Reference", ""]
     for field in fields:
-        lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
+        lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     return "\n".join(lines)
 
 
@@ -2732,7 +2762,10 @@ async def search_tasks_logic(
             except Exception:
                 default_tz = DEFAULT_TIMEZONE
             break
-    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    json_rule, err = _build_search_json_rule(
+        filters, filterable_map, default_timezone=default_tz,
+        internal_name_fields=_BUCKET_PICKLIST_RULES.get("task", {}).get("internal_name", set()),
+    )
     if err:
         return f"Invalid filters: {err}"
     payload = {
@@ -2875,6 +2908,7 @@ async def _fetch_raw_tasks_for_relation(
     json_rule, err = _build_search_json_rule(
         [{"field": relation_field, "operator": "is_not_null", "value": None}],
         filterable_map,
+        internal_name_fields=_BUCKET_PICKLIST_RULES.get("task", {}).get("internal_name", set()),
     )
     if err:
         logger.warning("_fetch_raw_tasks_for_relation(%s): rule error: %s", relation_field, err)
@@ -3060,6 +3094,7 @@ async def get_deal_field_instructions_logic(
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
     large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("deal", {}).get("large", set())}
+    internal_name_fields = _BUCKET_PICKLIST_RULES.get("deal", {}).get("internal_name", set())
     lines = [
         "=" * 60,
         "KYLAS CRM - DEAL FIELDS CHEAT SHEET",
@@ -3069,11 +3104,11 @@ async def get_deal_field_instructions_logic(
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -3830,6 +3865,7 @@ async def get_company_field_instructions_logic(
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
     large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("company", {}).get("large", set())}
+    internal_name_fields = _BUCKET_PICKLIST_RULES.get("company", {}).get("internal_name", set())
     lines = [
         "=" * 60,
         "KYLAS CRM - COMPANY FIELDS CHEAT SHEET",
@@ -3839,11 +3875,11 @@ async def get_company_field_instructions_logic(
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -5773,7 +5809,10 @@ async def search_quotations_logic(
                 default_tz = DEFAULT_TIMEZONE
             break
 
-    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    json_rule, err = _build_search_json_rule(
+        filters, filterable_map, default_timezone=default_tz,
+        internal_name_fields=_BUCKET_PICKLIST_RULES.get("quotation", {}).get("internal_name", set()),
+    )
     if err:
         return f"Invalid filters: {err}"
     payload = {"jsonRule": json_rule}
@@ -6677,7 +6716,7 @@ _BUCKET_PICKLIST_RULES: Dict[str, Dict[str, set]] = {
     },
     "task": {
         "large": set(),
-        "internal_name": PICKLIST_FIELDS_USE_INTERNAL_NAME,
+        "internal_name": TASK_PICKLIST_FIELDS_USE_INTERNAL_NAME,
     },
     "call_log": {
         "large": set(),
