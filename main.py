@@ -458,10 +458,11 @@ and what datetime.parse_to_utc needs for create/update payloads.
    the payload you go on to build from it.
 
    A few picklist fields on a real tenant are enormous — timezone alone is
-   ~435 options. Their option lists are omitted by default and shown as
-   "options_count" / "options_omitted" / "uses_internal_name" instead. Every
-   other field, including every small picklist and every custom field, always
-   comes back complete, so this costs you nothing on a normal request. The
+   ~435 options. Their option lists are omitted by default from the returned
+   "tenant_fields_reference" cheat sheet, replaced with a one-line stub
+   telling you exactly how to get them. Every other field, including every
+   small picklist and every custom field, always comes back complete, so this
+   costs you nothing on a normal request. The
    large ones, with both names each goes by (entities disagree — a lead has
    "companyIndustry", a company has "industry"):
 
@@ -920,6 +921,7 @@ def _format_field(
     field: Dict[str, Any],
     include_filterable: bool = False,
     large_fields: Optional[set] = None,
+    requested_picklists: Optional[set] = None,
 ) -> List[str]:
     lines = []
     label = field.get("displayName") or field.get("label") or "Unknown"
@@ -942,7 +944,7 @@ def _format_field(
         # Deals use "picklistValues", Leads use "values"
         values = picklist.get("values") or picklist.get("picklistValues", [])
         if values:
-            if name.strip().lower() in (large_fields or set()):
+            if name.strip().lower() in (large_fields or set()) and name.strip().lower() not in (requested_picklists or set()):
                 lines.append(f"  └─ {len(values)} options omitted to keep this reference compact.")
                 lines.append(f"     Call build_payload(id, fields=[\"{name}\"]) to get them. Do NOT guess an option id or name.")
             else:
@@ -1086,8 +1088,11 @@ def _build_search_json_rule(
     return {"rules": rules, "condition": "AND", "valid": True}, None
 
 
-async def get_lead_field_instructions_logic() -> str:
-    fields = await _fetch_lead_fields()
+async def get_lead_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_lead_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
     large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("lead", {}).get("large", set())}
@@ -1100,11 +1105,11 @@ async def get_lead_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -2359,6 +2364,18 @@ def _format_contact_for_display(contact: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+async def get_contact_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_contact_fields()
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("contact", {}).get("large", set())}
+    lines = ["# Contact Field Reference", ""]
+    for field in fields:
+        lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def get_contact_field_instructions() -> str:
     """
@@ -2367,12 +2384,7 @@ async def get_contact_field_instructions() -> str:
     """
     try:
         _reset_api_call_count()
-        fields = await _fetch_contact_fields()
-        large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("contact", {}).get("large", set())}
-        lines = ["# Contact Field Reference", ""]
-        for field in fields:
-            lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields))
-        return "\n".join(lines)
+        return await get_contact_field_instructions_logic()
     except KylasAPIError as e:
         return f"✗ Failed to fetch fields: {e.message}"
     except Exception as e:
@@ -2635,6 +2647,18 @@ def _format_task_for_display(task: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+async def get_task_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_task_fields()
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("task", {}).get("large", set())}
+    lines = ["# Task Field Reference", ""]
+    for field in fields:
+        lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def get_task_field_instructions() -> str:
     """
@@ -2643,12 +2667,7 @@ async def get_task_field_instructions() -> str:
     """
     try:
         _reset_api_call_count()
-        fields = await _fetch_task_fields()
-        large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("task", {}).get("large", set())}
-        lines = ["# Task Field Reference", ""]
-        for field in fields:
-            lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields))
-        return "\n".join(lines)
+        return await get_task_field_instructions_logic()
     except KylasAPIError as e:
         return f"✗ Failed to fetch fields: {e.message}"
     except Exception as e:
@@ -3033,8 +3052,11 @@ async def _get_deal_custom_field_id_to_name() -> Dict[str, str]:
     return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
 
 
-async def get_deal_field_instructions_logic() -> str:
-    fields = await _fetch_deal_fields()
+async def get_deal_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_deal_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
     large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("deal", {}).get("large", set())}
@@ -3047,11 +3069,11 @@ async def get_deal_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -3800,8 +3822,11 @@ async def _get_company_custom_field_id_to_name() -> Dict[str, str]:
     return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
 
 
-async def get_company_field_instructions_logic() -> str:
-    fields = await _fetch_company_fields()
+async def get_company_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_company_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
     large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("company", {}).get("large", set())}
@@ -3814,11 +3839,11 @@ async def get_company_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -4112,7 +4137,11 @@ async def _get_meeting_custom_field_id_to_name() -> Dict[str, str]:
     return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
 
 
-def _format_meeting_field(field: Dict[str, Any], large_fields: Optional[set] = None) -> List[str]:
+def _format_meeting_field(
+    field: Dict[str, Any],
+    large_fields: Optional[set] = None,
+    requested_picklists: Optional[set] = None,
+) -> List[str]:
     """Format a single meeting field for the cheat sheet."""
     lines = []
     name = field.get("name", "")
@@ -4134,10 +4163,11 @@ def _format_meeting_field(field: Dict[str, Any], large_fields: Optional[set] = N
         picklist = field.get("picklist") or {}
         values = picklist.get("picklistValues") or picklist.get("values", [])
         if values and field_type != "PICK_LIST":
-            if name.strip().lower() in (large_fields or set()):
-                # Oversized picklist (e.g. timezone) — same omission rule
-                # build_payload's _field_summary applies, kept in sync via the
-                # shared _BUCKET_PICKLIST_RULES table.
+            if name.strip().lower() in (large_fields or set()) and name.strip().lower() not in (requested_picklists or set()):
+                # Oversized picklist (e.g. timezone) — build_payload's
+                # tenant_fields_reference is this SAME text (it calls this
+                # function directly), so there is only one omission rule to
+                # keep in sync, driven by the shared _BUCKET_PICKLIST_RULES table.
                 lines.append(f"  └─ {len(values)} options omitted to keep this reference compact.")
                 lines.append(f"     Call build_payload(id, fields=[\"{name}\"]) to get them. Do NOT guess an option id or name.")
             else:
@@ -4152,8 +4182,11 @@ def _format_meeting_field(field: Dict[str, Any], large_fields: Optional[set] = N
     return lines
 
 
-async def get_meeting_field_instructions_logic() -> str:
-    fields = await _fetch_meeting_fields()
+async def get_meeting_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_meeting_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
     large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("meeting", {}).get("large", set())}
@@ -4166,11 +4199,11 @@ async def get_meeting_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_meeting_field(f, large_fields=large_fields))
+        lines.extend(_format_meeting_field(f, large_fields=large_fields, requested_picklists=requested_picklists))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_meeting_field(f, large_fields=large_fields))
+            lines.extend(_format_meeting_field(f, large_fields=large_fields, requested_picklists=requested_picklists))
     lines.extend([
         "",
         "## CREATE MEETING PAYLOAD FORMAT",
@@ -4867,8 +4900,11 @@ async def _fetch_call_log_fields() -> List[Dict[str, Any]]:
         return [f for f in fields if f.get("active", True)]
 
 
-async def get_call_log_field_instructions_logic() -> str:
-    fields = await _fetch_call_log_fields()
+async def get_call_log_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_call_log_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
     large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("call_log", {}).get("large", set())}
@@ -4881,11 +4917,11 @@ async def get_call_log_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_meeting_field(f, large_fields=large_fields))
+        lines.extend(_format_meeting_field(f, large_fields=large_fields, requested_picklists=requested_picklists))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_meeting_field(f, large_fields=large_fields))
+            lines.extend(_format_meeting_field(f, large_fields=large_fields, requested_picklists=requested_picklists))
     lines.extend([
         "",
         "## CREATE CALL LOG PAYLOAD FORMAT",
@@ -5588,8 +5624,11 @@ async def _fetch_quotation_fields() -> List[Dict[str, Any]]:
 
 
 
-async def get_quotation_field_instructions_logic() -> str:
-    fields = await _fetch_quotation_fields()
+async def get_quotation_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_quotation_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
     large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("quotation", {}).get("large", set())}
@@ -5602,11 +5641,11 @@ async def get_quotation_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -6578,6 +6617,23 @@ _BUCKET_FIELD_FETCHERS: Dict[str, Any] = {
     "quotation": _fetch_quotation_fields,
 }
 
+# Maps a bucket to the SAME cheat-sheet builder the standalone
+# get_<bucket>_field_instructions tool uses. _fold_field_metadata_into_schema calls this
+# (passing the fields_meta it already fetched via _BUCKET_FIELD_FETCHERS above, plus
+# build_payload's own "fields" hint as requested_picklists) instead of re-deriving its own,
+# separate field-listing JSON — one formatting path for both surfaces, not two that can drift
+# apart (see the "status"/ENTITY_PICKLIST omission this replaced).
+_BUCKET_FIELD_INSTRUCTIONS_LOGIC: Dict[str, Any] = {
+    "lead": get_lead_field_instructions_logic,
+    "contact": get_contact_field_instructions_logic,
+    "meeting": get_meeting_field_instructions_logic,
+    "call_log": get_call_log_field_instructions_logic,
+    "deal": get_deal_field_instructions_logic,
+    "task": get_task_field_instructions_logic,
+    "company": get_company_field_instructions_logic,
+    "quotation": get_quotation_field_instructions_logic,
+}
+
 # Maps a bucket to the real, original get_* tool whose inputSchema
 # build_payload copies verbatim for that bucket's ".get" entry. call_log has
 # no entry here on purpose — there is no get-a-single-call-log-by-id tool in
@@ -6627,13 +6683,33 @@ _BUCKET_PICKLIST_RULES: Dict[str, Dict[str, set]] = {
         "large": set(),
         "internal_name": CALL_LOG_PICKLIST_FIELDS_USE_INTERNAL_NAME,
     },
-    # quotation has no create/update entry in the registry, so it never
-    # reaches the tenant_fields path at all — listed only for completeness.
+    # quotation has no create/update entry in the registry, so this row never
+    # feeds a create/update tenant_fields_reference — listed only for completeness.
     "quotation": {
         "large": set(),
         "internal_name": set(),
     },
 }
+
+
+def _lean_filter_field(f: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    The two things a search filter needs that the cheat-sheet text
+    (tenant_fields_reference) doesn't carry: the literal string
+    _build_search_json_rule expects in a rule's "field" key (dotted
+    "customFieldValues.<name>" for custom fields), and which operators are
+    valid for this field's type. Deliberately lean — no options/
+    uses_internal_name/required here, since the cheat-sheet text already
+    covers picklist options (or the omission stub) and required-ness.
+    """
+    name = f.get("name")
+    is_standard = f.get("standard", False)
+    return {
+        "name": name,
+        "displayName": f.get("displayName"),
+        "filter_field_path": name if is_standard else f"customFieldValues.{name}",
+        "allowed_operators": OPERATOR_MAPPING.get(f.get("type")) or OPERATOR_MAPPING.get("TEXT_FIELD", []),
+    }
 
 
 async def _fold_field_metadata_into_schema(
@@ -6649,55 +6725,51 @@ async def _fold_field_metadata_into_schema(
     COPY of base_schema — never mutates the registry's own dict. Bucket-
     agnostic on purpose: was hardcoded to lead only until "contact" was added;
     kept generic from here so a 3rd/4th bucket is just one more
-    _BUCKET_FIELD_FETCHERS entry, not a new copy of this function.
-    BOTH paths run the same _field_summary() over the same live metadata and so
-    get the same picklist treatment (real option id/name/label triples, or the
-    omission stub for an oversized one); they differ only in which fields they
-    cover and in two path-specific keys:
+    _BUCKET_FIELD_FETCHERS/_BUCKET_FIELD_INSTRUCTIONS_LOGIC entry, not a new
+    copy of this function.
 
-      for_search=False (create/update) -> tenant_fields.standard/custom, every
-        field, each carrying "required".
-      for_search=True (search) -> tenant_filterable_fields, filterable fields
-        only, each carrying "filter_field_path" (the literal string
-        _build_search_json_rule expects in a rule's "field" key) instead of
-        "required", which is not a filter concept.
-
-    The search path used to emit only name/displayName/type/standard and return
-    immediately. That left a caller with no way to learn a picklist's Option
-    IDs at all — _build_search_json_rule validates the field name and coerces
-    the rule type but never resolves a label to an id, and the registry has no
-    picklist-lookup endpoint — so any picklist filter had to be guessed.
+    The field LISTING itself (standard/custom fields, real picklist options
+    or the large-picklist omission stub, *REQUIRED*/[FILTERABLE] markers) is
+    no longer built here — it used to be a second, separate JSON rendering
+    (_field_summary) that duplicated, and had drifted from, the cheat-sheet
+    text the standalone get_<bucket>_field_instructions tool already builds
+    via _format_field/_format_meeting_field (e.g. an ENTITY_PICKLIST like
+    meeting's "status" got its options shown in the cheat sheet but not here,
+    because _field_summary only recognised PICK_LIST/MULTI_PICKLIST). Instead
+    this now calls that SAME builder (_BUCKET_FIELD_INSTRUCTIONS_LOGIC),
+    passing it the already-fetched fields_meta (so this remains exactly one
+    live fetch, same as before) and requested_picklists straight through, and
+    embeds the resulting text as "tenant_fields_reference". One formatting
+    path, used by both surfaces.
 
     requested_picklists: the caller's "which large picklists do I actually need"
     hint, straight from build_payload's own "fields" parameter. None or empty
-    means "none of them" — the large picklists are then omitted, which is the
-    common case and the whole point: an unremarkable lead.create drops from
-    ~95 KB to ~24 KB. Names are matched case-insensitively. Names that aren't
-    a large picklist on this bucket are ignored, not an error — every other
-    field is returned in full either way, so a wrong guess costs nothing.
-    This now applies to search too: build_payload("lead.search",
-    fields=["country"]) inlines that picklist's options for filtering, exactly
-    as it already did for create/update.
+    means "none of them" — the large picklists are then omitted from the
+    cheat-sheet text, which is the common case and the whole point: an
+    unremarkable lead.create's reference text stays small instead of dumping
+    ~435 timezone options. Names are matched case-insensitively (see
+    _format_field/_format_meeting_field). Names that aren't a large picklist
+    on this bucket are ignored, not an error — every other field is rendered
+    in full either way, so a wrong guess costs nothing. This applies to
+    search too: build_payload("lead.search", fields=["country"]) inlines that
+    picklist's options for filtering, exactly as it already did for
+    create/update.
+
+    for_search additionally adds "tenant_filterable_fields": a lean
+    name/displayName/filter_field_path/allowed_operators table (via
+    _lean_filter_field) for filterable fields only — the one piece of
+    machine-readable structure the cheat-sheet prose doesn't carry, and which
+    execute_request's filter-building depends on.
 
     bucket: the entity bucket ("lead", "company", ...), used to pick that
-    bucket's row in _BUCKET_PICKLIST_RULES. Passing None disables the slimming
-    entirely (unknown bucket -> empty "large" set -> everything inlined), which
-    is the right failure mode: an unrecognised bucket falls back to the old,
-    complete behaviour rather than silently hiding options. A bucket with no
-    row at all (quotation today) additionally gets no "uses_internal_name" on
-    its picklists, because nobody has verified that bucket's value-shape rules
-    and a defaulted "false" would be an unearned claim, not a safe default.
+    bucket's cheat-sheet builder from _BUCKET_FIELD_INSTRUCTIONS_LOGIC.
+    Passing None (or an unrecognised bucket) means no builder is found, so no
+    "tenant_fields_reference" is added — the safe failure mode, same as this
+    function already does elsewhere for an unrecognised bucket.
     """
     schema = json.loads(json.dumps(base_schema))  # cheap deep copy, no extra dependency
     fields_meta = await fetch_fields_fn()
 
-    # Unknown/None bucket falls back to empty sets => nothing is treated as
-    # large => every option is inlined, exactly as before this feature existed.
-    _bucket_rules = _BUCKET_PICKLIST_RULES.get(bucket or "", {})
-    large_fields = {n.lower() for n in _bucket_rules.get("large", set())}
-    internal_name_fields = {n.lower() for n in _bucket_rules.get("internal_name", set())}
-
-    rules_authored = bool(_bucket_rules)
     # Non-strings are skipped rather than raising: this list comes straight
     # from a model's tool call, and a malformed hint should degrade to "no
     # hint", never fail the whole build_payload.
@@ -6705,110 +6777,17 @@ async def _fold_field_metadata_into_schema(
         n.strip().lower() for n in (requested_picklists or []) if isinstance(n, str)
     }
 
-
-    def _field_summary(f: Dict[str, Any], for_search: bool) -> Dict[str, Any]:
-        name = f.get("name")
-        is_standard = f.get("standard", False)
-        summary = {
-            "name": name,
-            "displayName": f.get("displayName"),
-            "type": f.get("type"),
-            "standard": is_standard,
-        }
-        if for_search:
-            summary["filter_field_path"] = (
-                name if is_standard else f"customFieldValues.{name}"
-            )
-            summary["allowed_operators"] = (
-                OPERATOR_MAPPING.get(f.get("type"))
-                or OPERATOR_MAPPING.get("TEXT_FIELD", [])
-            )
-        else:
-            # "required" is a create/update constraint only. On a filterable
-            # field it reads as "you must filter on this", so it is omitted
-            # from the search summary entirely.
-            summary["required"] = f.get("required", False)
-        if f.get("type") in ("PICK_LIST", "MULTI_PICKLIST"):
-            picklist = f.get("picklist") or {}
-            values = picklist.get("values") or picklist.get("picklistValues") or []
-            # "name" (the internal name string, e.g. "ACCOUNTING") was missing here
-            # entirely — only "id" and "label" were ever surfaced. That's fine for
-            # most picklist fields (Option ID is the correct value), but for the
-            # documented exceptions (requirementCurrency, companyBusinessType,
-            # country, timezone, companyIndustry — see this bucket's usage_notes),
-            # the internal name is the ONLY value Kylas accepts, and it can differ
-            # from the label in both case and format (e.g. companyIndustry's
-            # "Accounting" label has internal name "ACCOUNTING"; companyBusinessType's
-            # "Analyst" label has internal name "analyst"). Without "name" here, a
-            # caller had no way to ever produce the correct value for those 5 fields —
-            # confirmed live, every value tried for companyIndustry/companyBusinessType
-            # failed because none of them could be the real internal name.
-            opts = [
-                {"id": v.get("id"), "name": v.get("name"), "label": v.get("displayName") or v.get("label") or v.get("name")}
-                for v in values if isinstance(v, dict)
-            ]
-            field_name = (name or "").strip().lower()
-            # On the SEARCH path this flag is correct by construction: it is
-            # read from the same per-bucket set _rule_type_for_value already
-            # uses to pick "string" vs "long" for the rule it builds, so a
-            # true here and the rule builder can never disagree. On the
-            # create/update path the equivalent claim is not yet verified for
-            # every bucket (meeting's YAML documents status/medium as
-            # internal-name for FILTERS but Option ID for CREATE), so that
-            # path still emits it only where it already did — below, on an
-            # omitted picklist, where the caller has no options to reason
-            # from and silence is the worse of the two errors.
-            if rules_authored:
-                summary["uses_internal_name"] = (
-                    "Use internal 'name' string for this picklist"
-                    if field_name in internal_name_fields
-                    else "Use numeric option 'id' for this picklist"
-                )
-            if field_name in large_fields and field_name not in requested_picklists_set:
-                # Oversized picklist the caller didn't ask for. Emit a stub
-                # instead of the array. The stub is deliberately self-
-                # describing — it names the exact re-call that recovers the
-                # options — so this stays usable even for a caller that never
-                # read the docstring, and so no separate lookup endpoint is
-                # needed to make the omission safe.
-                summary["options_count"] = len(opts)
-                summary["options_omitted"] = (
-                    f"{len(opts)} options — omitted to keep this response small. "
-                    f"If you need to {'filter on' if for_search else 'set'} this field, "
-                    f"re-call build_payload(id, fields=[\"{name}\"]) to get them. "
-                    f"Do NOT guess an option id or name."
-                )
-            else:
-                summary["options"] = opts
-        return summary
+    instructions_fn = _BUCKET_FIELD_INSTRUCTIONS_LOGIC.get(bucket or "")
+    if instructions_fn:
+        schema["tenant_fields_reference"] = await instructions_fn(
+            fields_meta=fields_meta, requested_picklists=requested_picklists_set,
+        )
 
     if for_search:
-        # Filterable fields now get the SAME treatment as create/update
-        # fields: real picklist options (or the omission stub), the value-shape
-        # flag, and the literal rule field path. Before this, the search path
-        # emitted name/displayName/type/standard and nothing else, which left
-        # a caller no way at all to learn a picklist's Option IDs —
-        # _build_search_json_rule validates the field and coerces the rule
-        # type but never resolves a label to an id, and no picklist lookup
-        # endpoint exists in the registry. So a picklist filter could only
-        # ever be guessed.
         schema["tenant_filterable_fields"] = [
-            _field_summary(f, for_search=True)
-            for f in fields_meta
-            if f.get("filterable", False)
+            _lean_filter_field(f) for f in fields_meta if f.get("filterable", False)
         ]
         return schema
-
-    schema["tenant_fields"] = {
-        "standard": [
-            _field_summary(f, for_search=False)
-            for f in fields_meta if f.get("standard", False)
-        ],
-        "custom": [
-            _field_summary(f, for_search=False)
-            for f in fields_meta if not f.get("standard", False)
-        ],
-    }
 
     # Override the static YAML's "required" guess with the REAL required-field
     # list from this tenant's live metadata (same `required` flag the original
@@ -6858,28 +6837,32 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
                        only be known by asking Kylas directly (never static).
       fetched_live   - true only if that tenant-specific data was actually
                        fetched successfully on this call.
-      tenant_fields / tenant_filterable_fields - present only when
-                       dynamic_fields and fetched_live are both true: this
-                       tenant's REAL fields, with real picklist option
-                       id/name/label triples — tenant_fields (every field) for
-                       create/update, tenant_filterable_fields (filterable
-                       fields only) for search. Never placeholder data.
-                       A few oversized picklists (see "fields" below) come back
-                       with "options_count"/"options_omitted" instead of an
-                       "options" array — that is a deliberate size saving, not
-                       a fetch failure, and "options_omitted" tells you exactly
-                       how to get the real options when you need them.
-                       Per-field keys worth knowing:
-                         uses_internal_name - on a picklist: explicit self-describing
-                           instruction string stating whether to send the option's
-                           internal "name" string or numeric "id". Absent means this
-                           entity's rule has not been verified — read usage_notes instead.
-                         filter_field_path - search only: the exact string to
-                           put in a filter's "field" key. Copy it verbatim;
-                           custom fields use a dotted path here.
-                         allowed_operators - search only: the ONLY operators
-                           valid for that field's type (e.g. a DATE field
-                           cannot take "contains", and a CHECKBOX takes only
+      tenant_fields_reference - present only when dynamic_fields and
+                       fetched_live are both true: this tenant's REAL fields as
+                       a readable cheat sheet — the EXACT same text
+                       get_<bucket>_field_instructions returns (standard/custom
+                       fields, "*REQUIRED*"/"[FILTERABLE]" markers, real
+                       picklist option id/name/label per field), one shared
+                       formatter for both surfaces. Never placeholder data.
+                       A few oversized picklists (see "fields" below) get a
+                       one-line omission stub instead of their full option
+                       list — that is a deliberate size saving, not a fetch
+                       failure, and the stub tells you exactly how to get the
+                       real options when you need them (re-call build_payload
+                       naming that field in "fields").
+      tenant_filterable_fields - search ids only, present under the same
+                       condition as tenant_fields_reference: a lean
+                       name/displayName/filter_field_path/allowed_operators
+                       table for filterable fields — the two things the
+                       cheat-sheet text above doesn't carry, so filter-building
+                       stays machine-checkable:
+                         filter_field_path - the exact string to put in a
+                           filter's "field" key. Copy it verbatim; custom
+                           fields use a dotted "customFieldValues.<name>" path
+                           here.
+                         allowed_operators - the ONLY operators valid for that
+                           field's type (e.g. a DATE field cannot take
+                           "contains", and a CHECKBOX takes only
                            equal/not_equal). Build every filter's "operator"
                            from the list on THAT field — never guessed, and
                            never copied from a field of a different type.
@@ -6887,8 +6870,10 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
                            sent. Symbols (">", ">=", "!=", "==") are accepted
                            as shorthand and normalized, but the names in this
                            list always work.
-                         required - create/update only. Filters are never
-                           required, so it is absent from search fields.
+                       For picklist option values (id/name/label) and whether
+                       a filterable picklist uses an internal name or a
+                       numeric id, read tenant_fields_reference instead — this
+                       table stays lean on purpose.
       live_fetch_error - present only when dynamic_fields is true and the live
                        fetch failed (e.g. no credentials configured yet). When
                        this is present, everything else above — method, path,
@@ -6912,16 +6897,17 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
 
       A handful of picklists on this tenant are enormous (timezone alone is
       435 options / ~37 KB, which is 39% of a lead.create response). Their
-      "options" arrays are OMITTED by default and replaced with
-      "options_count" + "options_omitted" + "uses_internal_name". Every other
-      picklist — source, salutation, campaign, companyEmployees, all custom
-      picklists, and so on — is 9 options or fewer and is ALWAYS inlined in
-      full. So the only reason to pass this parameter is when the user has
-      actually mentioned one of the big ones.
+      option lists are OMITTED by default from "tenant_fields_reference" and
+      replaced with a one-line "N options omitted..." stub naming the exact
+      re-call that recovers them. Every other picklist — source, salutation,
+      campaign, companyEmployees, all custom picklists, and so on — is 9
+      options or fewer and is ALWAYS inlined in full. So the only reason to
+      pass this parameter is when the user has actually mentioned one of the
+      big ones.
 
       The large picklists, with both spellings each concept goes by (entities
       disagree on the name — a lead has "companyIndustry", a company has
-      "industry" — so pass whichever name you see in tenant_fields):
+      "industry" — so pass whichever name you see in tenant_fields_reference):
 
         timezone              - the user's/record's time zone (~435 options)
         country               / companyCountry        (~247 options)
@@ -6947,10 +6933,10 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
       Omit it whenever the user's request doesn't touch one of the fields
       above — that's the normal case and it is the cheap one.
 
-      You are never stuck: if a response shows "options_omitted" for a field
-      you turn out to need, just call build_payload again naming that field.
-      Re-calling is idempotent. NEVER guess a picklist option id or internal
-      name to avoid the second call.
+      You are never stuck: if tenant_fields_reference shows an "options
+      omitted" stub for a field you turn out to need, just call build_payload
+      again naming that field. Re-calling is idempotent. NEVER guess a
+      picklist option id or internal name to avoid the second call.
     """
     entry = _REGISTRY.get(id)
     if not entry:
