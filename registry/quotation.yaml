@@ -89,6 +89,15 @@
     (default 20). sort: only sortable fields are accepted — if unsure, omit
     sort entirely and the server defaults to updatedAt,desc.
 
+    Date/datetime fields (filter/search — e.g. updatedAt, createdAt): keep the
+    value in the user's timezone; pass timeZone in the filter (or omit —
+    server uses it). Do NOT convert filter values to UTC, and do NOT resolve
+    datetime.parse_to_utc for them. The server converts filter values itself
+    from the timeZone you pass; converting first shifts the window twice and
+    the search then silently misses the very records you are looking for.
+    (Quotations are read-only here, so there is no create/update payload that
+    would ever need datetime.parse_to_utc.)
+
     Only [FILTERABLE] fields (from the live tenant_filterable_fields below)
     are allowed. Common filters: quotationNumber, summary, status,
     grandTotal, associatedDeal, updatedAt. The id field (type ID) does NOT

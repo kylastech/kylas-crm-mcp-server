@@ -94,6 +94,14 @@
     the FULL participant object from meeting.lookup_related;
     timeZone (str, optional) — for date/datetime filters.
 
+    Date/datetime fields (filter/search — e.g. from, to, createdAt): keep the
+    value in the user's timezone; pass timeZone in the filter (or omit —
+    server uses it). Do NOT convert filter values to UTC, and do NOT resolve
+    datetime.parse_to_utc for them — that tool is for meeting.create/
+    meeting.update payloads ONLY. The server converts filter values itself
+    from the timeZone you pass; converting first shifts the window twice and
+    the search then silently misses the very records you are looking for.
+
     Unlike lead/contact/task/deal/company, filters are OPTIONAL for meeting —
     an empty filter list returns all meetings, it does not error.
 

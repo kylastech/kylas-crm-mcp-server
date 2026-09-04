@@ -15,8 +15,11 @@ STANDALONE TOOLS (2 — deliberately outside the registry flow):
   may have renamed CRM entities; every other tool only takes the standard
   type, never the tenant's custom display name). Fetched live, per call,
   never cached server-side — see _fetch_entity_labels's docstring.
-- get_current_user() — the calling user's profile/timezone; call before
-  any date/datetime conversion.
+- get_current_user() — MANDATORY, call first, every session, alongside
+  get_entity_labels(). Returns the calling user's IANA timezone and id.
+  Every timestamp Kylas returns is UTC; the timezone from this call is what
+  turns it into something the user actually recognises. Call it ONCE per
+  session and reuse the result — it is not cached server-side.
 
 THE GENERIC REGISTRY FLOW (3 tools):
 - list_tool(bucket?, intent?) — find the id of the operation you need.
@@ -204,6 +207,26 @@ def _convert_date_value_to_utc(value: Any, timezone_str: str) -> Any:
     Convert date/datetime filter value(s) from user's local timezone to UTC.
     Handles single ISO string, list of ISO strings (for between operator), or None.
     Strips trailing 'Z' before parsing so the value is treated as local time.
+
+    Parsing uses dateutil, the same parser datetime.parse_to_utc already uses,
+    rather than the two hardcoded strptime formats this used to accept. Those
+    two covered "2026-09-03T19:30:00.000" and "2026-09-03T19:30:00" and NOTHING
+    else — a space instead of the "T", or omitted seconds, fell through to a
+    bare `return v` and shipped the caller's local time to Kylas unconverted,
+    silently and with no log line. The filter then searched a window offset by
+    the timezone and quietly returned the wrong records:
+        '2026-09-03 19:30:00'       -> passed through unconverted
+        '3 September 2026 7:30 PM'  -> passed through unconverted
+        '2026-09-03T19:30'          -> passed through unconverted
+    All three convert correctly now.
+
+    Timezone handling is unchanged for the normal case and stricter for one
+    edge case: a naive value (including one with a trailing 'Z', which callers
+    routinely add to a local time they were told to send as local) is still
+    interpreted in `timezone_str`. But a value carrying a REAL utc offset, e.g.
+    "2026-09-03T19:30:00+05:30", is now honoured as written instead of having
+    its offset overwritten by timezone_str — previously such a value failed
+    both strptime formats and was passed through untouched.
     """
     if value is None:
         return value
@@ -211,30 +234,94 @@ def _convert_date_value_to_utc(value: Any, timezone_str: str) -> Any:
     try:
         tz = ZoneInfo(timezone_str)
     except Exception:
+        # Never silently pretend the caller meant UTC — that returns a wrong
+        # timestamp with no error anywhere. See the tzdata note in requirements.txt.
+        logger.error(
+            "Filter timezone %r could not be resolved — falling back to UTC. Date filter "
+            "values will NOT be shifted and the search window will be wrong by that "
+            "zone's offset. Ensure the 'tzdata' package is installed in the runtime.",
+            timezone_str,
+        )
         tz = ZoneInfo("UTC")
     utc = ZoneInfo("UTC")
 
-    def _convert_single(v: str) -> str:
-        if not isinstance(v, str):
+    def _convert_single(v: Any) -> Any:
+        if not isinstance(v, str) or not v.strip():
             return v
-        # Strip trailing Z so we treat it as naive local time
-        clean = v.rstrip("Z").rstrip("z")
+        # Strip trailing Z so a local time sent with a "Z" is still read as local.
+        clean = v.strip().rstrip("Zz")
         try:
-            # Try parsing with milliseconds first
-            try:
-                dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S.%f")
-            except ValueError:
-                dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S")
-            # Attach the user's timezone, then convert to UTC
-            local_dt = dt.replace(tzinfo=tz)
-            utc_dt = local_dt.astimezone(utc)
-            return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc_dt.microsecond // 1000:03d}Z"
-        except Exception:
-            return v  # Return as-is if parsing fails
+            dt = dateutil_parser.parse(clean)
+        except (ValueError, OverflowError, TypeError):
+            logger.warning(
+                "Could not parse date filter value %r; sending it to Kylas unconverted. "
+                "The search window may be wrong by the timezone offset.", v,
+            )
+            return v
+        # An explicit offset in the value wins; a naive value means local time.
+        local_dt = dt if dt.tzinfo is not None else dt.replace(tzinfo=tz)
+        utc_dt = local_dt.astimezone(utc)
+        return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc_dt.microsecond // 1000:03d}Z"
 
     if isinstance(value, list):
         return [_convert_single(v) for v in value]
     return _convert_single(value)
+
+
+def _epoch_to_iso_utc(value: Any) -> Any:
+    """
+    Convert a Kylas epoch timestamp to a UTC ISO string. Anything else is
+    returned EXACTLY as received.
+
+    Kylas is not consistent about this: the same field on the same record comes
+    back as epoch milliseconds from one endpoint and as an ISO string from
+    another (verified on task 11613888 — POST /tasks/search returned
+    1789070400000, GET /tasks/{id} returned "2026-09-10T20:00:00.000+0000" for
+    the same dueDate, same instant). A bare integer reaching the LLM is not a
+    timestamp it can read, so it guesses — that is how a task due 7:00 PM was
+    reported as 6:40 PM. This converts the epoch case only; ISO strings, None,
+    and everything else pass through untouched, by design.
+
+    Epoch is detected by TYPE first, then magnitude — never by field name:
+      - milliseconds: 1e11 .. 4.1e12   (~1973 .. ~2100)
+      - seconds:      1e9  .. 4.1e9    (~2001 .. ~2100)
+    The two ranges cannot overlap: epoch seconds do not reach 1e11 until the
+    year 5138, so a seconds value can never be misread as milliseconds.
+    Anything outside both ranges is left alone rather than guessed at.
+    """
+    # bool is a subclass of int — exclude it before any numeric check.
+    if isinstance(value, bool) or value is None:
+        return value
+
+    number = value
+    if isinstance(value, str):
+        stripped = value.strip()
+        # Only a plain integer literal counts; "2026-09-10T..." must not match.
+        if not (stripped.lstrip("-").isdigit() and stripped.lstrip("-")):
+            return value
+        try:
+            number = int(stripped)
+        except ValueError:
+            return value
+    elif not isinstance(value, (int, float)):
+        return value
+
+    magnitude = abs(number)
+    if 1e11 <= magnitude <= 4.1e12:
+        seconds = number / 1000.0
+    elif 1e9 <= magnitude <= 4.1e9:
+        seconds = float(number)
+    else:
+        # A number, but not in any plausible epoch range — leave it exactly as
+        # it came rather than inventing a date from it.
+        return value
+
+    try:
+        dt = datetime.fromtimestamp(seconds, tz=ZoneInfo("UTC"))
+    except (OverflowError, OSError, ValueError):
+        logger.warning("Could not convert epoch %r to a UTC datetime; passing through unchanged.", value)
+        return value
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) -> str:
@@ -311,19 +398,25 @@ operation (lead, contact, deal, task, company, meeting, call_log, quotation,
 plus shared user/product/pipeline/datetime lookups) is reached through
 exactly 3 generic tools, plus exactly 2 standalone tools that don't fit the
 id-based flow: get_current_user and get_entity_labels (see MANDATORY FIRST
-CALL, immediately below — read that before anything else in this document).
+CALLS, immediately below — read that before anything else in this document).
 There is no per-entity instructions block loaded up front — everything you
 need to use any operation correctly is either below (rules that apply
 across every operation) or returned by the tools themselves, on demand,
 scoped to the one operation you're actually performing.
 
-## MANDATORY FIRST CALL — get_entity_labels()
+## MANDATORY FIRST CALLS — get_entity_labels() and get_current_user()
 
-Call get_entity_labels() FIRST, before any other tool, at the start of
-EVERY session — before list_tool, before answering the user's actual
-request, before anything else. This is not optional and not a one-time
-setup step to skip on a hunch that "this tenant probably hasn't renamed
-anything."
+Call BOTH of these FIRST, before any other tool, at the start of EVERY
+session — before list_tool, before answering the user's actual request,
+before anything else. Neither is optional, and neither is a setup step to
+skip on a hunch that "this tenant probably hasn't renamed anything" or
+"this question probably isn't about dates."
+
+Call each ONCE per session and reuse the result for the rest of that
+session. Do NOT re-call either one before individual operations later on —
+the answers do not change mid-session. Call again only if the original
+result is no longer visible to you (e.g. a long conversation where it has
+dropped out of context).
 
 Why: this tenant may have renamed standard CRM entities to its own display
 names (e.g. "Lid" instead of "Lead", "Deeeel" instead of "Deal"). Every
@@ -333,6 +426,15 @@ STANDARD type (lead/contact/deal/task/company/meeting/call_log/quotation)
 from this tenant's custom names to those standard types. Without calling it
 first, a user asking for their "Lids" reads as a request for an entity type
 that doesn't exist, when it's actually just "lead" under a different name.
+
+Why get_current_user(): every timestamp Kylas returns is UTC (e.g.
+"2026-09-10T20:00:00.000Z"), but the user thinks, asks and reads in their
+own timezone. You need their IANA timezone BEFORE you show them any date,
+not after. Without it you will either dump a raw UTC timestamp the user has
+to decode, or guess the offset and be wrong — a task genuinely due 7:00 PM
+gets reported as 1:30 AM the next day, and nothing about the response looks
+wrong. The same timezone is also what you pass as timeZone in date filters,
+and what datetime.parse_to_utc needs for create/update payloads.
 
 ## The 3-step flow
 
@@ -405,9 +507,12 @@ task.search_any_relation, call_log.by_entity, datetime.parse_to_utc above):
 - get_entity_labels() — MANDATORY, call this first, every session, before
   anything else. See the MANDATORY FIRST CALL section at the top of this
   document — not repeated here.
-- get_current_user() — current user's profile/timezone; call before any
-  date/datetime conversion (before resolving datetime.parse_to_utc). No
-  bucket concept applies — it's about the calling user, not a CRM entity.
+- get_current_user() — MANDATORY, call this first, every session, before
+  anything else, alongside get_entity_labels(). See the MANDATORY FIRST
+  CALLS section at the top of this document — not repeated here. Reuse its
+  timezone for the whole session (date filters, datetime.parse_to_utc, and
+  every date you display); do not re-call it per operation. No bucket
+  concept applies — it's about the calling user, not a CRM entity.
 
 Two operations that used to be standalone tools are now registry ids —
 resolve them the same way as any other id (list_tool -> build_payload ->
@@ -464,8 +569,26 @@ it empty. Never call *.search_by_term with "*" or a blank term — it returns
 nothing; use *.search with a date filter for "all"/"list" queries instead.
 Tell the user: "Showing records updated in the last 3 months. Specify a
 date range for older records." If the user gives their own date range, use
-that instead. Call get_current_user first if the user's timezone is
-unknown.
+that instead. Use the timezone from the session-start get_current_user()
+call — do not call it again here.
+
+## SHOWING DATES TO THE USER — applies to every date you ever display
+Every timestamp in a tool response is UTC. Some arrive as
+"2026-09-10T20:00:00.000Z", some as "2026-09-10T20:00:00.000+0000" — both
+are UTC, treat them identically.
+
+NEVER show the user a raw UTC timestamp, and never show a bare number.
+Convert to the user's timezone (from the session-start get_current_user()
+call) and write it the way a person reads it:
+
+  "2026-09-10T20:00:00.000Z"  ->  "11 Sep 2026, 1:30 AM (Asia/Kolkata)"
+
+This applies to EVERY date field you present: dueDate, createdAt,
+updatedAt, closingDate, completedAt, meeting from/to, call log startTime,
+quotation validTill, and any custom date field. It also applies when you
+reason about a date out loud ("this task is overdue", "due in 3 days") —
+compare in the user's timezone, not in UTC, or you will be off by the
+offset and state it with confidence.
 
 ## REPORT FORMATTING — apply whenever presenting 3+ records or a summary
 Structure every report like this:
@@ -547,7 +670,7 @@ OPERATOR_SYMBOL_MAP = {
 }
 
 # Picklist fields that use internal name (string) in search; all others use Option ID (long)
-PICKLIST_FIELDS_USE_INTERNAL_NAME = {"requirementCurrency", "companyBusinessType", "country", "timezone", "companyIndustry"}
+PICKLIST_FIELDS_USE_INTERNAL_NAME = {"requirementCurrency", "companyBusinessType", "country", "timezone", "companyIndustry","companyCountry"}
 
 # ---------------------------------------------------------------------------
 # API call throttle: 100–500 ms random delay between subsequent calls per tool
@@ -1069,11 +1192,17 @@ async def _fetch_current_user() -> Dict[str, Any]:
 async def get_current_user() -> str:
     """
     Get the current authenticated user's profile from Kylas (GET /users/me).
-    Call this whenever a date or datetime-related query is involved, or whenever
-    you need the current user's own ID (e.g. to set ownerId/createdBy to "me").
-    Returns id, timezone (IANA, e.g. Asia/Calcutta), recordActions (call, email, sms, etc.), name, and other profile fields.
-    - For filtering (search_leads, search_idle_leads): use the returned timezone as the timeZone in date/datetime filters; keep the user's date/datetime as-is (do not convert to UTC).
-    - For create_lead: when the user provides a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone, convert to UTC using parse_datetime_to_utc_iso, and send the UTC ISO string in field_values.
+
+    MANDATORY: call this ONCE at the start of every session, before any other
+    tool, alongside get_entity_labels(). Then REUSE the result for the rest of
+    the session — do not call it again before individual date operations; the
+    answer does not change mid-session. Call again only if that first result is
+    no longer visible to you.
+
+    Returns id, timezone (IANA, e.g. Asia/Kolkata), recordActions (call, email, sms, etc.), name, and other profile fields.
+    - Displaying ANY date: every timestamp from every tool is UTC. Convert it to this timezone before showing it, and say which zone (e.g. "11 Sep 2026, 1:30 AM (Asia/Kolkata)"). Never show the user a raw UTC timestamp or a bare epoch number.
+    - For filtering (*.search, *.search_idle): pass this timezone as timeZone in date/datetime filters and keep the user's date/datetime as-is — do NOT convert filter values to UTC, the server does that itself.
+    - For create/update (*.create, *.update): when the user gives a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone and convert it to UTC by resolving datetime.parse_to_utc (list_tool -> build_payload -> execute_request) with {local_datetime, timezone}, then put the returned UTC ISO string in the payload.
     - For ownerId/createdBy referring to the current user (e.g. "assign to me", "create a lead owned by me"): use the returned id directly — do NOT call user.lookup/lookup_users to resolve yourself by name.
     """
     try:
@@ -1892,8 +2021,8 @@ def _format_lead_for_display(lead: Dict[str, Any]) -> str:
         lines.append(f"Pipeline: {pipeline}")
     lines.append(f"Pipeline Stage Reason: {lead.get('pipelineStageReason') or '—'}")
     lines.append(f"Owner ID: {lead.get('ownerId', '—')}")
-    lines.append(f"Created At: {lead.get('createdAt', '—')}")
-    lines.append(f"Updated At: {lead.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(lead.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(lead.get('updatedAt', '—'))}")
     # Custom fields
     custom = lead.get("customFieldValues") or {}
     if custom:
@@ -2205,8 +2334,8 @@ def _format_contact_for_display(contact: Dict[str, Any]) -> str:
     else:
         lines.append("Phone: —")
     lines.append(f"Owner ID: {contact.get('ownerId', '—')}")
-    lines.append(f"Created At: {contact.get('createdAt', '—')}")
-    lines.append(f"Updated At: {contact.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(contact.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(contact.get('updatedAt', '—'))}")
     ad = contact.get("associatedDeals") or []
     if ad:
         lines.append(f"Associated deal IDs: {ad}")
@@ -2480,11 +2609,11 @@ def _format_task_for_display(task: Dict[str, Any]) -> str:
     lines.append(f"Description: {task.get('description') or '—'}")
     lines.append(f"Status: {task.get('status') or '—'}")
     lines.append(f"Priority: {task.get('priority') or '—'}")
-    lines.append(f"Due Date: {task.get('dueDate') or '—'}")
+    lines.append(f"Due Date: {_epoch_to_iso_utc(task.get('dueDate')) or '—'}")
     lines.append(f"Assigned To: {task.get('assignedTo') or '—'}")
     lines.append(f"Reminder: {task.get('reminder') or '—'}")
-    lines.append(f"Created At: {task.get('createdAt', '—')}")
-    lines.append(f"Updated At: {task.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(task.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(task.get('updatedAt', '—'))}")
     # Custom fields
     custom = task.get("customFieldValues") or {}
     if custom:
@@ -2599,7 +2728,7 @@ async def search_tasks_logic(
         name = task.get("name", "—")
         status = task.get("status", "—")
         priority = task.get("priority", "—")
-        due_date = task.get("dueDate", "—")
+        due_date = _epoch_to_iso_utc(task.get("dueDate", "—"))
         lines.append(f"• ID: {tid} | Name: {name} | Status: {status} | Priority: {priority} | Due: {due_date}")
     lines.append("-" * 60)
     return "\n".join(lines)
@@ -2806,7 +2935,7 @@ async def _search_tasks_with_any_relation_logic(
         name = task.get("name", "—")
         status = task.get("status", "—")
         priority = task.get("priority", "—")
-        due = task.get("dueDate", "—")
+        due = _epoch_to_iso_utc(task.get("dueDate", "—"))
         relation = task.get("relation") or []
         rel_parts = []
         for r in relation:
@@ -3287,7 +3416,7 @@ def _format_deal_for_display(deal: Dict[str, Any]) -> str:
     lines.append(f"Name: {deal.get('name', '—')}")
     lines.append(f"Value: {deal.get('value', '—')}")
     lines.append(f"Currency: {deal.get('currency', '—')}")
-    lines.append(f"Closing Date: {deal.get('closingDate', '—')}")
+    lines.append(f"Closing Date: {_epoch_to_iso_utc(deal.get('closingDate', '—'))}")
     # Emails
     emails = deal.get("emails") or []
     if emails:
@@ -3320,8 +3449,8 @@ def _format_deal_for_display(deal: Dict[str, Any]) -> str:
     else:
         lines.append(f"Pipeline: {pipeline}")
     lines.append(f"Owner ID: {deal.get('ownerId', '—')}")
-    lines.append(f"Created At: {deal.get('createdAt', '—')}")
-    lines.append(f"Updated At: {deal.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(deal.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(deal.get('updatedAt', '—'))}")
     # Products
     products = deal.get("products") or []
     lines.append("")
@@ -3849,8 +3978,8 @@ def _format_company_for_display(company: Dict[str, Any]) -> str:
     else:
         lines.append("Phone: —")
     lines.append(f"Owner ID: {company.get('ownerId', '—')}")
-    lines.append(f"Created At: {company.get('createdAt', '—')}")
-    lines.append(f"Updated At: {company.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(company.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(company.get('updatedAt', '—'))}")
     # Custom fields
     custom = company.get("customFieldValues") or {}
     if custom:
@@ -4379,8 +4508,8 @@ def _format_meeting_for_display(meeting: Dict[str, Any]) -> str:
     lines.append(f"ID: {meeting.get('id', '—')}")
     lines.append(f"Title: {meeting.get('title', '—')}")
     lines.append(f"Status: {meeting.get('status', '—')}")
-    lines.append(f"From: {meeting.get('from', '—')}")
-    lines.append(f"To: {meeting.get('to', '—')}")
+    lines.append(f"From: {_epoch_to_iso_utc(meeting.get('from', '—'))}")
+    lines.append(f"To: {_epoch_to_iso_utc(meeting.get('to', '—'))}")
     lines.append(f"All Day: {meeting.get('allDay', False)}")
     lines.append(f"Location: {meeting.get('location', '—')}")
     lines.append(f"Description: {meeting.get('description', '—')}")
@@ -4425,8 +4554,8 @@ def _format_meeting_for_display(meeting: Dict[str, Any]) -> str:
                 lines.append(f"  • {rname} ({rentity}, ID: {rid})")
     # Metadata
     lines.append(f"Created By: {(meeting.get('createdBy') or {}).get('name', '—')}")
-    lines.append(f"Created At: {meeting.get('createdAt', '—')}")
-    lines.append(f"Updated At: {meeting.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(meeting.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(meeting.get('updatedAt', '—'))}")
     # Custom fields
     custom = meeting.get("customFieldValues") or {}
     if custom:
@@ -4543,8 +4672,8 @@ def _format_meeting_summary_line(m: Dict[str, Any]) -> str:
     mid = m.get("id", "?")
     title = m.get("title", "—")
     status = m.get("status", "—")
-    from_dt = m.get("from", "—")
-    to_dt = m.get("to", "—")
+    from_dt = _epoch_to_iso_utc(m.get("from", "—"))
+    to_dt = _epoch_to_iso_utc(m.get("to", "—"))
     location = m.get("location") or "—"
     
     # Extract owner
@@ -4831,7 +4960,7 @@ def _format_call_log_for_display(log: Dict[str, Any]) -> str:
     lines.append(f"Call Type: {log.get('callType', '—')}")
     lines.append(f"Outcome: {log.get('outcome', '—')}")
     lines.append(f"Phone Number: {log.get('phoneNumber', '—')}")
-    lines.append(f"Start Time: {log.get('startTime', '—')}")
+    lines.append(f"Start Time: {_epoch_to_iso_utc(log.get('startTime', '—'))}")
     lines.append(f"Duration: {log.get('duration', '—')} seconds")
     # Related To
     related = log.get("relatedTo") or {}
@@ -4869,8 +4998,8 @@ def _format_call_log_for_display(log: Dict[str, Any]) -> str:
     owner = log.get("owner") or {}
     if isinstance(owner, dict):
         lines.append(f"Logged By: {owner.get('name', '—')} (ID: {owner.get('id', '—')})")
-    lines.append(f"Created At: {log.get('createdAt', '—')}")
-    lines.append(f"Updated At: {log.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(log.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(log.get('updatedAt', '—'))}")
     lines.append("=" * 60)
     return "\n".join(lines)
 
@@ -5038,7 +5167,7 @@ def _extract_call_log_data(log: Dict[str, Any]) -> dict:
     call_type = log.get("callType", "—")
     outcome = log.get("outcome", "—")
     phone = log.get("phoneNumber", "—")
-    start = log.get("startTime", "—")
+    start = _epoch_to_iso_utc(log.get("startTime", "—"))
     duration = log.get("duration", "—")
 
     # Extract sentiment: overallSentiment + customerEmotion (first one)
@@ -5330,7 +5459,7 @@ async def search_tasks_by_term_logic(
         name = task.get("name", "—")
         status = task.get("status", "—")
         priority = task.get("priority", "—")
-        due_date = task.get("dueDate", "—")
+        due_date = _epoch_to_iso_utc(task.get("dueDate", "—"))
         lines.append(f"• ID: {tid} | Name: {name} | Status: {status} | Priority: {priority} | Due: {due_date}")
     lines.append("-" * 60)
     return "\n".join(lines)
@@ -5496,15 +5625,15 @@ def _format_quotation_for_display(q: Dict[str, Any]) -> str:
 
     lines.append(f"Sub Total: {_money(q.get('subTotal'))}")
     lines.append(f"Grand Total: {_money(q.get('grandTotal'))}")
-    lines.append(f"Valid Till: {q.get('validTill', '—')}")
+    lines.append(f"Valid Till: {_epoch_to_iso_utc(q.get('validTill', '—'))}")
     lines.append(f"Owner: {_name_of(q.get('owner'))}")
     lines.append(f"Associated Deal: {_name_of(q.get('associatedDeal'))}")
     lines.append(f"Associated Company: {_name_of(q.get('associatedCompany'))}")
     contacts = q.get("associatedContacts") or []
     if contacts:
         lines.append("Associated Contacts: " + ", ".join(_name_of(c) for c in contacts))
-    lines.append(f"Created At: {q.get('createdAt', '—')}")
-    lines.append(f"Updated At: {q.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(q.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(q.get('updatedAt', '—'))}")
     # Products
     products = q.get("products") or []
     lines.append("")
@@ -6606,8 +6735,12 @@ async def _fold_field_metadata_into_schema(
             # path still emits it only where it already did — below, on an
             # omitted picklist, where the caller has no options to reason
             # from and silence is the worse of the two errors.
-            if for_search and rules_authored:
-                summary["uses_internal_name"] = field_name in internal_name_fields
+            if rules_authored:
+                summary["uses_internal_name"] = (
+                    "Use internal 'name' string for this picklist"
+                    if field_name in internal_name_fields
+                    else "Use numeric option 'id' for this picklist"
+                )
             if field_name in large_fields and field_name not in requested_picklists_set:
                 # Oversized picklist the caller didn't ask for. Emit a stub
                 # instead of the array. The stub is deliberately self-
@@ -6622,12 +6755,6 @@ async def _fold_field_metadata_into_schema(
                     f"re-call build_payload(id, fields=[\"{name}\"]) to get them. "
                     f"Do NOT guess an option id or name."
                 )
-                # Without the inline options the caller can no longer see
-                # whether this field wants "IN" or 175 — so say it outright.
-                # Read per-bucket: the same field name disagrees across
-                # entities (lead's timezone is a name, meeting's is an id).
-                if rules_authored and not for_search:
-                    summary["uses_internal_name"] = field_name in internal_name_fields
             else:
                 summary["options"] = opts
         return summary
@@ -6720,11 +6847,10 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
                        a fetch failure, and "options_omitted" tells you exactly
                        how to get the real options when you need them.
                        Per-field keys worth knowing:
-                         uses_internal_name - on a picklist: true means send
-                           the option's "name" string, false means send its
-                           numeric "id". Absent means this entity's rule has
-                           not been verified — read usage_notes instead of
-                           assuming either shape.
+                         uses_internal_name - on a picklist: explicit self-describing
+                           instruction string stating whether to send the option's
+                           internal "name" string or numeric "id". Absent means this
+                           entity's rule has not been verified — read usage_notes instead.
                          filter_field_path - search only: the exact string to
                            put in a filter's "field" key. Copy it verbatim;
                            custom fields use a dotted path here.

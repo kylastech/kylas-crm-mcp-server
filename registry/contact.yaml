@@ -97,7 +97,11 @@
 
     Date/datetime fields (filter/search): keep the value in the user's
     timezone; pass timeZone in the filter (or omit — server uses it). Do NOT
-    convert filter values to UTC.
+    convert filter values to UTC, and do NOT resolve datetime.parse_to_utc
+    for them — that tool is for create/update payloads ONLY. The server
+    converts filter values itself from the timeZone you pass; converting
+    first shifts the window twice and the search then silently misses the
+    very records you are looking for.
 
     Never guess IDs — always resolve first: Users (createdBy, updatedBy,
     owner, ownerId, assignedTo, etc.) — resolve user.lookup (list_tool ->
