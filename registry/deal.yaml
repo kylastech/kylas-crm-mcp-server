@@ -182,6 +182,11 @@
     target stage directly, the sequential advancement is handled
     transparently; you do not need to do anything differently.
 
+    On create, pipeline must carry the target stage nested inside it:
+    {"id": <pipelineId>, "stage": {"id": <stageId>, "name": "<stageName>"}}.
+    Do NOT send a separate top-level pipelineStage key alongside pipeline on
+    create — that shorthand is deal.update-only.
+
     Products: ask the user for product name (resolve via product.lookup —
     list_tool -> build_payload -> execute_request; not a standalone tool),
     quantity, price per unit, currency, and optional discount before
@@ -190,9 +195,23 @@
     <qty>, "price": {"currencyId": <id>, "value": <price>}, "discount":
     {"value": <disc>, "type": "PERCENTAGE|FLAT"}}]}.
 
-    Picklist fields: use Option ID (number) from the live tenant_fields
-    below, except currency, country, dealSource → use internal name
-    (string).
+    On create, every line item MUST include a discount object even when there
+    is no discount — send {"value": 0, "type": "PERCENTAGE"} rather than
+    omitting the key.
+
+    When products are present the API RECOMPUTES estimatedValue and
+    actualValue from the line items and discards whatever you sent for them:
+    estimatedValue becomes sum(quantity x price), actualValue that sum after
+    discount. Do not report a user-supplied deal value as saved in that case
+    — read the created record back and report the computed values. With no
+    products, both are stored as sent, and actualValue defaults to
+    estimatedValue when omitted.
+
+    Picklist fields: send the whole option OBJECT — copy id and name from the
+    same option line in tenant_fields_reference below. A bare Option ID or a
+    bare name string fails the create with a 400 and an empty error body. The
+    "use Option ID / currency, country, dealSource → use internal name" rule
+    is a deal.search rule only.
 
     Date / datetime fields: call get_current_user to get the user's
     timezone, then resolve datetime.parse_to_utc (list_tool -> build_payload
@@ -206,7 +225,7 @@
     ask the user to pick.
   example:
     name: "Big Deal"
-    closingDate: "2026-06-30T00:00:00.000Z"
+    estimatedClosureOn: "2026-06-30T00:00:00.000Z"
     estimatedValue: {currencyId: 431, value: 50000}
 
 - id: deal.search_by_term

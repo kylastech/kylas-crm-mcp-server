@@ -957,10 +957,7 @@ def _format_field(
                     val_label = val.get("displayName") or val.get("label") or val.get("name") or "Unknown"
                     val_id = val.get("id", "")
                     val_name = val.get("name", "")
-                    if use_name and val_name:
-                        lines.append(f"     • {val_label} (internal name: '{val_name}')")
-                    else:
-                        lines.append(f"     • {val_label} (ID: {val_id})")
+                    lines.append(f"     • {val_label} (internal name: '{val_name}'),(ID: {val_id})")
     return lines
 
 
