@@ -223,10 +223,12 @@
     and include assignedTo (via user.lookup, or the current user's id from
     get_current_user when the user says "assign to me") — do not treat its
     absence from the *REQUIRED* markers as license to omit it, and do not
-    guess a value if the user hasn't said who to assign it to; ask them.
+    guess a value if the user hasn't said who to assign it to; ask them,
+    assignedTo's value is a bare integer user ID (e.g. "assignedTo": 7236).
   example:
     name: "Follow up"
     dueDate: "2026-05-01T18:29:59.999Z"
+    assignedTo: 7236
     relation: [{targetEntityId: 12345, targetEntityType: "LEAD", targetEntityName: "Jane Doe"}]
 
 - id: task.search_by_term
