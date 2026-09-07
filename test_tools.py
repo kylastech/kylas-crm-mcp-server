@@ -17,6 +17,7 @@ except ImportError:
             asyncio = lambda f: f
 
 import main
+from shared import http_client
 from main import (
     _normalize_country_code,
     get_lead_field_instructions_logic,
@@ -1227,7 +1228,7 @@ def test_get_mcp_client_name_with_name_and_version():
     """Returns 'Name(version)' when both client name and version are present."""
     mock_ctx = _make_mock_context("Claude Desktop", "1.2.3")
     with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
-        result = main._get_mcp_client_name()
+        result = http_client._get_mcp_client_name()
     assert result == "Claude Desktop(1.2.3)"
 
 
@@ -1235,14 +1236,14 @@ def test_get_mcp_client_name_without_version():
     """Returns just the name when version is empty."""
     mock_ctx = _make_mock_context("cursor", "")
     with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
-        result = main._get_mcp_client_name()
+        result = http_client._get_mcp_client_name()
     assert result == "cursor"
 
 
 def test_get_mcp_client_name_outside_request_context():
     """Returns 'unknown' when called outside a request (get_context raises)."""
     with patch.object(main.mcp, "get_context", side_effect=LookupError, create=True):
-        result = main._get_mcp_client_name()
+        result = http_client._get_mcp_client_name()
     assert result == "unknown"
 
 
@@ -1253,17 +1254,17 @@ def test_get_mcp_client_name_no_client_params():
     mock_ctx = MagicMock()
     mock_ctx.session = mock_session
     with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
-        result = main._get_mcp_client_name()
+        result = http_client._get_mcp_client_name()
     assert result == "unknown"
 
 
 def test_throttled_client_context_user_agent_format():
     """User-Agent header must be 'kylas_mcp_server({version}) on {client}'."""
-    with patch("main._resolve_auth_headers", return_value={"api-key": "test-key"}), \
-         patch("main._get_mcp_client_name", return_value="Claude Desktop(1.2.3)"):
-        ctx = main._ThrottledClientContext()
+    with patch("shared.http_client._resolve_auth_headers", return_value={"api-key": "test-key"}), \
+         patch("shared.http_client._get_mcp_client_name", return_value="Claude Desktop(1.2.3)"):
+        ctx = http_client._ThrottledClientContext()
         ua = ctx._raw.headers.get("user-agent")
-    assert ua == f"kylas_mcp_server({main.SERVER_VERSION}) on Claude Desktop(1.2.3)"
+    assert ua == f"kylas_mcp_server({http_client.SERVER_VERSION}) on Claude Desktop(1.2.3)"
 
 
 # ---------------------------------------------------------------------------
