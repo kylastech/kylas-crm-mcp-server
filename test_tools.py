@@ -196,6 +196,33 @@ def test_format_field_custom_with_picklist():
     assert "Large (ID: 67890)" in lines[3]
 
 
+def test_format_field_omits_large_picklist_options():
+    """A picklist named in large_fields gets a short stub instead of every option."""
+    field = {
+        "id": 200,
+        "displayName": "Timezone",
+        "name": "timezone",
+        "type": "PICK_LIST",
+        "standard": True,
+        "picklist": {
+            "values": [
+                {"id": 1, "displayName": "Asia/Calcutta"},
+                {"id": 2, "displayName": "America/New_York"},
+            ]
+        },
+    }
+    lines = _format_field(field, large_fields={"timezone"})
+    joined = "\n".join(lines)
+    assert "omitted" in joined
+    assert "build_payload(id, fields=[\"timezone\"])" in joined
+    assert "Asia/Calcutta" not in joined
+
+    # Not in large_fields -> unaffected, full list still shown.
+    lines_full = _format_field(field, large_fields={"country"})
+    joined_full = "\n".join(lines_full)
+    assert "Asia/Calcutta" in joined_full
+
+
 def test_normalize_field_values_standard_only():
     fv = {"firstName": "John", "lastName": "Doe"}
     payload = _normalize_field_values(fv)
@@ -347,6 +374,47 @@ async def test_get_lead_field_instructions_success():
         assert "KYLAS CRM - LEAD FIELDS CHEAT SHEET" in result
         assert "[STANDARD] 'First Name' (API Name: 'firstName')" in result
         assert "[CUSTOM] 'Company Size' (Field ID: '57300'" in result
+        assert "Website (ID: 1001)" in result
+        assert "Small (ID: 12345)" in result
+
+
+@pytest.mark.asyncio
+async def test_get_lead_field_instructions_omits_large_picklist():
+    """timezone is one of lead's 'large' picklists (_BUCKET_PICKLIST_RULES) -
+    get_lead_field_instructions should stub it out, same as build_payload does,
+    while leaving an ordinary picklist (leadSource) untouched."""
+    mock_response_with_timezone = MOCK_FIELDS_RESPONSE + [
+        {
+            "id": 300,
+            "displayName": "Timezone",
+            "name": "timezone",
+            "type": "PICK_LIST",
+            "standard": True,
+            "active": True,
+            "picklist": {
+                "values": [
+                    {"id": 1, "displayName": "Asia/Calcutta"},
+                    {"id": 2, "displayName": "America/New_York"},
+                ]
+            },
+        }
+    ]
+    with patch("main.get_client") as mock_get_client:
+        mock_client = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.json.return_value = mock_response_with_timezone
+        mock_response.raise_for_status = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        mock_client.__aexit__.return_value = None
+        mock_get_client.return_value = mock_client
+
+        result = await get_lead_field_instructions_logic()
+
+        assert "omitted" in result
+        assert 'build_payload(id, fields=["timezone"])' in result
+        assert "Asia/Calcutta" not in result
+        # Non-large picklists are unaffected.
         assert "Website (ID: 1001)" in result
         assert "Small (ID: 12345)" in result
 
@@ -906,8 +974,8 @@ async def test_search_idle_entities_invalid_type():
 
 
 @pytest.mark.asyncio
-async def test_load_entity_labels_success():
-    """Test successfully loading entity labels from API."""
+async def test_fetch_entity_labels_success():
+    """Test successfully fetching entity labels from API, live, with no caching."""
     mock_labels = {
         "LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"},
         "DEAL": {"displayName": "Deeeel", "displayNamePlural": "Deeeels"},
@@ -921,51 +989,40 @@ async def test_load_entity_labels_success():
         mock_client.get.return_value = mock_response
         mock_get_client.return_value.__aenter__.return_value = mock_client
 
-        result = await main._load_entity_labels()
+        result = await main._fetch_entity_labels()
 
         assert result == mock_labels
         mock_client.get.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_label_refresh_loop():
-    """Test that refresh loop updates labels periodically."""
-    initial_labels = {
-        "LEAD": {"displayName": "Lead", "displayNamePlural": "Leads"}
-    }
-    updated_labels = {
-        "LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"},
-        "DEAL": {"displayName": "Deeeel", "displayNamePlural": "Deeeels"}
-    }
+async def test_fetch_entity_labels_not_cached():
+    """Two calls must each hit the API — nothing is cached process-wide.
+
+    This is the isolation fix itself: the server runs stateless_http, so a
+    module-level cache would leak one tenant's labels into another tenant's
+    request. Every call must resolve auth (and therefore labels) fresh.
+    """
+    first_tenant_labels = {"LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"}}
+    second_tenant_labels = {"LEAD": {"displayName": "Prospect", "displayNamePlural": "Prospects"}}
 
     with patch("main.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
-        # First call returns initial, second returns updated
-        mock_response.json.side_effect = [initial_labels, updated_labels]
+        mock_response.json.side_effect = [first_tenant_labels, second_tenant_labels]
         mock_client.get.return_value = mock_response
         mock_get_client.return_value.__aenter__.return_value = mock_client
 
-        # Load initial labels
-        await main._load_entity_labels()
-        assert main._ENTITY_LABELS == initial_labels
+        result_a = await main._fetch_entity_labels()
+        result_b = await main._fetch_entity_labels()
 
-        # This function doesn't exist yet, test will fail
-        refresh_task = asyncio.create_task(main._label_refresh_loop())
-
-        # Let it run for a moment (won't actually refresh yet)
-        await asyncio.sleep(0.1)
-
-        # Cancel the task
-        refresh_task.cancel()
-        try:
-            await refresh_task
-        except asyncio.CancelledError:
-            pass
+        assert result_a == first_tenant_labels
+        assert result_b == second_tenant_labels
+        assert mock_client.get.call_count == 2
 
 
 @pytest.mark.asyncio
-async def test_load_entity_labels_api_error():
+async def test_fetch_entity_labels_api_error():
     """Test graceful handling when label fetch fails."""
     with patch("main.get_client") as mock_get_client:
         mock_client = AsyncMock()
@@ -973,10 +1030,9 @@ async def test_load_entity_labels_api_error():
         mock_get_client.return_value.__aenter__.return_value = mock_client
 
         # Should not raise, should return empty dict
-        result = await main._load_entity_labels()
+        result = await main._fetch_entity_labels()
 
         assert result == {}
-        assert main._ENTITY_LABELS == {}
 
 
 def test_format_entity_labels_for_instructions():
@@ -1005,9 +1061,6 @@ async def test_system_instructions_include_labels():
         "LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"},
         "DEAL": {"displayName": "Deeeel", "displayNamePlural": "Deeeels"},
     }
-
-    # Manually set labels
-    main._ENTITY_LABELS = test_labels
 
     # Format labels
     formatted = main._format_entity_labels_for_instructions(test_labels)

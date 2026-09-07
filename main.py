@@ -1,36 +1,49 @@
 """
-Kylas CRM MCP Server
+Kylas CRM MCP Server — Generic Registry Architecture
 
-Model Context Protocol server for Kylas CRM operations:
+Model Context Protocol server for Kylas CRM operations (lead, contact,
+deal, task, company, meeting, call_log, quotation). There is no
+per-entity tool surface any more — every operation is reached through
+exactly 5 advertised tools; everything else is internal Python that those
+5 tools dispatch to. See SYSTEM_INSTRUCTIONS below (the actual text served
+to a connecting MCP client as its `instructions`) for the full, current
+contract — this docstring is a short map for a human reading the source,
+not duplicated guidance for the client.
 
-GENERIC CRUD (use these instead of entity-specific tools):
-- create_entity(entity_type, field_values)  — create any entity
-- update_entity(entity_type, entity_id, field_values)  — update any entity
-  Supported entity_type values: lead, contact, deal, task, company, meeting, call_log
+STANDALONE TOOLS (2 — deliberately outside the registry flow):
+- get_entity_labels() — MANDATORY, call first, every session (this tenant
+  may have renamed CRM entities; every other tool only takes the standard
+  type, never the tenant's custom display name). Fetched live, per call,
+  never cached server-side — see _fetch_entity_labels's docstring.
+- get_current_user() — MANDATORY, call first, every session, alongside
+  get_entity_labels(). Returns the calling user's IANA timezone and id.
+  Every timestamp Kylas returns is UTC; the timezone from this call is what
+  turns it into something the user actually recognises. Call it ONCE per
+  session and reuse the result — it is not cached server-side.
 
-PER-ENTITY FIELD INSTRUCTIONS (call FIRST to get schema before create/update):
-- get_lead_field_instructions
-- get_contact_field_instructions
-- get_task_field_instructions
-- get_deal_field_instructions
-- get_company_field_instructions
+THE GENERIC REGISTRY FLOW (3 tools):
+- list_tool(bucket?, intent?) — find the id of the operation you need.
+- build_payload(id, fields?) — get that one id's real method/path/
+  usage_notes/schema/example, with this tenant's live custom
+  fields/picklist options folded in where relevant.
+- execute_request(id, payload) — actually run it, via this repo's
+  existing, already-tested *_logic implementation for that id — never a
+  reimplemented HTTP call.
 
-PER-ENTITY GET (fetch full record by ID):
-- get_lead, get_contact, get_task, get_deal, get_company, get_meeting, get_call_log
+Every CRUD operation (get/search/search_by_term/search_idle/create/update)
+across every bucket goes through these 3. So does every operation that used
+to be its own standalone tool — user/product/pipeline lookups, per-entity
+relation lookups (meeting participants, task associations, call logs by
+entity), datetime conversion (datetime.parse_to_utc), and the
+tasks-with-any-relation search (task.search_any_relation) — each reached as
+a registry id, dispatched via _REGISTRY_ID_TO_META_TOOL /
+_META_LOOKUP_ROUTERS to the same real Python function that operation
+always used, not a new implementation.
 
-SEARCH:
-- search_entity(entity_type, filters) — filter any entity by criteria
-- search_entity_by_term(entity_type, term) — full-text search
-- search_idle_entities(entity_type, days) — no activity for N days
-
-PIPELINE:
-- lookup_pipelines, get_pipeline_stages, get_pipeline_details
-
-SHARED UTILITIES:
-- get_current_user (timezone, ID; use for date/datetime handling)
-- lookup_users (resolve user names to IDs for ownerId, createdBy, updatedBy)
-- lookup_products (find products for field_values)
-- parse_datetime_to_utc_iso_tool (convert user timezone to UTC ISO)
+Registry source of truth: registry/*.yaml (what each operation is, how to
+use it) + this file's runtime schemas (the authoritative request shape) —
+see registry/_meta.yaml's header comment for why those two are deliberately
+kept separate.
 """
 
 import asyncio
@@ -40,14 +53,15 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
+from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from zoneinfo import ZoneInfo
 
 import httpx
 import phonenumbers
+import yaml
 from dateutil import parser as dateutil_parser
 from fastmcp.server import FastMCP
-from fastmcp.server.middleware import Middleware, MiddlewareContext
 from dotenv import load_dotenv
 import json
 
@@ -164,8 +178,17 @@ def _get_default_timezone() -> str:
 
 DEFAULT_TIMEZONE = _get_default_timezone()
 
-# Entity label mapping (tenant-specific display names)
-_ENTITY_LABELS: Dict[str, Dict[str, str]] = {}
+# Entity label mapping (tenant-specific display names).
+#
+# Deliberately NOT cached process-wide. This server runs stateless_http=True
+# (see run()) — every request is its own fresh transport with no session
+# continuity (mcp/server/streamable_http_manager.py sets mcp_session_id=None
+# in stateless mode) — so there is no per-tenant or per-session slot to cache
+# this in safely. A module-level dict here previously caused tenant A's
+# labels to leak to tenant B (and, via a background refresh loop with no
+# request context, to whatever KYLAS_API_KEY the env fell back to). Always
+# fetch live, scoped to the resolved auth of the current request. The extra
+# /entities/label round-trip is the accepted cost of correctness.
 
 
 def _threshold_iso_days_ago(days: int, time_zone: str) -> str:
@@ -184,6 +207,26 @@ def _convert_date_value_to_utc(value: Any, timezone_str: str) -> Any:
     Convert date/datetime filter value(s) from user's local timezone to UTC.
     Handles single ISO string, list of ISO strings (for between operator), or None.
     Strips trailing 'Z' before parsing so the value is treated as local time.
+
+    Parsing uses dateutil, the same parser datetime.parse_to_utc already uses,
+    rather than the two hardcoded strptime formats this used to accept. Those
+    two covered "2026-09-03T19:30:00.000" and "2026-09-03T19:30:00" and NOTHING
+    else — a space instead of the "T", or omitted seconds, fell through to a
+    bare `return v` and shipped the caller's local time to Kylas unconverted,
+    silently and with no log line. The filter then searched a window offset by
+    the timezone and quietly returned the wrong records:
+        '2026-09-03 19:30:00'       -> passed through unconverted
+        '3 September 2026 7:30 PM'  -> passed through unconverted
+        '2026-09-03T19:30'          -> passed through unconverted
+    All three convert correctly now.
+
+    Timezone handling is unchanged for the normal case and stricter for one
+    edge case: a naive value (including one with a trailing 'Z', which callers
+    routinely add to a local time they were told to send as local) is still
+    interpreted in `timezone_str`. But a value carrying a REAL utc offset, e.g.
+    "2026-09-03T19:30:00+05:30", is now honoured as written instead of having
+    its offset overwritten by timezone_str — previously such a value failed
+    both strptime formats and was passed through untouched.
     """
     if value is None:
         return value
@@ -191,30 +234,94 @@ def _convert_date_value_to_utc(value: Any, timezone_str: str) -> Any:
     try:
         tz = ZoneInfo(timezone_str)
     except Exception:
+        # Never silently pretend the caller meant UTC — that returns a wrong
+        # timestamp with no error anywhere. See the tzdata note in requirements.txt.
+        logger.error(
+            "Filter timezone %r could not be resolved — falling back to UTC. Date filter "
+            "values will NOT be shifted and the search window will be wrong by that "
+            "zone's offset. Ensure the 'tzdata' package is installed in the runtime.",
+            timezone_str,
+        )
         tz = ZoneInfo("UTC")
     utc = ZoneInfo("UTC")
 
-    def _convert_single(v: str) -> str:
-        if not isinstance(v, str):
+    def _convert_single(v: Any) -> Any:
+        if not isinstance(v, str) or not v.strip():
             return v
-        # Strip trailing Z so we treat it as naive local time
-        clean = v.rstrip("Z").rstrip("z")
+        # Strip trailing Z so a local time sent with a "Z" is still read as local.
+        clean = v.strip().rstrip("Zz")
         try:
-            # Try parsing with milliseconds first
-            try:
-                dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S.%f")
-            except ValueError:
-                dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S")
-            # Attach the user's timezone, then convert to UTC
-            local_dt = dt.replace(tzinfo=tz)
-            utc_dt = local_dt.astimezone(utc)
-            return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc_dt.microsecond // 1000:03d}Z"
-        except Exception:
-            return v  # Return as-is if parsing fails
+            dt = dateutil_parser.parse(clean)
+        except (ValueError, OverflowError, TypeError):
+            logger.warning(
+                "Could not parse date filter value %r; sending it to Kylas unconverted. "
+                "The search window may be wrong by the timezone offset.", v,
+            )
+            return v
+        # An explicit offset in the value wins; a naive value means local time.
+        local_dt = dt if dt.tzinfo is not None else dt.replace(tzinfo=tz)
+        utc_dt = local_dt.astimezone(utc)
+        return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{utc_dt.microsecond // 1000:03d}Z"
 
     if isinstance(value, list):
         return [_convert_single(v) for v in value]
     return _convert_single(value)
+
+
+def _epoch_to_iso_utc(value: Any) -> Any:
+    """
+    Convert a Kylas epoch timestamp to a UTC ISO string. Anything else is
+    returned EXACTLY as received.
+
+    Kylas is not consistent about this: the same field on the same record comes
+    back as epoch milliseconds from one endpoint and as an ISO string from
+    another (verified on task 11613888 — POST /tasks/search returned
+    1789070400000, GET /tasks/{id} returned "2026-09-10T20:00:00.000+0000" for
+    the same dueDate, same instant). A bare integer reaching the LLM is not a
+    timestamp it can read, so it guesses — that is how a task due 7:00 PM was
+    reported as 6:40 PM. This converts the epoch case only; ISO strings, None,
+    and everything else pass through untouched, by design.
+
+    Epoch is detected by TYPE first, then magnitude — never by field name:
+      - milliseconds: 1e11 .. 4.1e12   (~1973 .. ~2100)
+      - seconds:      1e9  .. 4.1e9    (~2001 .. ~2100)
+    The two ranges cannot overlap: epoch seconds do not reach 1e11 until the
+    year 5138, so a seconds value can never be misread as milliseconds.
+    Anything outside both ranges is left alone rather than guessed at.
+    """
+    # bool is a subclass of int — exclude it before any numeric check.
+    if isinstance(value, bool) or value is None:
+        return value
+
+    number = value
+    if isinstance(value, str):
+        stripped = value.strip()
+        # Only a plain integer literal counts; "2026-09-10T..." must not match.
+        if not (stripped.lstrip("-").isdigit() and stripped.lstrip("-")):
+            return value
+        try:
+            number = int(stripped)
+        except ValueError:
+            return value
+    elif not isinstance(value, (int, float)):
+        return value
+
+    magnitude = abs(number)
+    if 1e11 <= magnitude <= 4.1e12:
+        seconds = number / 1000.0
+    elif 1e9 <= magnitude <= 4.1e9:
+        seconds = float(number)
+    else:
+        # A number, but not in any plausible epoch range — leave it exactly as
+        # it came rather than inventing a date from it.
+        return value
+
+    try:
+        dt = datetime.fromtimestamp(seconds, tz=ZoneInfo("UTC"))
+    except (OverflowError, OSError, ValueError):
+        logger.warning("Could not convert epoch %r to a UTC datetime; passing through unchanged.", value)
+        return value
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) -> str:
@@ -249,56 +356,31 @@ def _format_entity_labels_for_instructions(labels: Dict[str, Dict[str, str]]) ->
     return "\n".join(lines)
 
 
-async def _load_entity_labels() -> Dict[str, Dict[str, str]]:
+async def _fetch_entity_labels() -> Dict[str, Dict[str, str]]:
     """
-    Fetch entity labels from /v1/entities/label endpoint.
+    Fetch entity labels from /v1/entities/label endpoint, live, for the caller's
+    own resolved auth (get_client() reads x-api-key/OAuth off the current request).
     Returns mapping like: {"LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"}, ...}
-    Returns empty dict if fetch fails.
+    Returns empty dict if fetch fails — callers fall back to standard names.
+
+    Not cached anywhere — this server runs stateless_http (see run()), so there's no
+    session or tenant-scoped slot to cache this in without either leaking across
+    tenants (the old bug) or reintroducing per-tenant credential storage for a
+    background refresh. Call this fresh wherever the labels are needed.
     """
-    global _ENTITY_LABELS
     try:
         async with get_client() as client:
             resp = await client.get(f"{BASE_URL}/entities/label")
-            _ENTITY_LABELS = resp.json()
-            # Log with display names in clear format
+            labels = resp.json()
             summary = "\n".join(
                 f"  • {etype:8} => {data.get('displayName', etype)} / {data.get('displayNamePlural', etype)}"
-                for etype, data in sorted(_ENTITY_LABELS.items())
+                for etype, data in sorted(labels.items())
             )
-            logger.info(f"\n📦 Loaded Entity Labels:\n{summary}")
-            return _ENTITY_LABELS
+            logger.debug(f"\n📦 Fetched entity labels:\n{summary}")
+            return labels
     except Exception as e:
-        logger.warning(f"Failed to load entity labels: {e}")
-        _ENTITY_LABELS = {}
+        logger.warning(f"Failed to fetch entity labels: {e}")
         return {}
-
-
-async def _label_refresh_loop(interval_seconds: int = 1800) -> None:
-    """
-    Background task: periodically refresh entity labels.
-    Default interval: 1800 seconds (30 minutes).
-    Runs forever until cancelled. Updates _ENTITY_LABELS in-place and
-    rebuilds MCP server instructions so new labels are picked up immediately.
-    """
-    global _ENTITY_LABELS
-    while True:
-        try:
-            await asyncio.sleep(interval_seconds)
-            logger.debug("Refreshing entity labels...")
-            async with get_client() as client:
-                resp = await client.get(f"{BASE_URL}/entities/label")
-                new_labels = resp.json()
-                _ENTITY_LABELS.clear()
-                _ENTITY_LABELS.update(new_labels)
-                logger.info(f"🔄 Refreshed entity labels: {list(_ENTITY_LABELS.keys())}")
-                mcp._mcp_server.instructions = _build_instructions()
-                _update_tool_description(mcp)
-                _patch_entity_tool_descriptions(mcp)
-        except asyncio.CancelledError:
-            logger.info("Label refresh loop cancelled")
-            break
-        except Exception as e:
-            logger.warning(f"Label refresh failed: {e}. Keeping cached labels.")
 
 
 if not API_KEY:
@@ -309,152 +391,229 @@ if not API_KEY:
 # ---------------------------------------------------------------------------
 
 SYSTEM_INSTRUCTIONS = """
-# Kylas CRM MCP Server - Lead, Contact & Task Support
+# Kylas CRM MCP Server — Generic Registry Architecture
 
-## ⚠️ MANDATORY SESSION RULES — READ FIRST
+This server does not expose one dedicated tool per CRM operation. Every
+operation (lead, contact, deal, task, company, meeting, call_log, quotation,
+plus shared user/product/pipeline/datetime lookups) is reached through
+exactly 3 generic tools, plus exactly 2 standalone tools that don't fit the
+id-based flow: get_current_user and get_entity_labels (see MANDATORY FIRST
+CALLS, immediately below — read that before anything else in this document).
+There is no per-entity instructions block loaded up front — everything you
+need to use any operation correctly is either below (rules that apply
+across every operation) or returned by the tools themselves, on demand,
+scoped to the one operation you're actually performing.
 
-### Rule 0 — Call first, every session
-Call `get_entity_labels()` IMMEDIATELY at the start of every session before anything else.
-This tenant uses custom names for CRM entities. Without this, you will misidentify entity requests.
+## MANDATORY FIRST CALLS — get_entity_labels() and get_current_user()
 
-### Rule 1 — Entity field schemas (once per session)
-Call each entity’s field instructions tool the FIRST time you interact with that entity. Do NOT call it again for subsequent operations on the same entity in the same session.
+Call BOTH of these FIRST, before any other tool, at the start of EVERY
+session — before list_tool, before answering the user's actual request,
+before anything else. Neither is optional, and neither is a setup step to
+skip on a hunch that "this tenant probably hasn't renamed anything" or
+"this question probably isn't about dates."
 
-### Rule 2 — NEVER simulate CRM actions
-**CRITICAL: You MUST call the appropriate tool for every create / update / delete / search operation. Never respond as if an action succeeded without actually calling the tool.**
-- ❌ Do NOT write an artifact, table, or summary showing what "would be" created and then stop.
-- ❌ Do NOT say "Lead created" or "I’ve created the lead" without a successful tool call response.
-- ❌ Do NOT ask for confirmation before calling a create/update tool — just call it (unless a required field is missing).
-- ✅ Call the tool → show the result. That’s the only valid flow.
+Call each ONCE per session and reuse the result for the rest of that
+session. Do NOT re-call either one before individual operations later on —
+the answers do not change mid-session. Call again only if the original
+result is no longer visible to you (e.g. a long conversation where it has
+dropped out of context).
 
-| Entity    | Tool (call once per session)       |
-|-----------|------------------------------------|
-| Lead      | `get_lead_field_instructions`      |
-| Contact   | `get_contact_field_instructions`   |
-| Task      | `get_task_field_instructions`      |
-| Deal      | `get_deal_field_instructions`      |
-| Company   | `get_company_field_instructions`   |
-| Meeting   | `get_meeting_field_instructions`   |
-| Call Log  | `get_call_log_field_instructions`  |
+Why: this tenant may have renamed standard CRM entities to its own display
+names (e.g. "Lid" instead of "Lead", "Deeeel" instead of "Deal"). Every
+registry id, every bucket name, every field in a payload still uses the
+STANDARD type (lead/contact/deal/task/company/meeting/call_log/quotation)
+— never the tenant's custom name. get_entity_labels() returns the mapping
+from this tenant's custom names to those standard types. Without calling it
+first, a user asking for their "Lids" reads as a request for an entity type
+that doesn't exist, when it's actually just "lead" under a different name.
 
----
+Why get_current_user(): every timestamp Kylas returns is UTC (e.g.
+"2026-09-10T20:00:00.000Z"), but the user thinks, asks and reads in their
+own timezone. You need their IANA timezone BEFORE you show them any date,
+not after. Without it you will either dump a raw UTC timestamp the user has
+to decode, or guess the offset and be wrong — a task genuinely due 7:00 PM
+gets reported as 1:30 AM the next day, and nothing about the response looks
+wrong. The same timezone is also what you pass as timeZone in date filters,
+and what datetime.parse_to_utc needs for create/update payloads.
 
-## 🚨 ENTITY LABEL MAPPING (Tenant-Customized Names)
+## The 3-step flow
 
-Before saying "Kylas doesn’t have X entity", check this mapping first. If the user’s entity name is found here, use the standard type for all tool calls. Only say "entity not found" if the name is absent from both this mapping and the standard types.
+1. list_tool(bucket?, intent?)
+   Find the id of the endpoint you need. Returns only a short
+   id/bucket/intent/description row per match — never a schema. Call it with
+   no arguments first if you don't know what's available yet; narrow with
+   bucket/intent once you have a sense of what you're looking for.
 
-{ENTITY_LABEL_MAPPING}
+2. build_payload(id, fields?)
+   Get everything about the ONE endpoint you picked: its real HTTP method and
+   path, usage_notes (the actual field-shape rules for that specific
+   endpoint — read these, they are load-bearing, not decorative), a
+   parameter schema, and a worked example. For endpoints whose real shape
+   depends on this tenant's own custom fields/picklist options, this makes a
+   genuine live call to fetch them and folds the real data into the schema —
+   check the returned "fetched_live" / "live_fetch_error" fields to know
+   whether that actually succeeded; if it didn't, the rest of the response
+   (method/path/usage_notes/example) is still correct and usable, only the
+   tenant-specific enrichment is missing. This tool never sees or validates
+   the payload you go on to build from it.
 
----
+   A few picklist fields on a real tenant are enormous — timezone alone is
+   ~435 options. Their option lists are omitted by default from the returned
+   "tenant_fields_reference" cheat sheet, replaced with a one-line stub
+   telling you exactly how to get them. Every other field, including every
+   small picklist and every custom field, always comes back complete, so this
+   costs you nothing on a normal request. The
+   large ones, with both names each goes by (entities disagree — a lead has
+   "companyIndustry", a company has "industry"):
 
-## PAGINATION — AVOID RATE LIMITS (429)
+     timezone, country / companyCountry, companyIndustry / industry,
+     requirementCurrency, companyBusinessType / businessType
 
-The Kylas API rate-limits rapid sequential requests. Every search tool returns `totalPages` — follow these rules strictly when there are multiple pages:
+   If the user's request actually mentions one of those — "country India",
+   "timezone IST" — pass it in the optional "fields" list to get its real
+   options: build_payload("lead.create", fields=["country"]). Otherwise omit
+   the parameter. If you only realise later that you need one, just call
+   build_payload again naming it; that is always cheaper and always correct
+   compared with guessing an option id or internal name, which you must never
+   do. Note that deal, task and call_log have no large picklists at all, so
+   "fields" does nothing for those buckets.
 
-1. **Always use the largest page size available** (`size=50` is the max for most endpoints). Fewer calls = fewer 429s.
-2. **Do NOT auto-fetch all pages sequentially.** Fetch page 1, show results, then ask: *"There are N more pages. Do you want me to fetch them?"* Wait for user confirmation before fetching page 2, 3, etc.
-3. **Use `return_all=True` / `fetch_all_pages=True` where available** (e.g. `lookup_users`). These flags do the paging server-side in one tool call — far safer than manual iteration.
-4. **One page at a time when manually paginating.** After showing page N, wait for the user to ask for the next page. Never fetch multiple pages in one reasoning step.
-5. **If you receive a 429 error:** stop, wait at least 5 seconds, then retry once. If it fails again, tell the user the API is rate-limited and suggest retrying after 30 seconds. (The server retries automatically up to 3 times with backoff, so a 429 reaching you means retries were exhausted.)
+3. execute_request(id, payload)
+   Send the exact payload you built, using the SAME id you called
+   build_payload with. Always returns {"ok": true, "status", "data"} on
+   success or {"ok": false, "error": {"code", "message"}} on failure — never
+   a raw exception. A malformed payload is caught HERE, not earlier —
+   build_payload does no validation of its own, on purpose.
 
----
+## What's registered right now (call list_tool to confirm, don't assume)
+Buckets: lead, contact, meeting, call_log, deal, task, company, quotation,
+plus a bucket-less "_meta" group for shared lookups (user.lookup,
+product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc).
+Not every bucket has every intent:
+  - lead, deal, company: get, search, search_by_term, search_idle, create, update (all 6)
+  - contact, meeting: get, search, search_by_term, create, update (no search_idle)
+  - task: get, search, search_by_term, create, update, lookup (task.lookup_entity, task.search_any_relation — no search_idle)
+  - call_log: search, create, update, lookup (call_log.by_entity — no get, no search_by_term, no search_idle)
+  - meeting also has lookup (meeting.lookup_related), beyond the get/search/search_by_term/create/update above
+  - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
+  - _meta: lookup only (user.lookup, product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc)
+Always call list_tool(bucket=...) to see exactly which ids exist for a
+bucket before assuming one does.
 
-## DEFAULT DATE RANGE — "SHOW ALL" / "GIVE ALL" QUERIES
+## Standalone tools (outside the 3-step flow)
+Exactly 2 tools don't fit the id-based flow above and stay independently
+callable — everything else lookup/get-shaped lives in the registry instead
+(see pipeline.details, meeting.lookup_related, task.lookup_entity,
+task.search_any_relation, call_log.by_entity, datetime.parse_to_utc above):
+- get_entity_labels() — MANDATORY, call this first, every session, before
+  anything else. See the MANDATORY FIRST CALL section at the top of this
+  document — not repeated here.
+- get_current_user() — MANDATORY, call this first, every session, before
+  anything else, alongside get_entity_labels(). See the MANDATORY FIRST
+  CALLS section at the top of this document — not repeated here. Reuse its
+  timezone for the whole session (date filters, datetime.parse_to_utc, and
+  every date you display); do not re-call it per operation. No bucket
+  concept applies — it's about the calling user, not a CRM entity.
 
-When the user asks for "all" records without a date range, apply `updatedAt ≥ (today − 90 days)`.
-- **Never use `search_entity_by_term` with `"*"` or blank** — returns no results.
-- Call `get_current_user` first if timezone is unknown.
-- Tell the user: *"Showing records updated in the last 3 months. Specify a date range for older records."*
-- If the user specifies a date range, use that instead.
+Two operations that used to be standalone tools are now registry ids —
+resolve them the same way as any other id (list_tool -> build_payload ->
+execute_request), do NOT try to call them as bare functions:
+- datetime.parse_to_utc (local_datetime, timezone) — convert a local
+  datetime to the UTC ISO string create/update payloads need. Call
+  get_current_user first to get the timezone. A pure conversion; doesn't
+  call the Kylas API at all, but is still resolved through execute_request
+  like every other id, not called directly.
+- task.search_any_relation (page, size, sort) — tasks linked to ANY entity
+  (4 parallel is_not_null calls, deduplicated server-side) — an OR across 4
+  association fields that a single jsonRule-based filter set (what
+  task.search's payload actually is) cannot express as one filter.
 
-Use `search_entity(entity_type, [{"field": "updatedAt", "operator": "greater_or_equal", "value": "<ISO>"}])` where `entity_type` is one of: `lead`, `contact`, `task`, `deal`, `company`, `meeting`.
+## Rules that apply across every endpoint, not just one
+- Always call list_tool first if you don't already know the exact id
+  you need — never guess an id, and never assume one from a previous session
+  still exists.
+- Never guess a method, path, field name, or field value shape for ANY
+  endpoint — call build_payload and read its schema and usage_notes before
+  constructing anything, every time, even for an id you've used before in
+  this same conversation.
+- If a field in a schema carries "resolve_via": "<other_id>", you must
+  resolve that value through the named endpoint first — run the full
+  list_tool -> build_payload -> execute_request cycle on <other_id>,
+  take the real value it returns, and only then use it. Never invent a
+  plausible-looking id/value for a field that says resolve_via.
+- For *.search endpoints: fetch one page, show the user what came back, and
+  only fetch further pages if they ask for more — don't loop and fetch
+  everything automatically. Every search response carries "totalPages" —
+  use the largest page size available (usually 50-100 max) to minimize
+  calls, and never auto-fetch multiple pages in one reasoning step.
+- Never tell the user an action succeeded (a record was created, updated, or
+  found) unless execute_request's own envelope actually said
+  {"ok": true, ...}. If it returned {"ok": false, ...}, relay the real
+  error message — don't retry silently, don't fabricate a different outcome,
+  and don't paper over the failure.
+- None of these 3 tools take an entity's own field names as their own
+  top-level arguments (e.g. execute_request never takes "firstName" or
+  "email" directly) — that level of detail only ever exists inside the
+  "payload" argument, shaped exactly as build_payload's schema for that
+  specific id describes.
+- If you receive a 429 error: stop, wait at least 5 seconds, then retry
+  once. If it fails again, tell the user the API is rate-limited and
+  suggest retrying after 30 seconds.
 
----
+## DEFAULT DATE RANGE — "show all" / "give all" queries
+For every bucket except meeting and call_log (where an empty filter list is
+valid and already returns everything — see that bucket's *.search
+usage_notes), *.search requires a non-empty filter list. When the user asks
+for "all" records without specifying a date range, apply
+updatedAt >= (today - 90 days) as the filter instead of refusing or leaving
+it empty. Never call *.search_by_term with "*" or a blank term — it returns
+nothing; use *.search with a date filter for "all"/"list" queries instead.
+Tell the user: "Showing records updated in the last 3 months. Specify a
+date range for older records." If the user gives their own date range, use
+that instead. Use the timezone from the session-start get_current_user()
+call — do not call it again here.
 
-## COMMON RULES (apply to all entities)
+## SHOWING DATES TO THE USER — applies to every date you ever display
+Every timestamp in a tool response is UTC. Some arrive as
+"2026-09-10T20:00:00.000Z", some as "2026-09-10T20:00:00.000+0000" — both
+are UTC, treat them identically.
 
-### Building field_values
-- Use ONLY fields the user provided — no defaults, no extras.
-- Keys: API name for standard fields, or field ID string for custom fields.
-- Custom fields: `"customFieldValues": {"<internalName>": <value>}` — never use field ID as the key.
+NEVER show the user a raw UTC timestamp, and never show a bare number.
+Convert to the user's timezone (from the session-start get_current_user()
+call) and write it the way a person reads it:
 
-### Emails
-Shorthand: `"email": "user@example.com"` (normalized to OFFICE/primary).
-Full: `[{"email": "...", "type": "OFFICE|PERSONAL", "primary": true}]`
+  "2026-09-10T20:00:00.000Z"  ->  "11 Sep 2026, 1:30 AM (Asia/Kolkata)"
 
-### Phone numbers
-Full: `[{"number": "...", "type": "MOBILE|WORK|HOME|PERSONAL", "code": "IN", "primary": true}]`
-Shorthand: `"phone": "5551234567"` + top-level `"phone_country_code": "IN"` + `"phone_type": "MOBILE"` (both required whenever phone is included).
-**If user gives phone but NO country/dial code: do NOT create/update — ask first. Never infer from currency, locale, or number format.**
-**If user gives phone but NO type: do NOT create/update — ask: "Is this number MOBILE, WORK, HOME, or PERSONAL?"**
+This applies to EVERY date field you present: dueDate, createdAt,
+updatedAt, closingDate, completedAt, meeting from/to, call log startTime,
+quotation validTill, and any custom date field. It also applies when you
+reason about a date out loud ("this task is overdue", "due in 3 days") —
+compare in the user's timezone, not in UTC, or you will be off by the
+offset and state it with confidence.
 
-### Picklist fields
-Use **Option ID** (number) from cheat sheet. Exceptions — use **internal name** (string): `requirementCurrency`, `companyBusinessType`, `country`, `timezone`, `companyIndustry`.
+## REPORT FORMATTING — apply whenever presenting 3+ records or a summary
+Structure every report like this:
+1. TL;DR — one sentence capturing the most important signal (e.g. "3 deals
+   are overdue, totalling ₹8.4L at risk").
+2. Body — a markdown table whenever showing 3+ records (columns: the most
+   relevant 4-5 fields only, never dump all fields) or a grouped list for
+   5+ results (deals by pipeline stage/owner, leads by source/owner, tasks
+   by due status: Overdue / Due soon / Upcoming).
+3. Key Takeaways — 3-5 bullets, the most actionable insights only.
 
-### Date / datetime fields
-1. Call `get_current_user` to get user’s timezone (e.g. `Asia/Calcutta`).
-2. **Create/update:** call `parse_datetime_to_utc_iso_tool(datetime_string, timezone)` → use the returned UTC ISO string in field_values.
-3. **Filter/search:** keep value in user’s timezone; pass `timeZone` in the filter (or omit — server uses it). Do NOT convert filter values to UTC.
+Number formatting: currency with ₹ and K/L/Cr suffixes (₹45K, ₹1.2L,
+₹3.5Cr), never raw numbers like 1200000. Dates relative ("3 days ago", "in
+2 weeks") with absolute in parentheses where precision matters. Counts as
+"3 of 12 deals", not just "3". Use plain English, not field names ("closing
+date" not `closingDate`, "owner" not `ownedBy`). Highlight risks with ⚠️,
+wins with ✅. Never show raw IDs in report output — use names.
 
-### Never guess IDs — always resolve first
-- **Users** (createdBy, updatedBy, owner, ownerId, assignedTo, conductedBy, etc. - i.e., sales representatives and employees): call `lookup_users(query)`. Never use contact or lead lookup tools for employees/users. If multiple matches, list them and ask user to pick.
-- **Products**: call `lookup_products(query)`. If multiple matches, list and ask.
-- **Entity IDs** (for association filters — associatedLeads, associatedDeals, etc.): search for the entity first to get its real ID. Never invent IDs — this causes hallucinated results.
-  - Example: "contacts associated with deals from Acme" → search deals for "Acme" first, confirm which deal, then search contacts by that deal ID.
-
----
-
-## Lead Operations
-
-### Create / Update
-Build `field_values` from user input only. For `update_lead`: pass lead ID from search results + fields to update.
-
-### Search / Filter
-- Use `search_entity("lead", filters)`. Only `filterable=true` fields (from cheat sheet) are allowed.
-- PICK_LIST/MULTI_PICKLIST: use Option ID, except `requirementCurrency`, `companyBusinessType`, `country`, `timezone`, `companyIndustry` → use internal name.
-
-### Pipeline and Stage
-1. Call `lookup_pipelines(entityType="LEAD")` first.
-2. Multiple pipelines → list them and ask. Single pipeline → still confirm before proceeding.
-3. After confirmation: `get_pipeline_stages(pipeline_id)` → map intent to stage → use in create/update/search.
-4. **Move to stage:** `update_lead(lead_id, {"pipelineStage": stage_id})`
-5. **Closed Lost / Closed Unqualified:** call `get_pipeline_details` for closing reasons; ask user to pick, then pass `{"pipelineStage": stage_id, "pipelineStageReason": reason}`.
-6. If lead already has a pipeline and user moves to a different one: confirm first.
-
-### Idle / Stagnant Leads
-Use `search_idle_entities("lead", days)` for "no activity for N days" queries.
-Fallback: `search_entity("lead", [...])` with `updatedAt ≤ threshold AND latestActivityCreatedAt ≤ threshold`.
-
----
-
-## Contact Operations
-No pipeline or pipelineStage fields. Use `search_entity("contact", filters)`, `create_contact`, `update_contact`.
-All common rules (phone, email, date, custom fields, ID lookups) apply.
-
----
-
-## Task Operations
-No pipeline, pipelineStage, emails, or phoneNumbers fields.
-
-**Association (link task to an entity):**
-```json
-"relation": [{"targetEntityId": <id>, "targetEntityType": "LEAD|CONTACT|DEAL|COMPANY", "targetEntityName": "<name>"}]
-```
-
-**Resolve entity before creating/updating a task:**
-Use `lookup_entity_for_task(entity_type, search_term)` to find the entity ID by name.
-- entity_type: "lead", "contact", "deal", or "company" (internal type, not tenant display name)
-- Returns ID and name to use in the "relation" field above.
-
-**Filter tasks by a specific entity ID:**
-- Lead: `search_entity("task", [{"field": "associatedLeads", "operator": "equal", "value": <lead_id>}])`
-- Contact: `search_entity("task", [{"field": "associatedContacts", "operator": "equal", "value": <contact_id>}])`
-- Deal: `search_entity("task", [{"field": "associatedDeals", "operator": "equal", "value": <deal_id>}])`
-- Company: `search_entity("task", [{"field": "associatedCompanies", "operator": "equal", "value": <company_id>}])`
-
-**Tasks with ANY relation present (no specific entity):**
-Use `search_tasks_with_any_relation()` — makes 4 parallel `is_not_null` calls and deduplicates.
-Do NOT try to filter manually or post-process results for this case — use the dedicated tool.
+## Diagnosis after showing a single record
+lead.get, deal.get, and task.get's own usage_notes (returned by
+build_payload) each carry a diagnosis-block format and an entity-specific
+signal table to apply after showing that record. No other bucket has
+diagnosis guidance defined for it — don't invent one for a bucket that
+doesn't have it.
 """
 
 # ---------------------------------------------------------------------------
@@ -500,10 +659,19 @@ OPERATOR_SYMBOL_MAP = {
     "lt": "less",
     "ne": "not_equal",
     "eq": "equal",
+    # Verbose forms — common LLM/API convention, normalize to canonical names
+    "greater_than": "greater",
+    "less_than": "less",
+    "greater_than_or_equal": "greater_or_equal",
+    "less_than_or_equal": "less_or_equal",
+    "greater_than_or_equal_to": "greater_or_equal",
+    "less_than_or_equal_to": "less_or_equal",
+    "equals": "equal",
+    "not_equals": "not_equal",
 }
 
 # Picklist fields that use internal name (string) in search; all others use Option ID (long)
-PICKLIST_FIELDS_USE_INTERNAL_NAME = {"requirementCurrency", "companyBusinessType", "country", "timezone", "companyIndustry"}
+PICKLIST_FIELDS_USE_INTERNAL_NAME = {"requirementCurrency", "companyBusinessType", "country", "timezone", "companyIndustry","companyCountry"}
 
 # ---------------------------------------------------------------------------
 # API call throttle: 100–500 ms random delay between subsequent calls per tool
@@ -697,434 +865,30 @@ async def handle_api_response(response: httpx.Response, operation: str) -> Dict[
 
 
 # ---------------------------------------------------------------------------
-# Deal System Instructions (added alongside Lead instructions)
-# ---------------------------------------------------------------------------
-
-DEAL_SYSTEM_INSTRUCTIONS = """
-# Kylas CRM MCP Server - Deal Operations
-
-### Create / Update
-Build `field_values` from user input only. For `update_deal`: pass deal ID from search results + fields to update.
-
-### Deal-Specific Field Formats
-- **Monetary fields** (`estimatedValue`, `actualValue`, `value`): must be `{"currencyId": <id>, "value": <number>}`. Never pass a plain number — API will reject it. (e.g. `"estimatedValue": {"currencyId": 431, "value": 32}`)
-- **Owner** (`ownedBy`): `{"id": <user_id>}` — resolve via `lookup_users`. (e.g. `"ownedBy": {"id": 7236}`)
-
-### Search / Filter
-- Use `search_entity("deal", filters)`. Only `filterable=true` fields (from cheat sheet) are allowed.
-- PICK_LIST exceptions (use internal name string, not Option ID): `currency`, `country`, `dealSource`.
-
-### Pipeline and Stage
-- Call `lookup_pipelines(entity_type="DEAL")` first. List pipelines and confirm with user (even if only one).
-- **Move to same-pipeline stage:** `update_deal(deal_id, {"pipelineStage": stage_id})`
-- **Move to different pipeline:** `update_deal(deal_id, {"pipeline": {...}, "forecastingType": "..."})` with full pipeline object including nested stage.
-- Closing reasons (Closed Lost/Unqualified): call `get_pipeline_details`, ask user to pick, then pass `pipelineStageReason`.
-- **Sequential stage flow:** If the pipeline has `sequentialStageFlow=true` (visible in `get_pipeline_details` output), stages cannot be skipped. The server handles this automatically — if a direct jump is blocked, it creates the deal in stage 1 and advances stage-by-stage. You do NOT need to do anything differently; just pass the desired target stage and the server will handle the sequential advancement transparently.
-
-### Idle / Stagnant Deals
-`search_idle_entities("deal", days)` — or `search_entity("deal", [...])` with `updatedAt ≤ threshold AND latestActivityCreatedAt ≤ threshold`.
-
-### Products on Deals
-Products are a key part of a deal. Always display them when showing deal details.
-
-**Adding products:** Before create/update, ask user for: product name (resolve via `lookup_products`), quantity, price per unit, currency, and optional discount. Do NOT add without confirming price, quantity, and currency first.
-```
-{"products": [{"id": <product_id>, "quantity": <qty>, "price": {"currencyId": <id>, "value": <price>}, "discount": {"value": <disc>, "type": "PERCENTAGE|FLAT"}}]}
-```
-Existing products preserved; new products merged (duplicates by ID skipped).
-
-**Finding deals by product:** Call `lookup_products(query)` to resolve the product name to an ID, then:
-```
-search_entity("deal", [{"field": "products", "operator": "equal", "value": <product_id>}])
-```
-"""
-
-# ---------------------------------------------------------------------------
-# Company System Instructions
-# ---------------------------------------------------------------------------
-
-COMPANY_SYSTEM_INSTRUCTIONS = """
-# Kylas CRM MCP Server - Company Operations
-
-### Create / Update
-Build `field_values` from user input only. No pipeline, pipelineStage, associatedContacts, or products fields.
-All common rules apply (phone, email, date, custom fields, ID lookups).
-
-### Search / Filter
-- Use `search_entity("company", filters)`. Only `filterable=true` fields (from cheat sheet) allowed.
-- PICK_LIST exception: `country` → use internal name (string), not Option ID.
-
-### Idle / Stagnant Companies
-`search_idle_entities("company", days)`.
-"""
-
-# ---------------------------------------------------------------------------
-# Meeting System Instructions
-# ---------------------------------------------------------------------------
-
-MEETING_SYSTEM_INSTRUCTIONS = """
-# Kylas CRM MCP Server - Meeting Operations
-
-### Create / Update
-Before creating, ask for:
-1. **Title** (required)
-2. **Start/end datetime** (required) — convert to UTC via `get_current_user` + `parse_datetime_to_utc_iso_tool`
-3. **Participants** (required) — resolve via `lookup_meeting_related_entity` with `entity_type="invitee"`; pick row with correct `entity` type
-   - **CRITICAL RULES FOR INVITEES**: 
-     - Only leads/contacts with a VALID EMAIL can be added as invitees. Check the `emails` array from the lookup result.
-     - Deals CANNOT be added as invitees. If the user asks to add a deal as an invitee, DO NOT add it to the `participants` payload, and inform them of this restriction.
-4. **Related entities** (optional) — resolve IDs first via entity lookup tools
-5. **Location**, **allDay** (optional)
-
-### Payload Format
-```json
-{
-  "title": "...", "from": "<UTC ISO>", "to": "<UTC ISO>", "allDay": false,
-  "timezone": {"id": 372, "name": "Asia/Calcutta"},
-  "participants": [{"id": <user_id>, "entity": "user|lead|contact|external"}],
-  "relatedTo": [{"id": <entity_id>, "entity": "lead|contact|deal|company"}],
-  "location": "Office", "description": "..."
-}
-```
-
-### Resolving Entity IDs
-- **Meeting Owner / Conductor (CRM Users / Sales Reps):** ALWAYS use `lookup_users` (never lookup contacts, leads, or companies for sales reps).
-- **Participants/organizer:** `lookup_meeting_related_entity` with `entity_type="invitee"` (pick row with right `entity` — organizer is usually `user`)
-- **relatedTo leads:** `lookup_meeting_related_entity` with `entity_type="lead"` → filter `associatedLeads`
-- **relatedTo contacts:** `lookup_meeting_related_entity` with `entity_type="contact"` → filter `associatedContacts`
-- **relatedTo deals:** `lookup_meeting_related_entity` with `entity_type="deal"` → filter `associatedDeals`
-- **relatedTo companies:** `lookup_meeting_related_entity` with `entity_type="company"` → filter `associatedCompanies`
-- Combine multiple rules with AND.
-
-### Search / Filter
-- By associated entity: resolve ID first via lookup tool, then `search_entity("meeting", filters)` with association filter.
-- Presence check: `is_not_null` / `is_null` with value null.
-- By owner: `lookup_users` to resolve the user ID first → `{"field": "owner", "operator": "equal", "value": <user_id>}`.
-- By organizer: `lookup_meeting_related_entity` with `entity_type="invitee"` → `{"field": "organizer", "operator": "equal", "value": <user_id>}`.
-- Status filter: use internal name — "scheduled", "conducted", "missed", "cancelled".
-- By date/time: Use `from` (start datetime), `to` (end datetime), or `conductedAt` (conducted datetime) fields. Do NOT use `scheduledAt`.
-- Sorting: Sort by `from` (e.g., `from,desc`) or `createdAt` (e.g., `createdAt,desc`). Do NOT sort by `scheduledAt`.
-
-### Cancel vs Delete
-- `cancel_meeting` — sets status to "cancelled" (reversible)
-- `delete_meeting` — permanent; confirm with user first.
-
-### Notes
-`add_note("MEETING", meeting_id, "note text")`
-"""
-
-# ---------------------------------------------------------------------------
-# Call Log System Instructions
-# ---------------------------------------------------------------------------
-
-CALL_LOG_SYSTEM_INSTRUCTIONS = """
-# Kylas CRM MCP Server - Call Log Operations
-
-### Create
-Before creating, ask for:
-1. **Entity** — which lead, contact, or deal? Search to get the ID.
-2. **Phone number**, **call type** (incoming/outgoing), **outcome** (connected/rejected/busy/no_answer/missed_call/in_progress), **start time** (convert to UTC).
-3. **Duration** (seconds) and **notes** — optional.
-
-### Payload — Lead or Contact
-```json
-{
-  "outcome": "connected", "callType": "outgoing",
-  "startTime": "<UTC ISO>", "phoneNumber": "9618488578", "duration": "420",
-  "relatedTo": {"id": <entity_id>, "entity": "lead|contact", "phoneNumber": "..."},
-  "notes": [{"description": "..."}]
-}
-```
-
-### Payload — Deal
-Same as above with `"entity": "deal"` in relatedTo. Optionally link a contact:
-```json
-"associatedTo": [{"id": <contact_id>, "entity": "contact", "phoneNumber": "..."}]
-```
-
-### Fetching Call Logs
-`get_call_logs(entity_id, entity_type)` — for a lead, contact, or deal.
-
-### Notes
-`add_note("CALL_LOG", call_log_id, "note text")`
-"""
-
-
-QUOTATION_SYSTEM_INSTRUCTIONS = """
-# Kylas CRM MCP Server - Quotation Operations (READ-ONLY)
-
-A quotation is a priced proposal, usually linked to a deal, made up of line-item products with
-tax/discount and billing/shipping addresses.
-
-Quotations are READ-ONLY here. You can search, view, and report on them — you CANNOT create,
-update, or delete quotations through this server. If the user asks to create/edit a quotation, tell
-them it must be done in the Kylas web app; do not attempt it via create_entity/update_entity
-(those tools do not accept entity_type "quotation").
-
-Available quotation tools (same read surface as lead, minus create/update):
-- `get_quotation_field_instructions` — field cheat sheet (call once per session before filtering).
-- `search_entity("quotation", filters)` — list/filter quotations by field criteria.
-- `search_entity_by_term("quotation", term)` — free-text search across summary, quotation number, and associated deal/company/contact/product names.
-- `search_idle_entities("quotation", days)` — quotations not updated for N days (based on updatedAt; quotations have no activity feed).
-- `get_quotation(quotation_id)` — full details of one quotation (products, totals, deal, company, contacts).
-
-### Field instructions FIRST
-Call `get_quotation_field_instructions` the first time you touch quotations in a session to get
-the field cheat sheet (standard + custom fields, filterable flags, picklist Option IDs).
-
-### Search / Filter
-- Use `search_entity("quotation", filters)`. Only `filterable=true` fields (from the cheat sheet) are allowed.
-- Common filters: `quotationNumber`, `summary`, `status`, `grandTotal`, `associatedDeal`, `updatedAt`.
-- To get all quotations: `[{"field": "summary", "operator": "is_not_empty"}]` (summary is required so this matches all), or an `updatedAt >= last 90 days` filter. Note: the `id` field (type ID) does NOT support is_not_null.
-- Sorting: only sortable fields are accepted; if unsure, omit sort (server defaults to updatedAt,desc).
-
-### Reporting
-When showing multiple quotations, summarize by status or associated deal and total the grand totals
-where useful (values are in the quotation's currency). Use `get_quotation(id)` to drill into one record.
-"""
-
-
-# ---------------------------------------------------------------------------
-# Diagnosis & Reporting Instructions
-# ---------------------------------------------------------------------------
-
-DIAGNOSIS_AND_REPORTING_INSTRUCTIONS = """
-# Intelligent Diagnosis & Reporting
-
----
-
-## AUTOMATIC DIAGNOSIS — always append after displaying any entity
-
-After showing a deal, lead, or task, **always** append a diagnosis block in this exact format:
-
-```
-── Diagnosis ──────────────────────────────────────────
-🔴 <critical issue>
-🟡 <warning>
-🟢 <healthy signal>
-💡 Suggested: <next step>
-───────────────────────────────────────────────────────
-```
-
-Only include lines that apply. Skip severity levels that have no signals. Always include at least one 💡 line.
-
-### Deal diagnosis signals
-| Severity | Condition | Message |
-|----------|-----------|---------|
-| 🔴 | `closingDate` is in the past | "Closing date passed X days ago — update or move to Closed Lost" |
-| 🔴 | No `associatedContacts` | "No contacts linked — can't track communication" |
-| 🟡 | No activity for > 14 days (from `updatedAt` or `latestActivityCreatedAt`) | "No activity in X days" |
-| 🟡 | `products` list is empty | "No products attached" |
-| 🟡 | `value` is 0 or null | "Deal value not set" |
-| 🟡 | `closingDate` within 7 days but pipeline stage is first or second stage | "Closing soon but still in early stage" |
-| 🟢 | Products attached | "X product(s) attached — total ₹Y" |
-| 🟢 | Closing date is in the future | "Closing in X days" |
-
-💡 suggestions for deals:
-- Overdue closing → "Reschedule closing date or mark as Closed Lost"
-- No products → "Add products to complete the deal"
-- No contacts → "Link a contact to enable follow-ups"
-- Idle → "Schedule a follow-up call or meeting"
-- Closing soon in early stage → "Accelerate through pipeline stages"
-
-### Lead diagnosis signals
-| Severity | Condition | Message |
-|----------|-----------|---------|
-| 🔴 | No activity for > 30 days | "Stagnant for X days — at risk of going cold" |
-| 🟡 | No associated contact or company | "No contact or company linked" |
-| 🟡 | No products | "No products associated" |
-| 🟡 | No owner assigned | "Unassigned — no owner set" |
-| 🟢 | Active within 7 days | "Recently active" |
-
-💡 suggestions for leads:
-- Stagnant → "Follow up immediately or reassign to another owner"
-- No contact → "Create or link a contact for this lead"
-- Unassigned → "Assign to a sales rep"
-
-### Task diagnosis signals
-| Severity | Condition | Message |
-|----------|-----------|---------|
-| 🔴 | Due date is in the past | "Overdue by X days" |
-| 🟡 | No associated entity | "Not linked to any lead, deal, or contact" |
-| 🟢 | Due date is in the future | "Due in X days" |
-
-💡 suggestions for tasks:
-- Overdue → "Complete, reschedule, or reassign this task"
-- No link → "Associate with a lead or deal for context"
-
----
-
-## REPORT FORMATTING — apply whenever presenting 3+ entities or a summary
-
-### Structure every report like this:
-1. **TL;DR** — one sentence capturing the most important signal (e.g. "3 deals are overdue, totalling ₹8.4L at risk")
-2. **Body** — table or grouped list (see below)
-3. **Key Takeaways** — 3–5 bullets, the most actionable insights only
-
-### Tables over lists
-Use a markdown table whenever showing 3+ entities. Columns: the most relevant 4–5 fields only. Never dump all fields.
-
-Example deals table:
-| Deal | Stage | Value | Closing | Last Activity |
-|------|-------|-------|---------|---------------|
-| Acme Corp | Proposal | ₹2.5L | 3 days ago ⚠️ | 10 days ago |
-
-### Grouping
-For 5+ results, group by the most meaningful dimension:
-- Deals → by pipeline stage or owner
-- Leads → by source or owner
-- Tasks → by due status (Overdue / Due soon / Upcoming)
-
-### Number formatting
-- Currency: use ₹ symbol with K/L/Cr suffixes (₹45K, ₹1.2L, ₹3.5Cr) — never raw numbers like 1200000
-- Dates: show relative ("3 days ago", "in 2 weeks") with absolute in parentheses where precision matters
-- Counts: "3 of 12 deals" not just "3"
-
-### Language
-- Use plain English, not field names (say "closing date" not `closingDate`, "owner" not `ownedBy`)
-- Highlight risks with ⚠️, wins with ✅, neutral info without icons
-- Never show raw IDs in report output — use names
-
-### Key Takeaways block format
-```
-Key Takeaways:
-• [Most urgent action]
-• [Biggest risk or opportunity]
-• [Notable pattern or trend]
-```
-"""
-
-# ---------------------------------------------------------------------------
 # MCP Server
+#
+# All the old per-entity instruction blocks (DEAL_/COMPANY_/MEETING_/
+# CALL_LOG_/QUOTATION_SYSTEM_INSTRUCTIONS, and DIAGNOSIS_AND_REPORTING_
+# INSTRUCTIONS' entity-specific diagnosis tables) were deleted from here —
+# not archived elsewhere as dead code, actually deleted — once their content
+# was verified to already live in registry/*.yaml's usage_notes (verbatim,
+# real request-shape guidance) or, for the deal/lead/task diagnosis tables
+# specifically, moved into deal.yaml/lead.yaml/task.yaml's own .get
+# usage_notes. The only pieces that were genuinely generic (not
+# entity-specific) — the DEFAULT DATE RANGE rule and the REPORT FORMATTING
+# section — were folded into SYSTEM_INSTRUCTIONS above instead, since those
+# apply across every bucket, not to one. SYSTEM_INSTRUCTIONS is now the
+# server's one and only instructions text — see mcp = FastMCP(...) below.
 # ---------------------------------------------------------------------------
-
-_base_instructions = (
-    SYSTEM_INSTRUCTIONS + "\n\n" + DEAL_SYSTEM_INSTRUCTIONS + "\n\n" +
-    COMPANY_SYSTEM_INSTRUCTIONS + "\n\n" + MEETING_SYSTEM_INSTRUCTIONS + "\n\n" +
-    CALL_LOG_SYSTEM_INSTRUCTIONS + "\n\n" + QUOTATION_SYSTEM_INSTRUCTIONS + "\n\n" +
-    DIAGNOSIS_AND_REPORTING_INSTRUCTIONS
-)
-
-
-def _build_instructions() -> str:
-    """Build final instructions with entity label mapping injected once."""
-    label_block = _format_entity_labels_for_instructions(_ENTITY_LABELS)
-    return _base_instructions.replace("{ENTITY_LABEL_MAPPING}", label_block)
-
-
-def _format_label_summary() -> str:
-    """One-line summary of entity labels for tool description."""
-    if not _ENTITY_LABELS:
-        return ""
-    parts = []
-    for entity_type in sorted(_ENTITY_LABELS.keys()):
-        label_data = _ENTITY_LABELS[entity_type]
-        display_name = label_data.get("displayName", entity_type)
-        display_plural = label_data.get("displayNamePlural", entity_type)
-        std_type = entity_type.lower()
-        parts.append(f'"{display_name}"/"{display_plural}"={std_type}')
-    return ", ".join(parts)
-
-
-def _update_tool_description(app: FastMCP) -> None:
-    """Patch get_entity_labels tool description with live label data so Claude sees it in the tool list."""
-    tool = app.local_provider._components.get("get_entity_labels")
-    if not tool:
-        return
-    summary = _format_label_summary()
-    if summary:
-        tool.description = (
-            f"REQUIRED: Call this ONCE per session before any other action.\n"
-            f"THIS TENANT'S ENTITY NAMES: {summary}\n"
-            f"Returns the full mapping. Use standard types (right of =) in all tool calls."
-        )
-        logger.info(f"Updated get_entity_labels tool description: {summary}")
-
-
-# Maps entity type keys to tool name substrings for description patching
-_ENTITY_TOOL_SUBSTRINGS: Dict[str, str] = {
-    "CONTACT": "contact",
-    "LEAD": "lead",
-    "DEAL": "deal",
-    "TASK": "task",
-    "COMPANY": "company",
-    "MEETING": "meeting",
-    "CALL_LOG": "call_log",
-}
-
-# Stores original tool descriptions so refreshes don't stack the prefix
-_ORIGINAL_TOOL_DESCRIPTIONS: Dict[str, str] = {}
-
-_ENTITY_LABELS_RESOURCE_URI = "kylas://entity-labels"
-
-
-def _patch_entity_tool_descriptions(app: FastMCP) -> None:
-    """
-    Prepend a one-line resource reference to each entity tool's description.
-    Claude reads tool descriptions before deciding which tool to call; seeing the
-    resource URI there prompts it to read kylas://entity-labels for name resolution.
-    """
-    if not _ENTITY_LABELS:
-        return
-    for entity_type, substring in _ENTITY_TOOL_SUBSTRINGS.items():
-        label_data = _ENTITY_LABELS.get(entity_type)
-        if not label_data:
-            continue
-        display_name = label_data.get("displayName", "")
-        display_plural = label_data.get("displayNamePlural", "")
-        std_type = entity_type.lower()
-        prefix = (
-            f'[Tenant entity name: "{display_name}" / "{display_plural}" = {std_type}. '
-            f"If user uses a custom name, read resource `{_ENTITY_LABELS_RESOURCE_URI}` to resolve it.]\n"
-        )
-        for tool_name, tool in app.local_provider._components.items():
-            if substring in tool_name.lower() and tool_name != "get_entity_labels":
-                if tool_name not in _ORIGINAL_TOOL_DESCRIPTIONS:
-                    _ORIGINAL_TOOL_DESCRIPTIONS[tool_name] = tool.description
-                tool.description = prefix + _ORIGINAL_TOOL_DESCRIPTIONS[tool_name]
-    logger.info("Patched entity tool descriptions with resource reference")
-
-
-_entity_labels_lock = asyncio.Lock()
-
-
-class _EnsureEntityLabelsMiddleware(Middleware):
-    """Lazily load entity labels on the first tool call that arrives with a valid API key."""
-
-    async def on_call_tool(self, context: MiddlewareContext, call_next):
-        if not _ENTITY_LABELS:
-            async with _entity_labels_lock:
-                # Double-check inside lock — another request may have loaded them first
-                if not _ENTITY_LABELS:
-                    await _load_entity_labels()
-                    if _ENTITY_LABELS:
-                        mcp._mcp_server.instructions = _build_instructions()
-                        _update_tool_description(mcp)
-                        _patch_entity_tool_descriptions(mcp)
-                        logger.info("Lazily loaded entity labels on first request")
-        return await call_next(context)
 
 
 @asynccontextmanager
 async def _app_lifespan(app: FastMCP):
-    """Startup: attempt eager label load (works if KYLAS_API_KEY env var set), else labels load lazily on first request."""
-    await _load_entity_labels()
-    if _ENTITY_LABELS:
-        app._mcp_server.instructions = _build_instructions()
-        _update_tool_description(app)
-        _patch_entity_tool_descriptions(app)
-        logger.info("🚀 Updated MCP server instructions with entity labels")
-    else:
-        logger.info("Entity labels not loaded at startup — will load lazily on first request")
-    refresh_task = asyncio.create_task(_label_refresh_loop(interval_seconds=1800))
+    """Startup/shutdown. Entity labels are fetched live per-request (see
+    _fetch_entity_labels) — nothing to warm or refresh here."""
     try:
         yield {}
     finally:
-        refresh_task.cancel()
-        try:
-            await refresh_task
-        except asyncio.CancelledError:
-            pass
         # Release the pooled HTTP client held by the token verifier.
         if _kylas_token_verifier is not None:
             try:
@@ -1146,15 +910,20 @@ auth_provider, _kylas_token_verifier = create_kylas_auth(
 )
 
 
-mcp = FastMCP("Kylas CRM", instructions=_base_instructions, lifespan=_app_lifespan, auth=auth_provider)
-mcp.add_middleware(_EnsureEntityLabelsMiddleware())
+mcp = FastMCP("Kylas CRM", instructions=SYSTEM_INSTRUCTIONS, lifespan=_app_lifespan, auth=auth_provider)
 
 
 # ---------------------------------------------------------------------------
 # Tool 1: Get Lead Field Instructions (call FIRST)
 # ---------------------------------------------------------------------------
 
-def _format_field(field: Dict[str, Any], include_filterable: bool = False) -> List[str]:
+def _format_field(
+    field: Dict[str, Any],
+    include_filterable: bool = False,
+    large_fields: Optional[set] = None,
+    requested_picklists: Optional[set] = None,
+    internal_name_fields: Optional[set] = None,
+) -> List[str]:
     lines = []
     label = field.get("displayName") or field.get("label") or "Unknown"
     name = field.get("name", "")
@@ -1176,18 +945,19 @@ def _format_field(field: Dict[str, Any], include_filterable: bool = False) -> Li
         # Deals use "picklistValues", Leads use "values"
         values = picklist.get("values") or picklist.get("picklistValues", [])
         if values:
-            use_name = name in PICKLIST_FIELDS_USE_INTERNAL_NAME
-            lines.append("  └─ Options (use internal name in search)" if use_name else "  └─ Options (use ID in search):")
-            for val in values:
-                if not isinstance(val, dict):
-                    continue
-                val_label = val.get("displayName") or val.get("label") or val.get("name") or "Unknown"
-                val_id = val.get("id", "")
-                val_name = val.get("name", "")
-                if use_name and val_name:
-                    lines.append(f"     • {val_label} (internal name: '{val_name}')")
-                else:
-                    lines.append(f"     • {val_label} (ID: {val_id})")
+            if name.strip().lower() in (large_fields or set()) and name.strip().lower() not in (requested_picklists or set()):
+                lines.append(f"  └─ {len(values)} options omitted to keep this reference compact.")
+                lines.append(f"     Call build_payload(id, fields=[\"{name}\"]) to get them. Do NOT guess an option id or name.")
+            else:
+                use_name = name in (internal_name_fields or set())
+                lines.append("  └─ Options (use internal name in search)" if use_name else "  └─ Options (use ID in search):")
+                for val in values:
+                    if not isinstance(val, dict):
+                        continue
+                    val_label = val.get("displayName") or val.get("label") or val.get("name") or "Unknown"
+                    val_id = val.get("id", "")
+                    val_name = val.get("name", "")
+                    lines.append(f"     • {val_label} (internal name: '{val_name}'),(ID: {val_id})")
     return lines
 
 
@@ -1224,11 +994,32 @@ def _get_filterable_fields_map(fields: List[Dict[str, Any]]) -> Dict[str, Dict[s
     }
 
 
-def _rule_type_for_value(field_type: str, field_name: str, value: Any) -> str:
-    """Return jsonRule rule 'type' (string, long, or date) for the given field type and value."""
+def _rule_type_for_value(
+    field_type: str,
+    field_name: str,
+    value: Any,
+    internal_name_fields: Optional[set] = None,
+) -> str:
+    """Return jsonRule rule 'type' (string, long, or date) for the given field type and value.
+
+    internal_name_fields: this bucket's set of picklist fields that take the
+    option's internal name (string) instead of its numeric id — from
+    _BUCKET_PICKLIST_RULES[bucket]["internal_name"]. Defaults to the lead/
+    contact set for backward compatibility with callers that don't pass it.
+    """
     if field_type in ("PICK_LIST", "MULTI_PICKLIST"):
-        return "string" if field_name in PICKLIST_FIELDS_USE_INTERNAL_NAME else "long"
+        allowed_internal_names = (
+            internal_name_fields if internal_name_fields is not None else PICKLIST_FIELDS_USE_INTERNAL_NAME
+        )
+        return "string" if field_name in allowed_internal_names else "long"
     if field_type == "NUMBER":
+        return "double"
+    # MONEY (deal estimatedValue/actualValue, company annualRevenue, quotation
+    # subTotal/grandTotal) is an ordered numeric field: OPERATOR_MAPPING gives it
+    # greater/less/between, but without this branch it fell through to "string"
+    # below and the API rejected every one of those with 003014 "Invalid string
+    # operation". "double", not "long" — money carries decimals.
+    if field_type == "MONEY":
         return "double"
     # User look-up fields: createdBy, updatedBy, convertedBy, ownerId, importedBy — value is user ID (long)
     if field_type in ("LOOK_UP", "ENTITY_FIELDS", "MEETING_ORGANIZER"):
@@ -1245,11 +1036,14 @@ def _build_search_json_rule(
     filters: List[Dict[str, Any]],
     filterable_map: Dict[str, Dict[str, Any]],
     default_timezone: Optional[str] = None,
+    internal_name_fields: Optional[set] = None,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """
     Build jsonRule for POST /search/lead. Returns (jsonRule, error_message).
     Each filter: { "field": "<name>", "operator": "<op>", "value": <val>, "type": "<FIELD_TYPE>" }.
     default_timezone: used for date/datetime rules when filter has no timeZone (e.g. from get_current_user).
+    internal_name_fields: this bucket's _BUCKET_PICKLIST_RULES[...]["internal_name"]
+    set, forwarded to _rule_type_for_value for PICK_LIST/MULTI_PICKLIST fields.
     """
     tz_for_date = default_timezone or DEFAULT_TIMEZONE
     rules = []
@@ -1264,14 +1058,14 @@ def _build_search_json_rule(
         if not field_name:
             return {}, f"Filter #{i + 1}: missing 'field'."
         if field_name not in filterable_map:
-            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only [FILTERABLE] fields from get_lead_field_instructions."
+            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only a field listed as [FILTERABLE] in this endpoint's build_payload response (tenant_filterable_fields)."
         meta = filterable_map[field_name]
         api_type = meta.get("type", "TEXT_FIELD")
         allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
         if operator not in allowed:
             return {}, f"Filter #{i + 1}: operator '{operator}' not allowed for field '{field_name}' (type {api_type}). Allowed: {', '.join(allowed)}."
 
-        rule_type = _rule_type_for_value(api_type, field_name, value)
+        rule_type = _rule_type_for_value(api_type, field_name, value, internal_name_fields)
         if rule_type in ("long", "double") and value is not None and not isinstance(value, (int, float)):
             try:
                 value = float(value) if rule_type == "double" else int(value)
@@ -1309,10 +1103,15 @@ def _build_search_json_rule(
     return {"rules": rules, "condition": "AND", "valid": True}, None
 
 
-async def get_lead_field_instructions_logic() -> str:
-    fields = await _fetch_lead_fields()
+async def get_lead_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_lead_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("lead", {}).get("large", set())}
+    internal_name_fields = _BUCKET_PICKLIST_RULES.get("lead", {}).get("internal_name", set())
     lines = [
         "=" * 60,
         "KYLAS CRM - LEAD FIELDS CHEAT SHEET",
@@ -1322,11 +1121,11 @@ async def get_lead_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -1340,18 +1139,19 @@ async def get_entity_labels() -> str:
     Without this, you will fail to recognize entity requests from users.
     After calling this, when the user mentions a custom name, map it to the standard type for all tool calls.
     """
-    if not _ENTITY_LABELS:
+    labels = await _fetch_entity_labels()
+    if not labels:
         return "No custom entity labels configured for this tenant. Standard names apply: lead, contact, deal, task, company, meeting, call_log."
     lines = ["# Entity Label Mapping — Custom Names for This Tenant\n"]
     lines.append("When the user says one of the custom names below, use the corresponding STANDARD TYPE in all tool calls.\n")
-    for entity_type in sorted(_ENTITY_LABELS.keys()):
-        label_data = _ENTITY_LABELS[entity_type]
+    for entity_type in sorted(labels.keys()):
+        label_data = labels[entity_type]
         display_name = label_data.get("displayName", entity_type)
         display_plural = label_data.get("displayNamePlural", entity_type)
         std_type = entity_type.lower()
         lines.append(f'- User says "{display_name}" or "{display_plural}" → use standard type: "{std_type}"')
-    lines.append('\n**Example:** User says "get animals" → map "animals" to "contact" → call search_contacts(...)')
-    lines.append('**Example:** User says "show cars" → map "cars" to "deal" → call search_deals(...)')
+    lines.append('\n**Example:** User says "get animals" → map "animals" to "contact" → use "contact.search" (list_tool -> build_payload -> execute_request)')
+    lines.append('**Example:** User says "show cars" → map "cars" to "deal" → use "deal.search" (list_tool -> build_payload -> execute_request)')
     return "\n".join(lines)
 
 
@@ -1365,15 +1165,16 @@ async def get_entity_labels() -> str:
     ),
     mime_type="text/plain",
 )
-def entity_labels_resource() -> str:
+async def entity_labels_resource() -> str:
     """Serve current entity label mapping as a readable resource."""
-    if not _ENTITY_LABELS:
+    labels = await _fetch_entity_labels()
+    if not labels:
         return "No custom entity labels. Standard names apply: lead, contact, deal, task, company, meeting, call_log."
     lines = ["# Entity Label Mapping — Tenant-Specific Custom Names", ""]
     lines.append("When the user says a custom name, use the STANDARD TYPE (right of →) in all tool calls.")
     lines.append("")
-    for entity_type in sorted(_ENTITY_LABELS.keys()):
-        label_data = _ENTITY_LABELS[entity_type]
+    for entity_type in sorted(labels.keys()):
+        label_data = labels[entity_type]
         display_name = label_data.get("displayName", entity_type)
         display_plural = label_data.get("displayNamePlural", entity_type)
         std_type = entity_type.lower()
@@ -1381,8 +1182,8 @@ def entity_labels_resource() -> str:
     lines.extend([
         "",
         "Examples:",
-        '  User says "get animals" → standard type is "contact" → call search_contacts(...)',
-        '  User says "show cars"   → standard type is "deal"    → call search_deals(...)',
+        '  User says "get animals" → standard type is "contact" → use "contact.search" (list_tool -> build_payload -> execute_request)',
+        '  User says "show cars"   → standard type is "deal"    → use "deal.search" (list_tool -> build_payload -> execute_request)',
     ])
     return "\n".join(lines)
 
@@ -1421,21 +1222,31 @@ async def _fetch_current_user() -> Dict[str, Any]:
 async def get_current_user() -> str:
     """
     Get the current authenticated user's profile from Kylas (GET /users/me).
-    Call this whenever a date or datetime-related query is involved.
-    Returns timezone (IANA, e.g. Asia/Calcutta), recordActions (call, email, sms, etc.), name, and other profile fields.
-    - For filtering (search_leads, search_idle_leads): use the returned timezone as the timeZone in date/datetime filters; keep the user's date/datetime as-is (do not convert to UTC).
-    - For create_lead: when the user provides a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone, convert to UTC using parse_datetime_to_utc_iso, and send the UTC ISO string in field_values.
+
+    MANDATORY: call this ONCE at the start of every session, before any other
+    tool, alongside get_entity_labels(). Then REUSE the result for the rest of
+    the session — do not call it again before individual date operations; the
+    answer does not change mid-session. Call again only if that first result is
+    no longer visible to you.
+
+    Returns id, timezone (IANA, e.g. Asia/Kolkata), recordActions (call, email, sms, etc.), name, and other profile fields.
+    - Displaying ANY date: every timestamp from every tool is UTC. Convert it to this timezone before showing it, and say which zone (e.g. "11 Sep 2026, 1:30 AM (Asia/Kolkata)"). Never show the user a raw UTC timestamp or a bare epoch number.
+    - For filtering (*.search, *.search_idle): pass this timezone as timeZone in date/datetime filters and keep the user's date/datetime as-is — do NOT convert filter values to UTC, the server does that itself.
+    - For create/update (*.create, *.update): when the user gives a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone and convert it to UTC by resolving datetime.parse_to_utc (list_tool -> build_payload -> execute_request) with {local_datetime, timezone}, then put the returned UTC ISO string in the payload.
+    - For ownerId/createdBy referring to the current user (e.g. "assign to me", "create a lead owned by me"): use the returned id directly — do NOT call user.lookup/lookup_users to resolve yourself by name.
     """
     try:
         _reset_api_call_count()
         logger.info("Fetching current user (users/me)")
         user = await _fetch_current_user()
+        user_id = user.get("id")
         tz = user.get("timezone") or "UTC"
         name = user.get("name") or f"{user.get('firstName', '')} {user.get('lastName', '')}".strip() or "—"
         lines = [
             "=" * 50,
             "CURRENT USER (GET /users/me)",
             "=" * 50,
+            f"ID: {user_id}",
             f"Name: {name}",
             f"Timezone: {tz}",
             "",
@@ -1449,6 +1260,7 @@ async def get_current_user() -> str:
             "Use this timezone for:",
             "  - Date/datetime filters in search_leads: pass timeZone in each date filter; do not convert filter values to UTC.",
             "  - create_lead with datetime fields: convert user's local datetime to UTC with parse_datetime_to_utc_iso, then send UTC ISO in field_values.",
+            f"Use this ID ({user_id}) directly for ownerId/createdBy when the action refers to the current user — no need for a separate user.lookup call.",
             "=" * 50,
         ])
         return "\n".join(lines)
@@ -1643,7 +1455,7 @@ async def lookup_pipelines_logic(
         name = p.get("name", p.get("displayName", "—"))
         lines.append(f"  • ID: {pid}  |  Name: {name}")
     lines.append("-" * 50)
-    lines.append("Ask the user to confirm which pipeline to use (list id and name). Do NOT call get_pipeline_stages until the user has confirmed. After confirmation, call get_pipeline_stages with that pipeline ID only, then search or update with pipeline + pipelineStage filters.")
+    lines.append("Ask the user to confirm which pipeline to use (list id and name). Do NOT resolve pipeline.details until the user has confirmed. After confirmation, resolve pipeline.details (list_tool -> build_payload -> execute_request; not a standalone tool) with that pipeline ID only, then search or update with pipeline + pipelineStage filters.")
     return "\n".join(lines)
 
 
@@ -1791,7 +1603,7 @@ async def get_pipeline_details_logic(pipeline_id: int) -> str:
     else:
         lines.append("  (none configured)")
     lines.append("")
-    lines.append("When updating lead to Closed Lost or Closed Unqualified, ask the user to pick one reason from the list above, then call update_lead with pipelineStageReason set to that exact string.")
+    lines.append("When updating a lead or deal to Closed Lost or Closed Unqualified, ask the user to pick one reason from the list above, then resolve lead.update or deal.update (list_tool -> build_payload -> execute_request; not a standalone tool) with pipelineStageReason set to that exact string.")
     return "\n".join(lines)
 
 
@@ -2239,8 +2051,8 @@ def _format_lead_for_display(lead: Dict[str, Any]) -> str:
         lines.append(f"Pipeline: {pipeline}")
     lines.append(f"Pipeline Stage Reason: {lead.get('pipelineStageReason') or '—'}")
     lines.append(f"Owner ID: {lead.get('ownerId', '—')}")
-    lines.append(f"Created At: {lead.get('createdAt', '—')}")
-    lines.append(f"Updated At: {lead.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(lead.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(lead.get('updatedAt', '—'))}")
     # Custom fields
     custom = lead.get("customFieldValues") or {}
     if custom:
@@ -2320,7 +2132,10 @@ async def search_leads_logic(
             except Exception:
                 default_tz = DEFAULT_TIMEZONE
             break
-    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    json_rule, err = _build_search_json_rule(
+        filters, filterable_map, default_timezone=default_tz,
+        internal_name_fields=_BUCKET_PICKLIST_RULES.get("lead", {}).get("internal_name", set()),
+    )
     if err:
         return f"Invalid filters: {err}"
     payload = {
@@ -2448,7 +2263,7 @@ async def search_idle_leads_logic(
         if name in filterable_map:
             filters.append({"field": name, **base})
     if not filters:
-        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_lead_field_instructions."
+        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check build_payload(\"lead.search\")'s tenant_filterable_fields."
     return await search_leads_logic(filters, page=page, size=size, sort=sort)
 
 
@@ -2552,8 +2367,8 @@ def _format_contact_for_display(contact: Dict[str, Any]) -> str:
     else:
         lines.append("Phone: —")
     lines.append(f"Owner ID: {contact.get('ownerId', '—')}")
-    lines.append(f"Created At: {contact.get('createdAt', '—')}")
-    lines.append(f"Updated At: {contact.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(contact.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(contact.get('updatedAt', '—'))}")
     ad = contact.get("associatedDeals") or []
     if ad:
         lines.append(f"Associated deal IDs: {ad}")
@@ -2568,6 +2383,19 @@ def _format_contact_for_display(contact: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+async def get_contact_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_contact_fields()
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("contact", {}).get("large", set())}
+    internal_name_fields = _BUCKET_PICKLIST_RULES.get("contact", {}).get("internal_name", set())
+    lines = ["# Contact Field Reference", ""]
+    for field in fields:
+        lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def get_contact_field_instructions() -> str:
     """
@@ -2576,11 +2404,7 @@ async def get_contact_field_instructions() -> str:
     """
     try:
         _reset_api_call_count()
-        fields = await _fetch_contact_fields()
-        lines = ["# Contact Field Reference", ""]
-        for field in fields:
-            lines.extend(_format_field(field, include_filterable=True))
-        return "\n".join(lines)
+        return await get_contact_field_instructions_logic()
     except KylasAPIError as e:
         return f"✗ Failed to fetch fields: {e.message}"
     except Exception as e:
@@ -2638,7 +2462,10 @@ async def search_contacts_logic(
             except Exception:
                 default_tz = DEFAULT_TIMEZONE
             break
-    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    json_rule, err = _build_search_json_rule(
+        filters, filterable_map, default_timezone=default_tz,
+        internal_name_fields=_BUCKET_PICKLIST_RULES.get("contact", {}).get("internal_name", set()),
+    )
     if err:
         return f"Invalid filters: {err}"
     payload = {
@@ -2754,6 +2581,9 @@ async def lookup_companies_for_task(search_term: str = "") -> Dict[str, Any]:
         return await handle_api_response(response, "Lookup companies for task")
 
 
+TASK_PICKLIST_FIELDS_USE_INTERNAL_NAME = {"reminder"}
+
+
 async def _fetch_task_fields() -> List[Dict[str, Any]]:
     """Fetch task field metadata from Kylas API."""
     async with get_client() as client:
@@ -2827,11 +2657,11 @@ def _format_task_for_display(task: Dict[str, Any]) -> str:
     lines.append(f"Description: {task.get('description') or '—'}")
     lines.append(f"Status: {task.get('status') or '—'}")
     lines.append(f"Priority: {task.get('priority') or '—'}")
-    lines.append(f"Due Date: {task.get('dueDate') or '—'}")
+    lines.append(f"Due Date: {_epoch_to_iso_utc(task.get('dueDate')) or '—'}")
     lines.append(f"Assigned To: {task.get('assignedTo') or '—'}")
     lines.append(f"Reminder: {task.get('reminder') or '—'}")
-    lines.append(f"Created At: {task.get('createdAt', '—')}")
-    lines.append(f"Updated At: {task.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(task.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(task.get('updatedAt', '—'))}")
     # Custom fields
     custom = task.get("customFieldValues") or {}
     if custom:
@@ -2843,6 +2673,19 @@ def _format_task_for_display(task: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+async def get_task_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_task_fields()
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("task", {}).get("large", set())}
+    internal_name_fields = _BUCKET_PICKLIST_RULES.get("task", {}).get("internal_name", set())
+    lines = ["# Task Field Reference", ""]
+    for field in fields:
+        lines.extend(_format_field(field, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
+    return "\n".join(lines)
+
+
 @mcp.tool()
 async def get_task_field_instructions() -> str:
     """
@@ -2851,11 +2694,7 @@ async def get_task_field_instructions() -> str:
     """
     try:
         _reset_api_call_count()
-        fields = await _fetch_task_fields()
-        lines = ["# Task Field Reference", ""]
-        for field in fields:
-            lines.extend(_format_field(field, include_filterable=True))
-        return "\n".join(lines)
+        return await get_task_field_instructions_logic()
     except KylasAPIError as e:
         return f"✗ Failed to fetch fields: {e.message}"
     except Exception as e:
@@ -2864,14 +2703,28 @@ async def get_task_field_instructions() -> str:
 
 
 
+async def get_task_logic(task_id: int) -> Dict[str, Any]:
+    """Fetch a single task by ID (GET /tasks/{id}). Returns full task object.
+
+    Extracted from the real, registered get_task tool below (which used to
+    inline this GET directly, unlike get_lead/get_contact/get_meeting/
+    get_deal/get_company, which already had their own _logic helper) so the
+    generic get_entity_logic dispatch in main.py has a real function to call
+    for entity_type "task" — same reasoning as every other *_logic split in
+    this file: exactly one real implementation, not two.
+    """
+    task_id = int(task_id)
+    async with get_client() as client:
+        response = await client.get(f"/tasks/{task_id}")
+        return await handle_api_response(response, "Get task")
+
+
 @mcp.tool()
 async def get_task(task_id: int) -> str:
     """Get full details of a task by ID."""
     try:
         _reset_api_call_count()
-        async with get_client() as client:
-            response = await client.get(f"/tasks/{task_id}")
-            task = await handle_api_response(response, "Get task")
+        task = await get_task_logic(task_id)
         return _format_task_for_display(task)
     except KylasAPIError as e:
         return f"✗ Failed to get task: {e.message}\n  Details: {e.response_body}"
@@ -2906,7 +2759,10 @@ async def search_tasks_logic(
             except Exception:
                 default_tz = DEFAULT_TIMEZONE
             break
-    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    json_rule, err = _build_search_json_rule(
+        filters, filterable_map, default_timezone=default_tz,
+        internal_name_fields=_BUCKET_PICKLIST_RULES.get("task", {}).get("internal_name", set()),
+    )
     if err:
         return f"Invalid filters: {err}"
     payload = {
@@ -2932,7 +2788,7 @@ async def search_tasks_logic(
         name = task.get("name", "—")
         status = task.get("status", "—")
         priority = task.get("priority", "—")
-        due_date = task.get("dueDate", "—")
+        due_date = _epoch_to_iso_utc(task.get("dueDate", "—"))
         lines.append(f"• ID: {tid} | Name: {name} | Status: {status} | Priority: {priority} | Due: {due_date}")
     lines.append("-" * 60)
     return "\n".join(lines)
@@ -2985,10 +2841,11 @@ async def lookup_entity_for_task(entity_type: str, search_term: str = "") -> str
         _reset_api_call_count()
         etype = entity_type.lower().strip()
 
-        lead_label = _ENTITY_LABELS.get("lead", {}).get("displayName", "Lead")
-        contact_label = _ENTITY_LABELS.get("contact", {}).get("displayName", "Contact")
-        deal_label = _ENTITY_LABELS.get("deal", {}).get("displayName", "Deal")
-        company_label = _ENTITY_LABELS.get("company", {}).get("displayName", "Company")
+        labels = await _fetch_entity_labels()
+        lead_label = labels.get("lead", {}).get("displayName", "Lead")
+        contact_label = labels.get("contact", {}).get("displayName", "Contact")
+        deal_label = labels.get("deal", {}).get("displayName", "Deal")
+        company_label = labels.get("company", {}).get("displayName", "Company")
 
         if etype == "lead":
             result = await lookup_leads_for_task(search_term)
@@ -3048,6 +2905,7 @@ async def _fetch_raw_tasks_for_relation(
     json_rule, err = _build_search_json_rule(
         [{"field": relation_field, "operator": "is_not_null", "value": None}],
         filterable_map,
+        internal_name_fields=_BUCKET_PICKLIST_RULES.get("task", {}).get("internal_name", set()),
     )
     if err:
         logger.warning("_fetch_raw_tasks_for_relation(%s): rule error: %s", relation_field, err)
@@ -3117,10 +2975,11 @@ async def _search_tasks_with_any_relation_logic(
     if not paginated:
         return f"No tasks on page {page + 1} (total found: {len(all_tasks)})."
 
-    lead_label = _ENTITY_LABELS.get("lead", {}).get("displayName", "Lead")
-    contact_label = _ENTITY_LABELS.get("contact", {}).get("displayName", "Contact")
-    deal_label = _ENTITY_LABELS.get("deal", {}).get("displayName", "Deal")
-    company_label = _ENTITY_LABELS.get("company", {}).get("displayName", "Company")
+    labels = await _fetch_entity_labels()
+    lead_label = labels.get("lead", {}).get("displayName", "Lead")
+    contact_label = labels.get("contact", {}).get("displayName", "Contact")
+    deal_label = labels.get("deal", {}).get("displayName", "Deal")
+    company_label = labels.get("company", {}).get("displayName", "Company")
     entity_type_label_map = {
         "LEAD": lead_label,
         "CONTACT": contact_label,
@@ -3137,7 +2996,7 @@ async def _search_tasks_with_any_relation_logic(
         name = task.get("name", "—")
         status = task.get("status", "—")
         priority = task.get("priority", "—")
-        due = task.get("dueDate", "—")
+        due = _epoch_to_iso_utc(task.get("dueDate", "—"))
         relation = task.get("relation") or []
         rel_parts = []
         for r in relation:
@@ -3224,10 +3083,15 @@ async def _get_deal_custom_field_id_to_name() -> Dict[str, str]:
     return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
 
 
-async def get_deal_field_instructions_logic() -> str:
-    fields = await _fetch_deal_fields()
+async def get_deal_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_deal_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("deal", {}).get("large", set())}
+    internal_name_fields = _BUCKET_PICKLIST_RULES.get("deal", {}).get("internal_name", set())
     lines = [
         "=" * 60,
         "KYLAS CRM - DEAL FIELDS CHEAT SHEET",
@@ -3237,11 +3101,11 @@ async def get_deal_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -3290,7 +3154,7 @@ def _build_deal_search_json_rule(
         if not field_name:
             return {}, f"Filter #{i + 1}: missing 'field'."
         if field_name not in filterable_map:
-            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only [FILTERABLE] fields from get_deal_field_instructions."
+            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only a field listed as [FILTERABLE] in build_payload(\"deal.search\")'s tenant_filterable_fields."
         meta = filterable_map[field_name]
         api_type = meta.get("type", "TEXT_FIELD")
         allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
@@ -3618,7 +3482,7 @@ def _format_deal_for_display(deal: Dict[str, Any]) -> str:
     lines.append(f"Name: {deal.get('name', '—')}")
     lines.append(f"Value: {deal.get('value', '—')}")
     lines.append(f"Currency: {deal.get('currency', '—')}")
-    lines.append(f"Closing Date: {deal.get('closingDate', '—')}")
+    lines.append(f"Closing Date: {_epoch_to_iso_utc(deal.get('closingDate', '—'))}")
     # Emails
     emails = deal.get("emails") or []
     if emails:
@@ -3651,8 +3515,8 @@ def _format_deal_for_display(deal: Dict[str, Any]) -> str:
     else:
         lines.append(f"Pipeline: {pipeline}")
     lines.append(f"Owner ID: {deal.get('ownerId', '—')}")
-    lines.append(f"Created At: {deal.get('createdAt', '—')}")
-    lines.append(f"Updated At: {deal.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(deal.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(deal.get('updatedAt', '—'))}")
     # Products
     products = deal.get("products") or []
     lines.append("")
@@ -3913,7 +3777,7 @@ async def search_idle_deals_logic(
         if name in filterable_map:
             filters.append({"field": name, **base})
     if not filters:
-        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_deal_field_instructions."
+        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check build_payload(\"deal.search\")'s tenant_filterable_fields."
     return await search_deals_logic(filters, page=page, size=size, sort=sort)
 
 
@@ -3954,7 +3818,7 @@ async def search_idle_companies_logic(
         if name in filterable_map:
             filters.append({"field": name, **base})
     if not filters:
-        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check get_company_field_instructions."
+        return "Error: Neither 'updatedAt' nor 'latestActivityCreatedAt' is filterable for this tenant. Check build_payload(\"company.search\")'s tenant_filterable_fields."
     return await search_companies_logic(filters, page=page, size=size, sort=sort)
 
 
@@ -3990,10 +3854,15 @@ async def _get_company_custom_field_id_to_name() -> Dict[str, str]:
     return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
 
 
-async def get_company_field_instructions_logic() -> str:
-    fields = await _fetch_company_fields()
+async def get_company_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_company_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("company", {}).get("large", set())}
+    internal_name_fields = _BUCKET_PICKLIST_RULES.get("company", {}).get("internal_name", set())
     lines = [
         "=" * 60,
         "KYLAS CRM - COMPANY FIELDS CHEAT SHEET",
@@ -4003,11 +3872,11 @@ async def get_company_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists, internal_name_fields=internal_name_fields))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -4056,7 +3925,7 @@ def _build_company_search_json_rule(
         if not field_name:
             return {}, f"Filter #{i + 1}: missing 'field'."
         if field_name not in filterable_map:
-            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only [FILTERABLE] fields from get_company_field_instructions."
+            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only a field listed as [FILTERABLE] in build_payload(\"company.search\")'s tenant_filterable_fields."
         meta = filterable_map[field_name]
         api_type = meta.get("type", "TEXT_FIELD")
         allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
@@ -4180,8 +4049,8 @@ def _format_company_for_display(company: Dict[str, Any]) -> str:
     else:
         lines.append("Phone: —")
     lines.append(f"Owner ID: {company.get('ownerId', '—')}")
-    lines.append(f"Created At: {company.get('createdAt', '—')}")
-    lines.append(f"Updated At: {company.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(company.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(company.get('updatedAt', '—'))}")
     # Custom fields
     custom = company.get("customFieldValues") or {}
     if custom:
@@ -4301,7 +4170,11 @@ async def _get_meeting_custom_field_id_to_name() -> Dict[str, str]:
     return {str(f["id"]): (f.get("name") or str(f["id"])) for f in custom if f.get("id") is not None}
 
 
-def _format_meeting_field(field: Dict[str, Any]) -> List[str]:
+def _format_meeting_field(
+    field: Dict[str, Any],
+    large_fields: Optional[set] = None,
+    requested_picklists: Optional[set] = None,
+) -> List[str]:
     """Format a single meeting field for the cheat sheet."""
     lines = []
     name = field.get("name", "")
@@ -4323,21 +4196,33 @@ def _format_meeting_field(field: Dict[str, Any]) -> List[str]:
         picklist = field.get("picklist") or {}
         values = picklist.get("picklistValues") or picklist.get("values", [])
         if values and field_type != "PICK_LIST":
-            # For ENTITY_PICKLIST like status/medium, show internal names
-            lines.append("  └─ Options (use internal name):")
-            for val in values:
-                if not isinstance(val, dict):
-                    continue
-                val_label = val.get("displayName") or val.get("name") or "Unknown"
-                val_name = val.get("name", "")
-                lines.append(f"     • {val_label} (name: '{val_name}')")
+            if name.strip().lower() in (large_fields or set()) and name.strip().lower() not in (requested_picklists or set()):
+                # Oversized picklist (e.g. timezone) — build_payload's
+                # tenant_fields_reference is this SAME text (it calls this
+                # function directly), so there is only one omission rule to
+                # keep in sync, driven by the shared _BUCKET_PICKLIST_RULES table.
+                lines.append(f"  └─ {len(values)} options omitted to keep this reference compact.")
+                lines.append(f"     Call build_payload(id, fields=[\"{name}\"]) to get them. Do NOT guess an option id or name.")
+            else:
+                # For ENTITY_PICKLIST like status/medium, show internal names
+                lines.append("  └─ Options (use internal name):")
+                for val in values:
+                    if not isinstance(val, dict):
+                        continue
+                    val_label = val.get("displayName") or val.get("name") or "Unknown"
+                    val_name = val.get("name", "")
+                    lines.append(f"     • {val_label} (name: '{val_name}')")
     return lines
 
 
-async def get_meeting_field_instructions_logic() -> str:
-    fields = await _fetch_meeting_fields()
+async def get_meeting_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_meeting_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("meeting", {}).get("large", set())}
     lines = [
         "=" * 60,
         "KYLAS CRM - MEETING FIELDS CHEAT SHEET",
@@ -4347,11 +4232,11 @@ async def get_meeting_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_meeting_field(f))
+        lines.extend(_format_meeting_field(f, large_fields=large_fields, requested_picklists=requested_picklists))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_meeting_field(f))
+            lines.extend(_format_meeting_field(f, large_fields=large_fields, requested_picklists=requested_picklists))
     lines.extend([
         "",
         "## CREATE MEETING PAYLOAD FORMAT",
@@ -4581,7 +4466,8 @@ def _build_meeting_search_json_rule(
         else:
             return {}, (
                 f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. "
-                "Use [FILTERABLE] from get_meeting_field_instructions, or synthetic meeting fields: "
+                "Use a field listed as [FILTERABLE] in build_payload(\"meeting.search\")'s tenant_filterable_fields, "
+                "or synthetic meeting fields: "
                 "associatedLeads, associatedContacts, associatedDeals, associatedCompanies (LOOK_UP; equal / is_null / is_not_null)."
             )
         api_type = meta.get("type", "TEXT_FIELD")
@@ -4709,8 +4595,8 @@ def _format_meeting_for_display(meeting: Dict[str, Any]) -> str:
     lines.append(f"ID: {meeting.get('id', '—')}")
     lines.append(f"Title: {meeting.get('title', '—')}")
     lines.append(f"Status: {meeting.get('status', '—')}")
-    lines.append(f"From: {meeting.get('from', '—')}")
-    lines.append(f"To: {meeting.get('to', '—')}")
+    lines.append(f"From: {_epoch_to_iso_utc(meeting.get('from', '—'))}")
+    lines.append(f"To: {_epoch_to_iso_utc(meeting.get('to', '—'))}")
     lines.append(f"All Day: {meeting.get('allDay', False)}")
     lines.append(f"Location: {meeting.get('location', '—')}")
     lines.append(f"Description: {meeting.get('description', '—')}")
@@ -4755,8 +4641,8 @@ def _format_meeting_for_display(meeting: Dict[str, Any]) -> str:
                 lines.append(f"  • {rname} ({rentity}, ID: {rid})")
     # Metadata
     lines.append(f"Created By: {(meeting.get('createdBy') or {}).get('name', '—')}")
-    lines.append(f"Created At: {meeting.get('createdAt', '—')}")
-    lines.append(f"Updated At: {meeting.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(meeting.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(meeting.get('updatedAt', '—'))}")
     # Custom fields
     custom = meeting.get("customFieldValues") or {}
     if custom:
@@ -4873,8 +4759,8 @@ def _format_meeting_summary_line(m: Dict[str, Any]) -> str:
     mid = m.get("id", "?")
     title = m.get("title", "—")
     status = m.get("status", "—")
-    from_dt = m.get("from", "—")
-    to_dt = m.get("to", "—")
+    from_dt = _epoch_to_iso_utc(m.get("from", "—"))
+    to_dt = _epoch_to_iso_utc(m.get("to", "—"))
     location = m.get("location") or "—"
     
     # Extract owner
@@ -5047,10 +4933,14 @@ async def _fetch_call_log_fields() -> List[Dict[str, Any]]:
         return [f for f in fields if f.get("active", True)]
 
 
-async def get_call_log_field_instructions_logic() -> str:
-    fields = await _fetch_call_log_fields()
+async def get_call_log_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_call_log_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("call_log", {}).get("large", set())}
     lines = [
         "=" * 60,
         "KYLAS CRM - CALL LOG FIELDS CHEAT SHEET",
@@ -5060,11 +4950,11 @@ async def get_call_log_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_meeting_field(f))
+        lines.extend(_format_meeting_field(f, large_fields=large_fields, requested_picklists=requested_picklists))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_meeting_field(f))
+            lines.extend(_format_meeting_field(f, large_fields=large_fields, requested_picklists=requested_picklists))
     lines.extend([
         "",
         "## CREATE CALL LOG PAYLOAD FORMAT",
@@ -5161,7 +5051,7 @@ def _format_call_log_for_display(log: Dict[str, Any]) -> str:
     lines.append(f"Call Type: {log.get('callType', '—')}")
     lines.append(f"Outcome: {log.get('outcome', '—')}")
     lines.append(f"Phone Number: {log.get('phoneNumber', '—')}")
-    lines.append(f"Start Time: {log.get('startTime', '—')}")
+    lines.append(f"Start Time: {_epoch_to_iso_utc(log.get('startTime', '—'))}")
     lines.append(f"Duration: {log.get('duration', '—')} seconds")
     # Related To
     related = log.get("relatedTo") or {}
@@ -5199,8 +5089,8 @@ def _format_call_log_for_display(log: Dict[str, Any]) -> str:
     owner = log.get("owner") or {}
     if isinstance(owner, dict):
         lines.append(f"Logged By: {owner.get('name', '—')} (ID: {owner.get('id', '—')})")
-    lines.append(f"Created At: {log.get('createdAt', '—')}")
-    lines.append(f"Updated At: {log.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(log.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(log.get('updatedAt', '—'))}")
     lines.append("=" * 60)
     return "\n".join(lines)
 
@@ -5321,7 +5211,7 @@ def _build_call_log_search_json_rule(
         if not field_name:
             return {}, f"Filter #{i + 1}: missing 'field'."
         if field_name not in filterable_map:
-            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only [FILTERABLE] fields from get_call_log_field_instructions."
+            return {}, f"Filter #{i + 1}: field '{field_name}' is not filterable or not found. Use only a field listed as [FILTERABLE] in build_payload(\"call_log.search\")'s tenant_filterable_fields."
         meta = filterable_map[field_name]
         api_type = meta.get("type", "TEXT_FIELD")
         allowed = OPERATOR_MAPPING.get(api_type) or OPERATOR_MAPPING.get("TEXT_FIELD", [])
@@ -5368,7 +5258,7 @@ def _extract_call_log_data(log: Dict[str, Any]) -> dict:
     call_type = log.get("callType", "—")
     outcome = log.get("outcome", "—")
     phone = log.get("phoneNumber", "—")
-    start = log.get("startTime", "—")
+    start = _epoch_to_iso_utc(log.get("startTime", "—"))
     duration = log.get("duration", "—")
 
     # Extract sentiment: overallSentiment + customerEmotion (first one)
@@ -5479,8 +5369,8 @@ async def search_call_logs_logic(
     for log in results:
         lines.append(_format_call_log_for_display(log))
         lines.append("")
-    lines.append("💡 HINT: For call logs showing 'Related: contact#123' or 'lead#456', use:")
-    lines.append("  • get_call_logs(entity_id=123, entity_type='contact') to see full contact details with their call logs")
+    lines.append("💡 HINT: For call logs showing 'Related: contact#123' or 'lead#456', resolve:")
+    lines.append("  • call_log.by_entity (list_tool -> build_payload -> execute_request; not a standalone tool) with {entity_id: 123, entity_type: 'contact'} to see full contact details with their call logs")
     return "\n".join(lines)
 
 
@@ -5660,7 +5550,7 @@ async def search_tasks_by_term_logic(
         name = task.get("name", "—")
         status = task.get("status", "—")
         priority = task.get("priority", "—")
-        due_date = task.get("dueDate", "—")
+        due_date = _epoch_to_iso_utc(task.get("dueDate", "—"))
         lines.append(f"• ID: {tid} | Name: {name} | Status: {status} | Priority: {priority} | Due: {due_date}")
     lines.append("-" * 60)
     return "\n".join(lines)
@@ -5767,10 +5657,14 @@ async def _fetch_quotation_fields() -> List[Dict[str, Any]]:
 
 
 
-async def get_quotation_field_instructions_logic() -> str:
-    fields = await _fetch_quotation_fields()
+async def get_quotation_field_instructions_logic(
+    fields_meta: Optional[List[Dict[str, Any]]] = None,
+    requested_picklists: Optional[set] = None,
+) -> str:
+    fields = fields_meta if fields_meta is not None else await _fetch_quotation_fields()
     standard = [f for f in fields if f.get("standard", False)]
     custom = [f for f in fields if not f.get("standard", False)]
+    large_fields = {n.lower() for n in _BUCKET_PICKLIST_RULES.get("quotation", {}).get("large", set())}
     lines = [
         "=" * 60,
         "KYLAS CRM - QUOTATION FIELDS CHEAT SHEET",
@@ -5780,11 +5674,11 @@ async def get_quotation_field_instructions_logic() -> str:
         "-" * 40,
     ]
     for f in standard:
-        lines.extend(_format_field(f, include_filterable=True))
+        lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
     if custom:
         lines.extend(["", "## CUSTOM FIELDS", "-" * 40])
         for f in custom:
-            lines.extend(_format_field(f, include_filterable=True))
+            lines.extend(_format_field(f, include_filterable=True, large_fields=large_fields, requested_picklists=requested_picklists))
     lines.extend(["", "=" * 60, "END OF CHEAT SHEET", "=" * 60])
     return "\n".join(lines)
 
@@ -5826,15 +5720,15 @@ def _format_quotation_for_display(q: Dict[str, Any]) -> str:
 
     lines.append(f"Sub Total: {_money(q.get('subTotal'))}")
     lines.append(f"Grand Total: {_money(q.get('grandTotal'))}")
-    lines.append(f"Valid Till: {q.get('validTill', '—')}")
+    lines.append(f"Valid Till: {_epoch_to_iso_utc(q.get('validTill', '—'))}")
     lines.append(f"Owner: {_name_of(q.get('owner'))}")
     lines.append(f"Associated Deal: {_name_of(q.get('associatedDeal'))}")
     lines.append(f"Associated Company: {_name_of(q.get('associatedCompany'))}")
     contacts = q.get("associatedContacts") or []
     if contacts:
         lines.append("Associated Contacts: " + ", ".join(_name_of(c) for c in contacts))
-    lines.append(f"Created At: {q.get('createdAt', '—')}")
-    lines.append(f"Updated At: {q.get('updatedAt', '—')}")
+    lines.append(f"Created At: {_epoch_to_iso_utc(q.get('createdAt', '—'))}")
+    lines.append(f"Updated At: {_epoch_to_iso_utc(q.get('updatedAt', '—'))}")
     # Products
     products = q.get("products") or []
     lines.append("")
@@ -5912,7 +5806,10 @@ async def search_quotations_logic(
                 default_tz = DEFAULT_TIMEZONE
             break
 
-    json_rule, err = _build_search_json_rule(filters, filterable_map, default_timezone=default_tz)
+    json_rule, err = _build_search_json_rule(
+        filters, filterable_map, default_timezone=default_tz,
+        internal_name_fields=_BUCKET_PICKLIST_RULES.get("quotation", {}).get("internal_name", set()),
+    )
     if err:
         return f"Invalid filters: {err}"
     payload = {"jsonRule": json_rule}
@@ -6025,7 +5922,7 @@ async def search_idle_quotations_logic(
         if name in filterable_map:
             filters.append({"field": name, **base})
     if not filters:
-        return "Error: 'updatedAt' is not filterable for quotations in this tenant. Check get_quotation_field_instructions."
+        return "Error: 'updatedAt' is not filterable for quotations in this tenant. Check build_payload(\"quotation.search\")'s tenant_filterable_fields."
     return await search_quotations_logic(filters, page=page, size=size, sort=sort)
 
 
@@ -6035,6 +5932,7 @@ async def search_idle_quotations_logic(
 
 _ENTITY_CONFIG = {
     "lead": {
+        "get_fn": get_lead_logic,
         "search_fn": search_leads_logic,
         "by_term_fn": search_leads_by_term_logic,
         "idle_fn": search_idle_leads_logic,
@@ -6046,6 +5944,7 @@ _ENTITY_CONFIG = {
         "field_fmt": "standard",
     },
     "contact": {
+        "get_fn": get_contact_logic,
         "search_fn": search_contacts_logic,
         "by_term_fn": search_contacts_by_term_logic,
         "idle_fn": None,
@@ -6057,6 +5956,7 @@ _ENTITY_CONFIG = {
         "field_fmt": "standard",
     },
     "task": {
+        "get_fn": get_task_logic,
         "search_fn": search_tasks_logic,
         "by_term_fn": search_tasks_by_term_logic,
         "idle_fn": None,
@@ -6068,6 +5968,7 @@ _ENTITY_CONFIG = {
         "field_fmt": "standard",
     },
     "deal": {
+        "get_fn": get_deal_logic,
         "search_fn": search_deals_logic,
         "by_term_fn": search_deals_by_term_logic,
         "idle_fn": search_idle_deals_logic,
@@ -6079,6 +5980,7 @@ _ENTITY_CONFIG = {
         "field_fmt": "standard",
     },
     "company": {
+        "get_fn": get_company_logic,
         "search_fn": search_companies_logic,
         "by_term_fn": search_companies_by_term_logic,
         "idle_fn": search_idle_companies_logic,
@@ -6090,6 +5992,7 @@ _ENTITY_CONFIG = {
         "field_fmt": "standard",
     },
     "meeting": {
+        "get_fn": get_meeting_logic,
         "search_fn": search_meetings_logic,
         "by_term_fn": search_meetings_by_term_logic,
         "idle_fn": None,
@@ -6112,6 +6015,7 @@ _ENTITY_CONFIG = {
         "field_fmt": "meeting",
     },
     "quotation": {
+        "get_fn": get_quotation_logic,
         "search_fn": search_quotations_logic,
         "by_term_fn": search_quotations_by_term_logic,
         "idle_fn": search_idle_quotations_logic,
@@ -6166,6 +6070,33 @@ _ENTITY_CRUD_CONFIG: Dict[str, Dict[str, Any]] = {
         "name_fn": lambda r: f"{r.get('callType', '')} / {r.get('outcome', '')}",
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Generic Get Router
+#
+# Mirrors search_entity_logic's shape (entity_type -> _ENTITY_CONFIG lookup ->
+# real per-entity function), added so execute_request has a single generic
+# router to call for "get" intents too, the same pattern as search/create/
+# update. Scoped to whichever buckets have a "get_fn" wired in _ENTITY_CONFIG
+# (currently lead, contact) — add one line there to extend to more buckets.
+#
+# Deliberately does NOT swallow exceptions into a formatted string the way
+# search_entity_logic/search_entity_by_term_logic/search_idle_entities_logic
+# do — get_lead_logic/get_contact_logic themselves already raise on failure
+# rather than returning an error string, so this stays a thin,
+# exception-propagating pass-through to match them, and to give
+# execute_request a real signal to build its ok/error envelope from.
+# ---------------------------------------------------------------------------
+
+async def get_entity_logic(entity_type: str, entity_id: int) -> Any:
+    cfg = _ENTITY_CONFIG.get(entity_type)
+    if not cfg:
+        raise ValueError(f"Unknown entity_type '{entity_type}'. Valid: {', '.join(_ENTITY_CONFIG.keys())}")
+    get_fn = cfg.get("get_fn")
+    if not get_fn:
+        raise ValueError(f"Entity type '{entity_type}' does not support get.")
+    return await get_fn(entity_id)
 
 
 # ---------------------------------------------------------------------------
@@ -6378,6 +6309,37 @@ async def search_idle_entities(
 # ---------------------------------------------------------------------------
 # Generic CRUD Tools
 # ---------------------------------------------------------------------------
+#
+# create_entity_logic/update_entity_logic are the actual dispatch logic that
+# used to live only inline inside the create_entity/update_entity tool
+# bodies below. Extracted so execute_request can call the SAME dispatch
+# (bucket -> _ENTITY_CRUD_CONFIG -> real create_fn/update_fn) directly and
+# get the raw created/updated record back, instead of going through the
+# tool's own "✓ ... created successfully" string formatting. The tools below
+# now call these too, so there is exactly one real implementation of this
+# dispatch, not two. Raises ValueError on an unknown entity_type (the tools'
+# own "✗ Unknown entity_type" message, as an exception instead of a string)
+# so a real caller needing an ok/fail signal — execute_request — gets one,
+# without the tools' user-facing string format changing at all.
+# ---------------------------------------------------------------------------
+
+async def create_entity_logic(entity_type: str, field_values: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = _ENTITY_CRUD_CONFIG.get(entity_type)
+    if not cfg:
+        valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
+        raise ValueError(f"Unknown entity_type '{entity_type}'. Valid: {valid}")
+    _reset_api_call_count()
+    return await cfg["create_fn"](field_values)
+
+
+async def update_entity_logic(entity_type: str, entity_id: int, field_values: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = _ENTITY_CRUD_CONFIG.get(entity_type)
+    if not cfg:
+        valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
+        raise ValueError(f"Unknown entity_type '{entity_type}'. Valid: {valid}")
+    _reset_api_call_count()
+    return await cfg["update_fn"](entity_id, field_values)
+
 
 @mcp.tool()
 async def create_entity(entity_type: str, field_values: Dict[str, Any]) -> str:
@@ -6449,12 +6411,8 @@ async def create_entity(entity_type: str, field_values: Dict[str, Any]) -> str:
        "notes": [{"description": "Discussed pricing"}]} ← optional
     """
     cfg = _ENTITY_CRUD_CONFIG.get(entity_type)
-    if not cfg:
-        valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
-        return f"✗ Unknown entity_type '{entity_type}'. Valid: {valid}"
     try:
-        _reset_api_call_count()
-        result = await cfg["create_fn"](field_values)
+        result = await create_entity_logic(entity_type, field_values)
         entity_id = result.get("id", "?")
         name = cfg["name_fn"](result)
         label = entity_type.replace("_", " ").title()
@@ -6508,12 +6466,8 @@ async def update_entity(entity_type: str, entity_id: int, field_values: Dict[str
     phone or phoneNumbers is in field_values. Never assume a default country.
     """
     cfg = _ENTITY_CRUD_CONFIG.get(entity_type)
-    if not cfg:
-        valid = ", ".join(_ENTITY_CRUD_CONFIG.keys())
-        return f"✗ Unknown entity_type '{entity_type}'. Valid: {valid}"
     try:
-        _reset_api_call_count()
-        result = await cfg["update_fn"](entity_id, field_values)
+        result = await update_entity_logic(entity_type, entity_id, field_values)
         eid = result.get("id", entity_id)
         name = cfg["name_fn"](result)
         label = entity_type.replace("_", " ").title()
@@ -6525,6 +6479,1081 @@ async def update_entity(entity_type: str, entity_id: int, field_values: Dict[str
     except Exception as e:
         logger.exception("update_entity")
         return f"✗ Unexpected error: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Generic Registry (list_tool / build_payload) — 3-tool architecture POC
+#
+# Step 1 of 3: registry + discovery + schema-detail only. No execute_request
+# yet, no _meta bucket yet. Additive — does not touch or replace any of the
+# 36 tools above. See TOOL_CONSOLIDATION_DESIGN.md and
+# YAML_REGISTRY_SCHEMA_PLAN.md for the full design this validates.
+# ---------------------------------------------------------------------------
+
+_REGISTRY_DIR = Path(__file__).parent / "registry"
+_REGISTRY_REQUIRED_FIELDS = ["id", "bucket", "intent", "method", "path", "description"]
+
+
+class RegistryError(Exception):
+    """Raised when the YAML registry fails validation. Must prevent server startup."""
+
+
+def _load_registry(registry_dir: Path = _REGISTRY_DIR) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    """
+    Load and validate registry_dir/index.yaml + registry_dir/*.yaml (all files
+    except index.yaml). Returns (index, entries) where entries is {id: entry_dict}.
+    Raises RegistryError, naming the offending file/id, on any problem. Called at
+    module import time (not lazily) — a broken registry must stop the server from
+    starting at all, not fail on the first tool call.
+    """
+    index_path = registry_dir / "index.yaml"
+    if not index_path.exists():
+        raise RegistryError(f"Registry index not found: {index_path}")
+    with open(index_path, "r", encoding="utf-8") as f:
+        index = yaml.safe_load(f) or {}
+    valid_buckets = set(index.get("buckets") or [])
+    valid_intents = set(index.get("intents") or [])
+    if not valid_buckets:
+        raise RegistryError(f"{index_path}: 'buckets' must be a non-empty list.")
+    if not valid_intents:
+        raise RegistryError(f"{index_path}: 'intents' must be a non-empty list.")
+
+    entries: Dict[str, Dict[str, Any]] = {}
+
+    for yml_path in sorted(registry_dir.glob("*.yaml")):
+        if yml_path.name == "index.yaml":
+            continue
+        with open(yml_path, "r", encoding="utf-8") as f:
+            content = yaml.safe_load(f)
+        if not isinstance(content, list):
+            raise RegistryError(
+                f"{yml_path}: expected a YAML list of entries, got {type(content).__name__}."
+            )
+        for i, entry in enumerate(content):
+            if not isinstance(entry, dict):
+                raise RegistryError(f"{yml_path}: entry #{i + 1} is not a mapping.")
+            entry_id = entry.get("id")
+            label = entry_id or f"entry #{i + 1} (no id)"
+            missing = [f for f in _REGISTRY_REQUIRED_FIELDS if not entry.get(f)]
+            if missing:
+                raise RegistryError(
+                    f"{yml_path}: '{label}' is missing required field(s): {', '.join(missing)}"
+                )
+            if entry_id in entries:
+                raise RegistryError(
+                    f"{yml_path}: duplicate id '{entry_id}' "
+                    f"(already defined in {entries[entry_id]['_source_file']})"
+                )
+            if entry["bucket"] not in valid_buckets:
+                raise RegistryError(
+                    f"{yml_path}: '{entry_id}' has bucket '{entry['bucket']}' which is not in "
+                    f"index.yaml's buckets list ({sorted(valid_buckets)})"
+                )
+            if entry["intent"] not in valid_intents:
+                raise RegistryError(
+                    f"{yml_path}: '{entry_id}' has intent '{entry['intent']}' which is not in "
+                    f"index.yaml's intents list ({sorted(valid_intents)})"
+                )
+            entry = dict(entry)
+            entry["_source_file"] = yml_path.name
+            entries[entry_id] = entry
+
+    if not entries:
+        raise RegistryError(
+            f"No registry entries found under {registry_dir} — refusing to start with an empty registry."
+        )
+
+    logger.info(
+        "📋 Loaded %d registry entries from %s: %s",
+        len(entries), registry_dir, sorted(entries.keys()),
+    )
+    return index, entries
+
+
+# Loaded once at import time — see docstring above for why this isn't lazy.
+_REGISTRY_INDEX, _REGISTRY = _load_registry()
+
+
+@mcp.tool()
+def list_tool(
+    bucket: Optional[str] = None,
+    intent: Optional[str] = None,
+) -> str:
+    """
+    Step 1 of 3 in the generic CRM tool flow (list_tool -> build_payload ->
+    execute_request): find which endpoint id you need, before knowing anything
+    about its shape.
+
+    Returns ONLY a short summary row per match:
+      {"results": [{"id": "...", "bucket": "...", "intent": "...", "description": "..."}]}
+    Never method, path, a parameter schema, or an example — no matter how specific
+    bucket/intent are. That level of detail is build_payload(id)'s job alone.
+    This tool exists purely to narrow the full registry down to the one id you
+    actually need, without paying the cost of every endpoint's full schema.
+
+    It is always safe and cheap to call this with NO arguments to see everything
+    currently registered — do that first if you're not sure what's available, then
+    narrow with bucket/intent once you have a sense of what you're looking for.
+
+    Registry contents right now (this will grow — always confirm here rather than
+    assuming an id exists, since not every bucket has every intent):
+      buckets: lead, contact, deal, task, company, meeting, call_log, quotation, _meta
+      intents: get, search, search_by_term, search_idle, create, update, lookup
+      (lead/deal/company have all of get/search/search_by_term/search_idle/
+      create/update; contact/meeting have the same 5 minus search_idle;
+      task has get/search/search_by_term/create/update plus lookup
+      (task.lookup_entity, task.search_any_relation), no search_idle;
+      call_log has only search/create/update plus lookup (call_log.by_entity)
+      — no get, no search_by_term, no search_idle; meeting also has lookup
+      (meeting.lookup_related) on top of its other 4; quotation is READ-ONLY
+      — get/search/search_by_term/search_idle only, no create/update; _meta
+      is bucket-less and has lookup entries only (user.lookup,
+      product.lookup, pipeline.lookup, pipeline.details,
+      datetime.parse_to_utc). Call list_tool(bucket=...) to see exactly
+      which intents a given bucket actually has — don't assume parity
+      across buckets.)
+
+    bucket: restrict to one bucket (e.g. "lead", "contact", "deal", "task",
+      "company", "meeting", "call_log", "quotation", "_meta"). Omit to search
+      every bucket.
+    intent: restrict to one intent — "get", "search", "search_by_term",
+      "search_idle", "create", "update", or "lookup". Omit to match any.
+
+    Example: list_tool(bucket="lead") returns all lead.* rows (get/search/
+    search_by_term/search_idle/create/update), each with its own id and
+    one-line description — nothing more.
+    """
+    results = []
+    for entry in _REGISTRY.values():
+        if bucket and entry["bucket"] != bucket:
+            continue
+        if intent and entry["intent"] != intent:
+            continue
+        results.append({
+            "id": entry["id"],
+            "bucket": entry["bucket"],
+            "intent": entry["intent"],
+            "description": entry.get("description", ""),
+        })
+    return json.dumps({"results": results}, indent=2)
+
+
+# Maps a bucket name to the existing per-entity field-metadata fetcher it
+# should use — same functions the original get_*_field_instructions tools
+# already call (_fetch_lead_fields, _fetch_contact_fields, ...). Add one line
+# per new bucket; nothing else about the fold/build_payload logic changes.
+_BUCKET_FIELD_FETCHERS: Dict[str, Any] = {
+    "lead": _fetch_lead_fields,
+    "contact": _fetch_contact_fields,
+    "meeting": _fetch_meeting_fields,
+    "call_log": _fetch_call_log_fields,
+    "deal": _fetch_deal_fields,
+    "task": _fetch_task_fields,
+    "company": _fetch_company_fields,
+    "quotation": _fetch_quotation_fields,
+}
+
+# Maps a bucket to the SAME cheat-sheet builder the standalone
+# get_<bucket>_field_instructions tool uses. _fold_field_metadata_into_schema calls this
+# (passing the fields_meta it already fetched via _BUCKET_FIELD_FETCHERS above, plus
+# build_payload's own "fields" hint as requested_picklists) instead of re-deriving its own,
+# separate field-listing JSON — one formatting path for both surfaces, not two that can drift
+# apart (see the "status"/ENTITY_PICKLIST omission this replaced).
+_BUCKET_FIELD_INSTRUCTIONS_LOGIC: Dict[str, Any] = {
+    "lead": get_lead_field_instructions_logic,
+    "contact": get_contact_field_instructions_logic,
+    "meeting": get_meeting_field_instructions_logic,
+    "call_log": get_call_log_field_instructions_logic,
+    "deal": get_deal_field_instructions_logic,
+    "task": get_task_field_instructions_logic,
+    "company": get_company_field_instructions_logic,
+    "quotation": get_quotation_field_instructions_logic,
+}
+
+# Maps a bucket to the real, original get_* tool whose inputSchema
+# build_payload copies verbatim for that bucket's ".get" entry. call_log has
+# no entry here on purpose — there is no get-a-single-call-log-by-id tool in
+# the old system (see registry/call_log.yaml's header comment), so it has no
+# ".get" registry entry to need one.
+_REGISTRY_BUCKET_TO_GET_TOOL: Dict[str, str] = {
+    "lead": "get_lead",
+    "contact": "get_contact",
+    "meeting": "get_meeting",
+    "deal": "get_deal",
+    "task": "get_task",
+    "company": "get_company",
+    "quotation": "get_quotation",
+}
+
+_LARGE_COMPANY_PICKLISTS = {
+    "country", "companycountry",
+    "companyindustry", "industry",
+    "companybusinesstype", "businesstype",
+}
+_BUCKET_PICKLIST_RULES: Dict[str, Dict[str, set]] = {
+    "lead": {
+        "large": {"timezone", "requirementcurrency"} | _LARGE_COMPANY_PICKLISTS,
+        "internal_name": PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "contact": {
+        "large": {"timezone", "requirementcurrency"} | _LARGE_COMPANY_PICKLISTS,
+        "internal_name": PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "company": {
+        "large": {"timezone"} | _LARGE_COMPANY_PICKLISTS,
+        "internal_name": COMPANY_PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "meeting": {
+        "large": {"timezone"},
+        "internal_name": MEETING_PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "deal": {
+        "large": set(),
+        "internal_name": DEAL_PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "task": {
+        "large": set(),
+        "internal_name": TASK_PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    "call_log": {
+        "large": set(),
+        "internal_name": CALL_LOG_PICKLIST_FIELDS_USE_INTERNAL_NAME,
+    },
+    # quotation has no create/update entry in the registry, so this row never
+    # feeds a create/update tenant_fields_reference — listed only for completeness.
+    "quotation": {
+        "large": set(),
+        "internal_name": set(),
+    },
+}
+
+
+def _lean_filter_field(f: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    The two things a search filter needs that the cheat-sheet text
+    (tenant_fields_reference) doesn't carry: the literal string
+    _build_search_json_rule expects in a rule's "field" key (dotted
+    "customFieldValues.<name>" for custom fields), and which operators are
+    valid for this field's type. Deliberately lean — no options/
+    uses_internal_name/required here, since the cheat-sheet text already
+    covers picklist options (or the omission stub) and required-ness.
+    """
+    name = f.get("name")
+    is_standard = f.get("standard", False)
+    return {
+        "name": name,
+        "displayName": f.get("displayName"),
+        "filter_field_path": name if is_standard else f"customFieldValues.{name}",
+        "allowed_operators": OPERATOR_MAPPING.get(f.get("type")) or OPERATOR_MAPPING.get("TEXT_FIELD", []),
+    }
+
+
+async def _fold_field_metadata_into_schema(
+    base_schema: Dict[str, Any],
+    fetch_fields_fn: Any,
+    for_search: bool,
+    requested_picklists: Optional[List[str]] = None,
+    bucket: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Fetch this tenant's real field metadata for one bucket (via whichever
+    existing _fetch_*_fields() function fetch_fields_fn is) and fold it into a
+    COPY of base_schema — never mutates the registry's own dict. Bucket-
+    agnostic on purpose: was hardcoded to lead only until "contact" was added;
+    kept generic from here so a 3rd/4th bucket is just one more
+    _BUCKET_FIELD_FETCHERS/_BUCKET_FIELD_INSTRUCTIONS_LOGIC entry, not a new
+    copy of this function.
+
+    The field LISTING itself (standard/custom fields, real picklist options
+    or the large-picklist omission stub, *REQUIRED*/[FILTERABLE] markers) is
+    no longer built here — it used to be a second, separate JSON rendering
+    (_field_summary) that duplicated, and had drifted from, the cheat-sheet
+    text the standalone get_<bucket>_field_instructions tool already builds
+    via _format_field/_format_meeting_field (e.g. an ENTITY_PICKLIST like
+    meeting's "status" got its options shown in the cheat sheet but not here,
+    because _field_summary only recognised PICK_LIST/MULTI_PICKLIST). Instead
+    this now calls that SAME builder (_BUCKET_FIELD_INSTRUCTIONS_LOGIC),
+    passing it the already-fetched fields_meta (so this remains exactly one
+    live fetch, same as before) and requested_picklists straight through, and
+    embeds the resulting text as "tenant_fields_reference". One formatting
+    path, used by both surfaces.
+
+    requested_picklists: the caller's "which large picklists do I actually need"
+    hint, straight from build_payload's own "fields" parameter. None or empty
+    means "none of them" — the large picklists are then omitted from the
+    cheat-sheet text, which is the common case and the whole point: an
+    unremarkable lead.create's reference text stays small instead of dumping
+    ~435 timezone options. Names are matched case-insensitively (see
+    _format_field/_format_meeting_field). Names that aren't a large picklist
+    on this bucket are ignored, not an error — every other field is rendered
+    in full either way, so a wrong guess costs nothing. This applies to
+    search too: build_payload("lead.search", fields=["country"]) inlines that
+    picklist's options for filtering, exactly as it already did for
+    create/update.
+
+    for_search additionally adds "tenant_filterable_fields": a lean
+    name/displayName/filter_field_path/allowed_operators table (via
+    _lean_filter_field) for filterable fields only — the one piece of
+    machine-readable structure the cheat-sheet prose doesn't carry, and which
+    execute_request's filter-building depends on.
+
+    bucket: the entity bucket ("lead", "company", ...), used to pick that
+    bucket's cheat-sheet builder from _BUCKET_FIELD_INSTRUCTIONS_LOGIC.
+    Passing None (or an unrecognised bucket) means no builder is found, so no
+    "tenant_fields_reference" is added — the safe failure mode, same as this
+    function already does elsewhere for an unrecognised bucket.
+    """
+    schema = json.loads(json.dumps(base_schema))  # cheap deep copy, no extra dependency
+    fields_meta = await fetch_fields_fn()
+
+    # Non-strings are skipped rather than raising: this list comes straight
+    # from a model's tool call, and a malformed hint should degrade to "no
+    # hint", never fail the whole build_payload.
+    requested_picklists_set = {
+        n.strip().lower() for n in (requested_picklists or []) if isinstance(n, str)
+    }
+
+    instructions_fn = _BUCKET_FIELD_INSTRUCTIONS_LOGIC.get(bucket or "")
+    if instructions_fn:
+        schema["tenant_fields_reference"] = await instructions_fn(
+            fields_meta=fields_meta, requested_picklists=requested_picklists_set,
+        )
+
+    if for_search:
+        schema["tenant_filterable_fields"] = [
+            _lean_filter_field(f) for f in fields_meta if f.get("filterable", False)
+        ]
+        return schema
+
+    # Override the static YAML's "required" guess with the REAL required-field
+    # list from this tenant's live metadata (same `required` flag the original
+    # get_*_field_instructions tools already read via _format_field) — a static
+    # required list authored by hand can be, and was, simply wrong: e.g. this
+    # registry originally hardcoded lead.create's required as
+    # [firstName, lastName, email], but Kylas actually accepted a real create
+    # with no email at all. Live data is the only real source of truth here.
+    live_required = [f.get("name") for f in fields_meta if f.get("standard", False) and f.get("required", False)]
+    if live_required:
+        schema["required"] = live_required
+
+    return schema
+
+
+@mcp.tool()
+async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
+    """
+    Step 2 of 3 in the generic CRM tool flow: get everything about the ONE
+    endpoint you already picked via list_tool. Takes that id, plus an optional
+    "fields" hint (described at the bottom) that only controls how much
+    picklist detail comes back — never the values you're about to send. This
+    tool still never sees or checks those values; that only happens (if at
+    all) in execute_request, described there.
+
+    Returns a JSON object with these fields:
+      id             - the id you asked for, echoed back.
+      method, path   - the real Kylas HTTP method and path for this endpoint,
+                       path params written as "{name}" (e.g. "/leads/{lead_id}").
+      usage_notes    - the ACTUAL rules for this one endpoint only: shorthand
+                       field formats, which picklist fields use a name instead
+                       of an Option ID, which fields must be resolved through
+                       another endpoint first, and any other constraint specific
+                       to it. Read this before building anything — it is not
+                       decorative, it is the real, load-bearing documentation
+                       for this endpoint (the same rules that used to live in
+                       this server's old global instructions, now scoped to
+                       exactly the one endpoint they apply to).
+      schema         - required/properties for the payload you need to build.
+                       If a field's own entry contains "resolve_via": "<other
+                       id>", do NOT invent a value for it — go run the full
+                       list_tool/build_payload/execute_request cycle on
+                       <other id> first, then use the real value it returns.
+      example        - one concrete, valid example payload for this endpoint.
+      dynamic_fields - true if this endpoint's real shape depends on THIS
+                       tenant's own custom fields/picklist options, which can
+                       only be known by asking Kylas directly (never static).
+      fetched_live   - true only if that tenant-specific data was actually
+                       fetched successfully on this call.
+      tenant_fields_reference - present only when dynamic_fields and
+                       fetched_live are both true: this tenant's REAL fields as
+                       a readable cheat sheet — the EXACT same text
+                       get_<bucket>_field_instructions returns (standard/custom
+                       fields, "*REQUIRED*"/"[FILTERABLE]" markers, real
+                       picklist option id/name/label per field), one shared
+                       formatter for both surfaces. Never placeholder data.
+                       A few oversized picklists (see "fields" below) get a
+                       one-line omission stub instead of their full option
+                       list — that is a deliberate size saving, not a fetch
+                       failure, and the stub tells you exactly how to get the
+                       real options when you need them (re-call build_payload
+                       naming that field in "fields").
+      tenant_filterable_fields - search ids only, present under the same
+                       condition as tenant_fields_reference: a lean
+                       name/displayName/filter_field_path/allowed_operators
+                       table for filterable fields — the two things the
+                       cheat-sheet text above doesn't carry, so filter-building
+                       stays machine-checkable:
+                         filter_field_path - the exact string to put in a
+                           filter's "field" key. Copy it verbatim; custom
+                           fields use a dotted "customFieldValues.<name>" path
+                           here.
+                         allowed_operators - the ONLY operators valid for that
+                           field's type (e.g. a DATE field cannot take
+                           "contains", and a CHECKBOX takes only
+                           equal/not_equal). Build every filter's "operator"
+                           from the list on THAT field — never guessed, and
+                           never copied from a field of a different type.
+                           Anything else is rejected before the request is
+                           sent. Symbols (">", ">=", "!=", "==") are accepted
+                           as shorthand and normalized, but the names in this
+                           list always work.
+                       For picklist option values (id/name/label) and whether
+                       a filterable picklist uses an internal name or a
+                       numeric id, read tenant_fields_reference instead — this
+                       table stays lean on purpose.
+      live_fetch_error - present only when dynamic_fields is true and the live
+                       fetch failed (e.g. no credentials configured yet). When
+                       this is present, everything else above — method, path,
+                       usage_notes, example — is still the real, correct static
+                       shape; only the tenant-specific enrichment is missing.
+                       Don't treat this field's presence as the whole call
+                       having failed.
+
+    This tool never validates the payload you build from this. Call
+    execute_request(id, payload) next to actually send it — a malformed payload
+    is caught there (or by Kylas itself), never here.
+
+    id: an endpoint id from list_tool (e.g. "lead.create", "contact.search").
+
+    fields: OPTIONAL. The names of the LARGE picklist fields you need the full
+      option list for — nothing else. This is not "the fields I intend to
+      set": every field of every type still comes back in full, with its name,
+      displayName and type, whether or not you pass this. Works the same on
+      create/update ids and search ids — on a search id it inlines the options
+      you need to build a filter on that picklist.
+
+      A handful of picklists on this tenant are enormous (timezone alone is
+      435 options / ~37 KB, which is 39% of a lead.create response). Their
+      option lists are OMITTED by default from "tenant_fields_reference" and
+      replaced with a one-line "N options omitted..." stub naming the exact
+      re-call that recovers them. Every other picklist — source, salutation,
+      campaign, companyEmployees, all custom picklists, and so on — is 9
+      options or fewer and is ALWAYS inlined in full. So the only reason to
+      pass this parameter is when the user has actually mentioned one of the
+      big ones.
+
+      The large picklists, with both spellings each concept goes by (entities
+      disagree on the name — a lead has "companyIndustry", a company has
+      "industry" — so pass whichever name you see in tenant_fields_reference):
+
+        timezone              - the user's/record's time zone (~435 options)
+        country               / companyCountry        (~247 options)
+        companyIndustry       / industry              (~147 options)
+        requirementCurrency                           (~165 options)
+        companyBusinessType   / businessType          (small, listed for
+                                                       consistency with the
+                                                       fields above)
+
+      Which of these exist depends on the entity: lead/contact have all of
+      them, company has the company-prefixed set plus timezone, meeting has
+      only timezone, and deal/task/call_log have none at all (their picklists
+      are small, so this parameter does nothing for those buckets).
+
+      Pass the names as a list, e.g. build_payload("lead.create",
+      fields=["country"]) when the user said "country India", or
+      build_payload("lead.search", fields=["country"]) when they asked for
+      leads in India, or fields=["country", "timezone"] for both. Matching is
+      case-insensitive. Names that aren't a large picklist on this bucket are
+      simply ignored — a wrong guess is never an error and never hides
+      anything, because everything else is returned in full regardless.
+
+      Omit it whenever the user's request doesn't touch one of the fields
+      above — that's the normal case and it is the cheap one.
+
+      You are never stuck: if tenant_fields_reference shows an "options
+      omitted" stub for a field you turn out to need, just call build_payload
+      again naming that field. Re-calling is idempotent. NEVER guess a
+      picklist option id or internal name to avoid the second call.
+    """
+    entry = _REGISTRY.get(id)
+    if not entry:
+        return json.dumps({
+            "ok": False,
+            "error": f"Unknown endpoint id '{id}'. Call list_tool first to find a valid id.",
+        })
+
+    # Schema comes from the REAL original tool's own inputSchema
+    # (get_lead/get_contact/search_entity/create_entity), never a
+    # hand-authored one — see _real_get_schema/_real_search_schema/
+    # _real_create_schema and the snapshot mechanism above.
+    if entry["intent"] == "get":
+        original_get_tool = _REGISTRY_BUCKET_TO_GET_TOOL.get(entry["bucket"])
+        schema = _real_get_schema(original_get_tool) if original_get_tool else (entry.get("schema") or {})
+    elif entry["intent"] == "search":
+        schema = _real_search_schema()
+    elif entry["intent"] == "search_by_term":
+        schema = _real_search_by_term_schema()
+    elif entry["intent"] == "search_idle":
+        schema = _real_idle_schema()
+    elif entry["intent"] == "create":
+        schema = _real_create_schema()
+    elif entry["intent"] == "update":
+        schema = _real_update_schema()
+    elif entry["intent"] == "lookup":
+        schema = _real_get_schema(_REGISTRY_ID_TO_META_TOOL.get(id, ""))
+    else:
+        schema = entry.get("schema") or {}
+
+    fetched_live = False
+    live_fetch_error = None
+    if entry.get("dynamic_fields"):
+        fetch_fields_fn = _BUCKET_FIELD_FETCHERS.get(entry["bucket"])
+        if fetch_fields_fn is None:
+            live_fetch_error = f"No field-metadata fetcher wired for bucket '{entry['bucket']}' yet."
+        else:
+            try:
+                schema = await _fold_field_metadata_into_schema(
+                    schema, fetch_fields_fn,
+                    for_search=(entry["intent"] == "search"),
+                    requested_picklists=fields,
+                    bucket=entry["bucket"],
+                )
+                fetched_live = True
+            except KylasAPIError as e:
+                # Don't fail the whole call for this — method/path/usage_notes/example
+                # need no network access at all and are still genuinely useful on
+                # their own; only the live tenant field/picklist enrichment is missing.
+                live_fetch_error = e.message
+
+    result = {
+        "id": entry["id"],
+        "method": entry["method"],
+        "path": entry["path"],
+        "usage_notes": entry.get("usage_notes", ""),
+        "schema": schema,
+        "example": entry.get("example"),
+        "dynamic_fields": bool(entry.get("dynamic_fields")),
+        "fetched_live": fetched_live,
+    }
+    if live_fetch_error:
+        result["live_fetch_error"] = (
+            f"Could not fetch this tenant's live custom fields/picklist options: "
+            f"{live_fetch_error}. The schema/usage_notes/example above are still the "
+            f"real static shape — only the live tenant-specific enrichment is missing."
+        )
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# execute_request — step 3. Routes purely by (bucket, intent) read straight
+# off the registry entry into the SAME generic Python routers every other
+# entity-agnostic tool already uses — get_entity_logic / search_entity_logic /
+# search_entity_by_term_logic / search_idle_entities_logic / create_entity_logic
+# / update_entity_logic — never a hardcoded per-id mapping, and never a
+# reimplemented Kylas call. Adding a new bucket to the registry (e.g. "deal")
+# needs a "get_fn"/"search_fn"/etc. entry in _ENTITY_CONFIG/_ENTITY_CRUD_CONFIG
+# (if not already there) and nothing else here — no new Python per id.
+#
+# Known, deliberate asymmetry, not a bug: get_entity_logic/create_entity_logic/
+# update_entity_logic return a raw dict (clean, structured "data"); the three
+# search_*_logic routers return a pre-FORMATTED STRING (they already build
+# "Found N lead(s)/contact(s)..." text themselves, same as the old
+# search_leads/search_contacts tools did) — reused exactly as-is rather than
+# changed, so every search/search_by_term/search_idle id's "data" is a
+# display string, not a dict, unlike *.get/*.create/*.update. A related,
+# still-open point: those same three search_*_logic routers catch their own
+# KylasAPIError internally and return it as a "✗ ..." string rather than
+# raising — execute_request's try/except below can't see that failure, so
+# "ok" currently reads true even when the underlying search actually failed.
+# Not fixed here; flagging it exactly where it now lives.
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def execute_request(id: str, payload: Dict[str, Any]) -> str:
+    """
+    Step 3 of 3 in the generic CRM tool flow: actually perform the call for the
+    payload you built via build_payload, using the SAME id you called it with.
+    Runs this repo's existing, already-tested implementation for that specific
+    endpoint — e.g. "lead.create" runs the exact same create_lead_logic() the
+    original create_lead tool already used — never a newly written or
+    reimplemented HTTP call.
+
+    build_payload does not validate anything about your payload, so this is
+    where a malformed one is caught first (or, if it's shaped correctly but
+    semantically wrong, by Kylas's own API). Always returns a normalized JSON
+    envelope, never a raw exception and never an unhandled crash:
+      success: {"ok": true, "status": 200, "data": <result>}
+      failure: {"ok": false, "error": {"code": "<CODE>", "message": "<why>",
+                "details": <Kylas's own real error body, when Kylas rejected
+                the request>}}
+
+    ALWAYS read "error.details" when present, before concluding anything
+    about why a request failed — "error.message" alone is often just
+    "<Operation> failed: <status code>" with no real information, while
+    "details" carries Kylas's own specific reason (e.g. a duplicate-value
+    rejection, a required-field validation message, a business-rule lock).
+    Treating a bare message + status code as the full picture is how a
+    genuine data collision (e.g. "phone number already exists") gets
+    misdiagnosed as a payload-building bug — check details FIRST.
+
+    "data" on success is whatever that endpoint's real underlying logic already
+    returns — do not assume it is always the same shape across ids. For *.get
+    and *.create ids today, that's a structured dict (the real record). For
+    *.search ids today, that's a pre-formatted, human-readable string (e.g.
+    "Found 3 lead(s)..."), because that is genuinely what the reused search
+    logic already returns — reused exactly as-is, not restructured.
+
+    error.code values you may see:
+      "UNKNOWN_ID"  - this id isn't in the registry at all — call
+                      list_tool to find a real one.
+      "NOT_WIRED"   - the id exists but has no execute_request handler yet.
+      "BAD_PAYLOAD" - the payload was missing a required field or had the
+                      wrong type for it — since build_payload never validates,
+                      this is often the FIRST place that surfaces.
+      anything else - Kylas's own HTTP status code, or "KYLAS_ERROR" for a
+                      connection/auth failure reaching Kylas at all.
+
+    id: an endpoint id from list_tool/build_payload (e.g. "lead.create").
+    payload: the request body/args you built by hand from that SAME id's
+        build_payload schema. Never send a payload built for one id against
+        a different id — the two are not interchangeable even if they look
+        similar (e.g. lead.create vs contact.create).
+    """
+    entry = _REGISTRY.get(id)
+    if not entry:
+        return json.dumps({
+            "ok": False,
+            "error": {"code": "UNKNOWN_ID", "message": f"Unknown endpoint id '{id}'. Call list_tool first."},
+        }, indent=2)
+
+    bucket = entry["bucket"]
+    intent = entry["intent"]
+    payload = payload or {}
+
+    try:
+        if intent == "get":
+            # The id-field name genuinely differs per bucket (lead_id vs
+            # contact_id) — derived from the same real snapshot build_payload
+            # already uses for this bucket's schema, not a second hardcoded map.
+            original_get_tool = _REGISTRY_BUCKET_TO_GET_TOOL.get(bucket)
+            id_field = (_ORIGINAL_TOOL_PARAMETERS.get(original_get_tool, {}).get("required") or ["entity_id"])[0]
+            result = await get_entity_logic(bucket, payload[id_field])
+        elif intent == "search":
+            result = await search_entity_logic(
+                entity_type=bucket,
+                filters=payload.get("filters", []),
+                page=payload.get("page", 0),
+                size=payload.get("size", 20),
+                sort=payload.get("sort", "createdAt,desc"),
+            )
+        elif intent == "search_by_term":
+            result = await search_entity_by_term_logic(
+                entity_type=bucket,
+                search_term=payload["search_term"],
+                page=payload.get("page", 0),
+                size=payload.get("size", 20),
+                sort=payload.get("sort", "updatedAt,desc"),
+            )
+        elif intent == "search_idle":
+            result = await search_idle_entities_logic(
+                entity_type=bucket,
+                days=payload["days"],
+                time_zone=payload.get("time_zone"),
+                page=payload.get("page", 0),
+                size=payload.get("size", 20),
+                sort=payload.get("sort", "createdAt,desc"),
+            )
+        elif intent == "create":
+            result = await create_entity_logic(bucket, payload)
+        elif intent == "update":
+            update_payload = dict(payload)
+            entity_id = update_payload.pop("entity_id")
+            result = await update_entity_logic(bucket, entity_id, update_payload)
+        elif intent == "lookup":
+            router = _META_LOOKUP_ROUTERS.get(id)
+            if not router:
+                return json.dumps({
+                    "ok": False,
+                    "error": {"code": "NOT_WIRED", "message": f"'{id}' has no execute_request router wired yet."},
+                }, indent=2)
+            result = await router(payload)
+        else:
+            return json.dumps({
+                "ok": False,
+                "error": {"code": "NOT_WIRED", "message": f"intent '{intent}' has no execute_request router yet."},
+            }, indent=2)
+        return json.dumps({"ok": True, "status": 200, "data": result}, default=str, indent=2)
+    except KylasAPIError as e:
+        error_obj = {"code": str(e.status_code or "KYLAS_ERROR"), "message": e.message}
+        # e.response_body is Kylas's own raw error body (set by handle_api_response) —
+        # previously dropped here entirely, leaving only a bare "<op> failed: <code>"
+        # message with zero diagnostic value. Surface it as "details", parsed to a dict
+        # when it's real JSON (the common case) so a caller can read e.g. details.code /
+        # details.message directly, falling back to the raw string otherwise. Absent
+        # (key omitted) when there's no response body at all — e.g. a connection/auth
+        # failure that never reached Kylas.
+        if e.response_body:
+            try:
+                error_obj["details"] = json.loads(e.response_body)
+            except (json.JSONDecodeError, TypeError):
+                error_obj["details"] = e.response_body
+        return json.dumps({"ok": False, "error": error_obj}, indent=2)
+    except (KeyError, ValueError, TypeError) as e:
+        # Missing/malformed payload field (e.g. lead.get called without "lead_id") —
+        # never let this surface as a raw traceback to the client.
+        return json.dumps({
+            "ok": False,
+            "error": {"code": "BAD_PAYLOAD", "message": f"{type(e).__name__}: {e}"},
+        }, indent=2)
+    except Exception as e:
+        logger.exception("execute_request(%s)", id)
+        return json.dumps({
+            "ok": False,
+            "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+        }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Registry tool surface — final, not a toggle
+#
+# The 3-tool registry (list_tool/build_payload/execute_request) is this
+# server's only interface now. There used to be an MCP_TOOL_MODE env var
+# that switched between this and a legacy 38-tool surface with its own
+# always-visible per-entity instructions (SYSTEM_/DEAL_/COMPANY_/MEETING_/
+# CALL_LOG_/QUOTATION_SYSTEM_INSTRUCTIONS) — that toggle, the env var, and
+# every one of those instruction blocks have been deleted, not merely
+# disabled. SYSTEM_INSTRUCTIONS (defined near the top of this file, passed
+# to FastMCP(...) below) is the server's one and only instructions text.
+# ---------------------------------------------------------------------------
+
+# The tools kept advertised to a connecting client: the 3 core registry
+# tools, plus exactly 2 standalone tools that deliberately do NOT go through
+# the id-based flow:
+#   - get_current_user: no bucket at all — it's about the calling user, not
+#     any CRM entity. Needed to resolve the caller's own timezone before any
+#     datetime conversion.
+#   - get_entity_labels: MUST be called before any other tool, every
+#     session (this tenant may have renamed CRM entities — e.g. "Lid"
+#     instead of "Lead" — and every other tool/registry id only ever takes
+#     the STANDARD type, never the tenant's custom display name). That
+#     "call me first, unconditionally" contract is a stronger, session-level
+#     precondition than what the registry's "lookup" intent models (an
+#     on-demand resolution called when a specific field needs it) — see the
+#     MANDATORY FIRST CALL section of SYSTEM_INSTRUCTIONS. Deliberately NOT
+#     cached anywhere server-side and NOT folded into the registry as a
+#     _meta lookup id — see _fetch_entity_labels's own docstring for why
+#     (this server runs stateless_http; a process-wide cache leaked one
+#     tenant's labels into another's requests, which is what motivated
+#     pulling this back out to a live, always-fresh call).
+#
+# Every other former standalone tool has been folded into the registry
+# instead, reached via list_tool -> build_payload -> execute_request rather
+# than called directly:
+#   - get_pipeline_details, lookup_meeting_related_entity,
+#     lookup_entity_for_task, get_call_logs -> pipeline.details (_meta),
+#     meeting.lookup_related, task.lookup_entity, call_log.by_entity
+#   - lookup_users, lookup_products, lookup_pipelines -> user.lookup,
+#     product.lookup, pipeline.lookup (all _meta)
+#   - parse_datetime_to_utc_iso_tool -> datetime.parse_to_utc (_meta). Being
+#     a pure conversion with no Kylas API call at all doesn't block this —
+#     the router just calls the same Python function directly, same as
+#     every other _meta/lookup router.
+#   - search_tasks_with_any_relation -> task.search_any_relation. Its 4
+#     parallel is_not_null calls still can't be expressed as one
+#     task.search filter set, but that only ruled out modeling it as a
+#     search.* variant — the lookup-intent router dispatch (same mechanism
+#     task.lookup_entity already used) bypasses that limitation entirely.
+# See _REGISTRY_ID_TO_META_TOOL / _META_LOOKUP_ROUTERS below for how each of
+# these is actually dispatched — the underlying Python function for every
+# one of them still exists in this file unchanged, just no longer
+# separately advertised.
+_REGISTRY_ONLY_TOOL_NAMES = {
+    "list_tool", "build_payload", "execute_request",
+    "get_current_user", "get_entity_labels",
+}
+
+
+def _plain_component_name(key: str) -> str:
+    """
+    FastMCP's internal `_components` dict keys aren't always plain function
+    names — different versions have stored them as e.g. "build_payload" or
+    "tool:build_payload@..." / "resource:<uri>@...". Strip any "<kind>:" prefix
+    and any "@..." suffix so this keeps working across that difference (verified
+    against fastmcp 3.4.7 here; requirements.txt pins 3.2.4 for the real deploy —
+    don't assume they key it the same way without checking again if either changes).
+    """
+    name = key.split(":", 1)[1] if ":" in key else key
+    return name.split("@", 1)[0] if "@" in name else name
+
+
+# ---------------------------------------------------------------------------
+# Snapshot the REAL, original tools' own inputSchema — captured HERE, before
+# _finalize_tool_surface() below always removes them from what's advertised —
+# so build_payload can literally reuse them instead of a hand-authored
+# schema. get_lead/get_contact's real schemas are entity-specific and copied
+# as-is. search_entity/create_entity's real schemas are what ACTUALLY backed
+# every lead/contact search & create in the old system (standalone
+# search_leads/create_lead never existed as registered tools) — their
+# "filters"/"field_values" properties are copied as-is too; only their
+# "entity_type" property is dropped per bucket entry, since a registry id
+# like "lead.create" already fixes the entity type that "entity_type" would
+# otherwise redundantly ask for.
+# ---------------------------------------------------------------------------
+
+_ORIGINAL_TOOL_PARAMETERS: Dict[str, Dict[str, Any]] = {}
+
+
+def _snapshot_original_tool_parameters(tool_name: str) -> None:
+    for key, component in mcp.local_provider._components.items():
+        if _plain_component_name(key) == tool_name:
+            _ORIGINAL_TOOL_PARAMETERS[tool_name] = component.parameters
+            return
+
+
+for _name in (
+    "get_lead", "get_contact", "get_meeting", "get_deal", "get_task", "get_company", "get_quotation",
+    "search_entity", "search_entity_by_term", "search_idle_entities",
+    "create_entity", "update_entity",
+    "lookup_users", "lookup_products", "lookup_pipelines",
+    "get_pipeline_details", "lookup_meeting_related_entity",
+    "lookup_entity_for_task", "get_call_logs",
+    "parse_datetime_to_utc_iso_tool", "search_tasks_with_any_relation",
+):
+    _snapshot_original_tool_parameters(_name)
+
+# Maps a registry id in the bucket-less "_meta" group, or a bucket-scoped
+# "lookup" entry (meeting.lookup_related, task.lookup_entity,
+# call_log.by_entity), to the real old tool whose inputSchema build_payload
+# copies verbatim for it (reuses _real_get_schema — that function just
+# returns a snapshot verbatim, nothing lead/contact-specific about it
+# despite the name).
+_REGISTRY_ID_TO_META_TOOL: Dict[str, str] = {
+    "user.lookup": "lookup_users",
+    "product.lookup": "lookup_products",
+    "pipeline.lookup": "lookup_pipelines",
+    "pipeline.details": "get_pipeline_details",
+    "meeting.lookup_related": "lookup_meeting_related_entity",
+    "task.lookup_entity": "lookup_entity_for_task",
+    "call_log.by_entity": "get_call_logs",
+    "datetime.parse_to_utc": "parse_datetime_to_utc_iso_tool",
+    "task.search_any_relation": "search_tasks_with_any_relation",
+}
+
+
+async def _lookup_users_router(payload: Dict[str, Any]) -> str:
+    # Real schema's public param is "return_all" (lookup_users tool's own
+    # name for it) — translated here to "fetch_all_pages", the name
+    # lookup_users_logic itself actually takes. Not a new rule, just naming
+    # the same real thing the tool wrapper already renames internally.
+    return await lookup_users_logic(
+        query=payload.get("query", "name:"),
+        page=payload.get("page", 0),
+        size=payload.get("size", 50),
+        fetch_all_pages=payload.get("return_all", False),
+    )
+
+
+async def _lookup_products_router(payload: Dict[str, Any]) -> str:
+    # lookup_products_logic's own param names match the real lookup_products
+    # tool's schema exactly — no renaming needed here, unlike users above.
+    return await lookup_products_logic(
+        query=payload.get("query", ""),
+        page=payload.get("page", 0),
+        size=payload.get("size", 50),
+    )
+
+
+async def _lookup_pipelines_router(payload: Dict[str, Any]) -> str:
+    # Same — lookup_pipelines_logic's params (query/entity_type/page/size)
+    # match the real lookup_pipelines tool's schema as-is.
+    return await lookup_pipelines_logic(
+        query=payload.get("query", ""),
+        entity_type=payload.get("entity_type", "LEAD"),
+        page=payload.get("page", 0),
+        size=payload.get("size", 50),
+    )
+
+
+async def _pipeline_details_router(payload: Dict[str, Any]) -> str:
+    # get_pipeline_details_logic raises KylasAPIError on failure (same as the
+    # 3 routers above) — execute_request's own except blocks build the
+    # {"ok": false, "error": {...}} envelope from that, nothing special here.
+    return await get_pipeline_details_logic(payload["pipeline_id"])
+
+
+async def _meeting_lookup_related_router(payload: Dict[str, Any]) -> str:
+    # lookup_meeting_related_entity is called directly (the real, registered
+    # tool itself, not a "_logic" helper) — same reuse-as-is principle as
+    # every other router, just that this old tool's own dispatch body IS its
+    # logic. It self-catches KylasAPIError and returns an "Error: ..." string
+    # instead of raising, so a failure here surfaces as {"ok": true, "data":
+    # "Error: ..."} rather than {"ok": false, ...} — the same known,
+    # deliberate asymmetry already documented on the search_*_logic routers
+    # execute_request calls for *.search/*.search_by_term/*.search_idle ids.
+    return await lookup_meeting_related_entity(
+        entity_type=payload["entity_type"],
+        query=payload.get("query", ""),
+    )
+
+
+async def _task_lookup_entity_router(payload: Dict[str, Any]) -> str:
+    # Same self-catching shape/caveat as _meeting_lookup_related_router above.
+    return await lookup_entity_for_task(
+        entity_type=payload["entity_type"],
+        search_term=payload.get("search_term", ""),
+    )
+
+
+async def _call_log_by_entity_router(payload: Dict[str, Any]) -> str:
+    # Same self-catching shape/caveat as _meeting_lookup_related_router above.
+    return await get_call_logs(
+        entity_id=payload["entity_id"],
+        entity_type=payload["entity_type"],
+        page=payload.get("page", 0),
+        size=payload.get("size", 20),
+    )
+
+
+async def _datetime_parse_router(payload: Dict[str, Any]) -> str:
+    # parse_datetime_to_utc_iso_tool is a plain sync function (no Kylas API
+    # call at all — pure local conversion), unlike every other router here.
+    # It self-catches its own parse errors and returns an "Error: ..."
+    # string rather than raising, same asymmetry already documented on the
+    # search_*_logic routers execute_request calls elsewhere.
+    return parse_datetime_to_utc_iso_tool(
+        local_datetime=payload["local_datetime"],
+        timezone=payload["timezone"],
+    )
+
+
+async def _task_search_any_relation_router(payload: Dict[str, Any]) -> str:
+    # search_tasks_with_any_relation self-catches KylasAPIError/Exception
+    # and returns a "✗ ..." string rather than raising — same asymmetry
+    # already documented on the search_*_logic routers above.
+    return await search_tasks_with_any_relation(
+        page=payload.get("page", 0),
+        size=payload.get("size", 20),
+        sort=payload.get("sort", "createdAt,desc"),
+    )
+
+
+# "_meta" entries (and the bucket-scoped lookups below) are NOT
+# entity-CRUD-shaped like lead/contact — each one is its own standalone old
+# tool with its own real signature, so (unlike get/search/create/update)
+# there's no single generic _ENTITY_CONFIG-style router to reuse for
+# "lookup" intents; the old system never had one either (lookup_users/
+# lookup_products/lookup_pipelines/get_pipeline_details/
+# lookup_meeting_related_entity/lookup_entity_for_task/get_call_logs/
+# parse_datetime_to_utc_iso_tool/search_tasks_with_any_relation were always
+# separate, unrelated tools). One small explicit map, one line per id, is
+# the honest shape here — add a line per new "lookup" id, same as any other
+# dict-based dispatch already in this file.
+_META_LOOKUP_ROUTERS: Dict[str, Any] = {
+    "user.lookup": _lookup_users_router,
+    "product.lookup": _lookup_products_router,
+    "pipeline.lookup": _lookup_pipelines_router,
+    "pipeline.details": _pipeline_details_router,
+    "meeting.lookup_related": _meeting_lookup_related_router,
+    "task.lookup_entity": _task_lookup_entity_router,
+    "call_log.by_entity": _call_log_by_entity_router,
+    "datetime.parse_to_utc": _datetime_parse_router,
+    "task.search_any_relation": _task_search_any_relation_router,
+}
+
+
+def _without_entity_type(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop the "entity_type" property/requirement — redundant once a registry id fixes it."""
+    props = schema.get("properties", {})
+    props.pop("entity_type", None)
+    schema["required"] = [f for f in schema.get("required", []) if f != "entity_type"]
+    return schema
+
+
+def _real_get_schema(tool_name: str) -> Dict[str, Any]:
+    """get_lead/get_contact's real inputSchema, copied verbatim."""
+    return json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get(tool_name, {})))
+
+
+def _real_search_schema() -> Dict[str, Any]:
+    """
+    search_entity's real inputSchema, with "entity_type" removed (redundant —
+    the registry id already fixes it) and "page"/"size"/"sort" kept exactly
+    as search_entity actually declares them, defaults included.
+    """
+    schema = json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get("search_entity", {})))
+    return _without_entity_type(schema)
+
+
+def _real_search_by_term_schema() -> Dict[str, Any]:
+    """search_entity_by_term's real inputSchema, "entity_type" removed."""
+    schema = json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get("search_entity_by_term", {})))
+    return _without_entity_type(schema)
+
+
+def _real_idle_schema() -> Dict[str, Any]:
+    """search_idle_entities's real inputSchema, "entity_type" removed."""
+    schema = json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get("search_idle_entities", {})))
+    return _without_entity_type(schema)
+
+
+def _real_create_schema() -> Dict[str, Any]:
+    """
+    create_entity's real "field_values" property, unwrapped to the top level.
+    The real create_entity schema is {entity_type, field_values: {type:
+    object, additionalProperties: true}} — no field names anywhere; that
+    open-object shape (never firstName/lastName/email) IS the real old
+    system's schema, copied as-is. Unwrapped (not nested under
+    "field_values") because that's how execute_request's payload for these
+    ids actually is structured — a flat object, matching what
+    create_lead_logic/create_contact_logic themselves take.
+    """
+    schema = json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get("create_entity", {})))
+    field_values_schema = schema.get("properties", {}).get("field_values", {"type": "object", "additionalProperties": True})
+    return field_values_schema
+
+
+def _real_update_schema() -> Dict[str, Any]:
+    """
+    update_entity's real inputSchema is {entity_type, entity_id, field_values:
+    {type: object, additionalProperties: true}}. "entity_type" is dropped
+    (redundant, same as elsewhere); "entity_id" is KEPT as its real name
+    (not renamed to "lead_id") — a real naming inconsistency inherited
+    as-is from the old system (get_lead's own real schema calls the same
+    concept "lead_id"), not smoothed over here. "field_values" is unwrapped
+    to the top level via additionalProperties, same reasoning as
+    _real_create_schema — the payload here is flat, matching what
+    update_lead_logic/update_contact_logic actually take (id + field dict).
+    """
+    schema = json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get("update_entity", {})))
+    schema = _without_entity_type(schema)
+    props = schema.get("properties", {})
+    props.pop("field_values", None)
+    return {
+        "type": "object",
+        "properties": {"entity_id": props.get("entity_id", {"type": "integer"})},
+        "required": ["entity_id"],
+        "additionalProperties": True,
+    }
+
+
+def _finalize_tool_surface() -> None:
+    """
+    Unconditionally remove every registered tool/resource except
+    _REGISTRY_ONLY_TOOL_NAMES from what gets advertised. Always runs now —
+    there is no other mode to preserve. SYSTEM_INSTRUCTIONS itself already
+    describes only this final surface (set once, at FastMCP construction
+    time above); this function's only remaining job is trimming components.
+    """
+    components = mcp.local_provider._components
+    removed = [k for k in components if _plain_component_name(k) not in _REGISTRY_ONLY_TOOL_NAMES]
+    for k in removed:
+        del components[k]
+    logger.info(
+        "Registry tool surface finalized — advertising only %s (%d component(s) hidden, %d remain)",
+        sorted(_REGISTRY_ONLY_TOOL_NAMES), len(removed), len(components),
+    )
+
+
+_finalize_tool_surface()
 
 
 # ---------------------------------------------------------------------------
