@@ -126,6 +126,11 @@
     No pipeline, pipelineStage, associatedContacts, or products fields exist
     for companies.
 
+    Required: name, and ownedBy as {"id": <user_id>} — the owner field's API
+    name is "ownedBy" (a LOOK_UP), not "ownerId"; omitting it fails
+    validation. Resolve the id via user.lookup, or use get_current_user's id
+    when the owner is the current user.
+
     The payload argument you pass to execute_request IS the object below,
     sent exactly as-is — a flat JSON object with the field names directly as
     its top-level keys. Build this payload from user input only — no defaults, no extras. Keys:
@@ -148,8 +153,19 @@
     "primary": true}]. Email types: OFFICE, PERSONAL. Exactly one must be
     primary.
 
-    Picklist fields: use Option ID (number) from the live tenant_fields
-    below, except country → use internal name (string).
+    Picklist fields: send the whole option OBJECT — copy id and name from the
+    same option line in tenant_fields_reference below. Never a bare Option ID
+    and never a bare name string; a scalar is rejected here. The "use Option
+    ID / country → use internal name" rule is a company.search rule only.
+
+    annualRevenue (MONEY): must be {"currencyId": <id>, "value": <number>},
+    never a plain number. currencyId is the Currency picklist's own option id
+    from tenant_fields_reference below (e.g. India Rupees / INR = 431).
+
+    requirementCurrency is NOT writable on companies — it appears in the
+    field metadata as a PICK_LIST but stays null after create and update even
+    with a correct option object. Do not send it, and do not report it as
+    set; a company's currency is carried by annualRevenue.currencyId.
 
     Date / datetime fields: call get_current_user to get the user's
     timezone, then resolve datetime.parse_to_utc (list_tool -> build_payload
@@ -157,11 +173,11 @@
     datetime_string, timezone} and put the returned UTC ISO string directly
     in the payload.
 
-    Never guess IDs: ownerId and any other user reference — resolve
+    Never guess IDs: ownedBy and any other user reference — resolve
     user.lookup (list_tool -> build_payload -> execute_request; not a
     standalone tool) with {query} first; if multiple matches, list them and
     ask the user to pick.
-  example: {name: "Acme Corp", website: "https://acme.com", email: "contact@acme.com"}
+  example: {name: "Acme Corp", website: "https://acme.com", email: "contact@acme.com", ownedBy: {id: 31800}}
 
 - id: company.search_by_term
   bucket: company
