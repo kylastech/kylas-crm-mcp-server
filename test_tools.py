@@ -1503,7 +1503,7 @@ async def test_advance_deal_sequentially_happy_path():
     ]
     base_deal = {"id": 5, "pipeline": {"id": 1, "stage": {"id": 10}}}
 
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.deal.get_client") as mock_get_client:
         mock_client = AsyncMock()
         # Each PUT returns the deal with the new stage
         responses = [
