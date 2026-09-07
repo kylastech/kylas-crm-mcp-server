@@ -267,6 +267,21 @@ async def _fetch_entity_labels() -> Dict[str, Dict[str, str]]:
         return {}
 
 
+async def _fetch_current_user() -> Dict[str, Any]:
+    """Fetch current user from GET /users/me. Returns full user object (timezone, recordActions, name, etc.).
+
+    Lives here (not in main.py alongside the get_current_user() tool it backs)
+    because every entity's search_*_logic also calls this directly, as the
+    default-timezone fallback for date/datetime filters — an entities ->
+    main.py import would cycle with main.py's own entities.* imports for the
+    dispatch dicts. get_current_user() itself stays a standalone tool in
+    main.py; only this raw fetch needed to move.
+    """
+    async with get_client() as client:
+        response = await client.get("/users/me")
+        return await handle_api_response(response, "Fetch current user")
+
+
 # ---------------------------------------------------------------------------
 # Search: Operator mapping by field type & picklists that use internal name
 # ---------------------------------------------------------------------------
@@ -323,6 +338,15 @@ OPERATOR_SYMBOL_MAP = {
 
 # Picklist fields that use internal name (string) in search; all others use Option ID (long)
 PICKLIST_FIELDS_USE_INTERNAL_NAME = {"requirementCurrency", "companyBusinessType", "country", "timezone", "companyIndustry","companyCountry"}
+
+# Large picklists shared by lead/contact/company (each entity's own "large"
+# set ORs this in, per the field's two possible names across those buckets —
+# e.g. lead's "companyIndustry" vs company's own "industry").
+_LARGE_COMPANY_PICKLISTS = {
+    "country", "companycountry",
+    "companyindustry", "industry",
+    "companybusinesstype", "businesstype",
+}
 
 
 def _format_field(

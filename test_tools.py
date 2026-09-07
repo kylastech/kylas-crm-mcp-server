@@ -360,7 +360,7 @@ def test_normalize_field_values_picklist_at_top_level():
 
 @pytest.mark.asyncio
 async def test_get_lead_field_instructions_success():
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.lead.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_FIELDS_RESPONSE
@@ -400,7 +400,7 @@ async def test_get_lead_field_instructions_omits_large_picklist():
             },
         }
     ]
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.lead.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = mock_response_with_timezone
@@ -422,7 +422,7 @@ async def test_get_lead_field_instructions_omits_large_picklist():
 
 @pytest.mark.asyncio
 async def test_create_lead_dynamic_field_values():
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.lead.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_CREATE_LEAD_RESPONSE
@@ -454,7 +454,7 @@ async def test_create_lead_dynamic_field_values():
 
 @pytest.mark.asyncio
 async def test_create_lead_minimal_fields():
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.lead.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {"id": 1, "firstName": "A", "lastName": "B"}
@@ -680,7 +680,7 @@ async def test_lookup_products_logic():
 
 @pytest.mark.asyncio
 async def test_search_leads_logic():
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.lead.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -696,7 +696,7 @@ async def test_search_leads_logic():
         mock_client.__aexit__.return_value = None
         mock_get_client.return_value = mock_client
 
-        with patch("main._fetch_lead_fields") as mock_fetch:
+        with patch("entities.lead._fetch_lead_fields") as mock_fetch:
             mock_fetch.return_value = [
                 {"id": 1, "name": "firstName", "type": "TEXT_FIELD", "active": True, "filterable": True, "standard": True},
             ]
@@ -719,7 +719,7 @@ async def run_manual_tests():
 
     # Test 1
     print("\n[TEST 1] get_lead_field_instructions")
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.lead.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_FIELDS_RESPONSE
@@ -734,7 +734,7 @@ async def run_manual_tests():
 
     # Test 2
     print("\n[TEST 2] create_lead with dynamic field_values (custom field ID resolved to internal name)")
-    with patch("main.get_client") as mock_get_client, patch("main._get_custom_field_id_to_name") as mock_id_to_name:
+    with patch("entities.lead.get_client") as mock_get_client, patch("entities.lead._get_custom_field_id_to_name") as mock_id_to_name:
         mock_id_to_name.return_value = {"57256": "companySize"}
         mock_client = AsyncMock()
         mock_response = MagicMock()
@@ -877,7 +877,7 @@ async def test_search_entity_invalid_entity_type():
 @pytest.mark.asyncio
 async def test_search_entity_by_term_lead():
     """search_entity_by_term should search leads by term and format concisely."""
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.lead.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
