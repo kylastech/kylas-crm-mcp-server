@@ -814,7 +814,7 @@ async def test_search_entity_meeting_empty_filters():
 @pytest.mark.asyncio
 async def test_create_meeting_logic_strips_deals():
     from main import create_meeting_logic
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.meeting.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {"id": 123, "title": "Test Meeting"}
@@ -903,7 +903,7 @@ async def test_search_entity_by_term_lead():
 @pytest.mark.asyncio
 async def test_search_entity_by_term_meeting():
     """search_entity_by_term for meeting should search title field and format concisely including owner details."""
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.meeting.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -1585,8 +1585,8 @@ def test_build_deal_search_json_rule_date_converted_to_utc():
 @pytest.mark.asyncio
 async def test_search_meetings_logic_sort_alias():
     from main import search_meetings_logic
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_meeting_fields") as mock_fetch_fields:
+    with patch("entities.meeting.get_client") as mock_get_client, \
+         patch("entities.meeting._fetch_meeting_fields") as mock_fetch_fields:
          
         mock_fetch_fields.return_value = [
             {"id": 1, "name": "title", "type": "TEXT_FIELD", "active": True, "filterable": True, "standard": True},
@@ -1655,7 +1655,7 @@ def test_normalize_meeting_sort():
 async def test_search_meetings_by_term_sort_normalization():
     """search_meetings_by_term_logic should normalize sort (e.g. updatedAt -> from)."""
     from main import search_meetings_by_term_logic
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.meeting.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
