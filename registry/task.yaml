@@ -215,6 +215,15 @@
     user.lookup (list_tool -> build_payload -> execute_request; not a
     standalone tool) with {query} first; if multiple matches, list them and
     ask the user to pick.
+
+    assignedTo is effectively REQUIRED even though this tenant's live field
+    metadata does not mark it *REQUIRED* in build_payload's
+    tenant_fields_reference — Kylas's field-metadata endpoint under-reports
+    it, but POST /tasks rejects a task with no assignedTo. Always resolve
+    and include assignedTo (via user.lookup, or the current user's id from
+    get_current_user when the user says "assign to me") — do not treat its
+    absence from the *REQUIRED* markers as license to omit it, and do not
+    guess a value if the user hasn't said who to assign it to; ask them.
   example:
     name: "Follow up"
     dueDate: "2026-05-01T18:29:59.999Z"
