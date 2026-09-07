@@ -1823,7 +1823,7 @@ MOCK_QUOTATION_SEARCH_RESPONSE = {
 @pytest.mark.asyncio
 async def test_get_quotation_field_instructions_success():
     """get_quotation_field_instructions_logic returns a cheat sheet with standard and custom fields."""
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.quotation.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
@@ -1885,7 +1885,7 @@ def test_format_quotation_for_display_no_contacts():
 @pytest.mark.asyncio
 async def test_get_quotation_logic():
     """get_quotation_logic fetches a single quotation by ID."""
-    with patch("main.get_client") as mock_get_client:
+    with patch("entities.quotation.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_QUOTATION_DETAIL
@@ -1905,8 +1905,8 @@ async def test_get_quotation_logic():
 @pytest.mark.asyncio
 async def test_search_quotations_logic_with_filters():
     """search_quotations_logic returns formatted results when filters match."""
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+    with patch("entities.quotation.get_client") as mock_get_client, \
+         patch("entities.quotation._fetch_quotation_fields") as mock_fetch_fields:
 
         mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
 
@@ -1941,8 +1941,8 @@ async def test_search_quotations_logic_with_filters():
 @pytest.mark.asyncio
 async def test_search_quotations_logic_no_results():
     """search_quotations_logic returns a 'no results' message when nothing matches."""
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+    with patch("entities.quotation.get_client") as mock_get_client, \
+         patch("entities.quotation._fetch_quotation_fields") as mock_fetch_fields:
 
         mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
 
@@ -1965,8 +1965,8 @@ async def test_search_quotations_logic_no_results():
 @pytest.mark.asyncio
 async def test_search_quotations_by_term_logic():
     """search_quotations_by_term_logic searches by free-text term."""
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+    with patch("entities.quotation.get_client") as mock_get_client, \
+         patch("entities.quotation._fetch_quotation_fields") as mock_fetch_fields:
 
         mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
 
@@ -2012,9 +2012,9 @@ async def test_search_quotations_by_term_empty_term():
 @pytest.mark.asyncio
 async def test_search_idle_quotations_logic():
     """search_idle_quotations_logic finds quotations not updated for N days."""
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_quotation_fields") as mock_fetch_fields, \
-         patch("main._fetch_current_user") as mock_user:
+    with patch("entities.quotation.get_client") as mock_get_client, \
+         patch("entities.quotation._fetch_quotation_fields") as mock_fetch_fields, \
+         patch("entities.quotation._fetch_current_user") as mock_user:
 
         mock_user.return_value = {"timezone": "Asia/Calcutta"}
         mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
@@ -2083,8 +2083,8 @@ def test_quotation_in_entity_config():
 @pytest.mark.asyncio
 async def test_search_quotations_sort_validation():
     """search_quotations_logic only passes sort if the field is sortable."""
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+    with patch("entities.quotation.get_client") as mock_get_client, \
+         patch("entities.quotation._fetch_quotation_fields") as mock_fetch_fields:
 
         mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
 
