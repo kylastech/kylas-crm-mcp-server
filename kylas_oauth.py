@@ -155,15 +155,24 @@ class KylasTokenVerifier(TokenVerifier):
 
 
 class _ApiKeyAwareBearerBackend(BearerAuthBackend):
-    """Bearer-token auth, plus a legacy escape hatch for the ``x-api-key`` flow.
+    """Bearer-token auth, plus two escape hatches: raw Kylas tokens and ``x-api-key``.
 
-    OAuth clients still authenticate exactly as before (Bearer token → verifier).
-    Additionally, a request carrying a non-empty ``x-api-key`` header is allowed
-    through the auth gate WITHOUT OAuth: it gets a synthetic authenticated user whose
-    access token is empty, so ``main._resolve_auth_headers`` skips the OAuth branch and
-    falls through to the ``x-api-key`` header (which Kylas validates on the real API
-    call). This keeps pre-OAuth API-key clients working while OAuth is enabled — clients
-    that send neither a Bearer token nor an api-key still get 401 and must log in.
+    OAuth clients still authenticate exactly as before (proxy-issued JWT → verifier).
+    Two additional paths are tried, in order, when that lookup misses:
+
+    1. **Raw Kylas access token.** A request whose ``Authorization: Bearer`` carries a
+       token Kylas itself issued (e.g. one lifted from an embedded host-app session)
+       won't match the FastMCP JWTs the proxy issued, so the base backend rejects it.
+       We then verify the raw token directly against Kylas ``/users/me`` via the shared
+       verifier; if Kylas accepts it, it is forwarded as a real Bearer token on the API
+       call. There is no refresh — an expired token 401s at this gate, and the host app
+       supplies a fresh token on its next login.
+    2. **``x-api-key``.** A request carrying a non-empty ``x-api-key`` header gets a
+       synthetic authenticated user whose access token is empty, so
+       ``main._resolve_auth_headers`` skips the OAuth branch and falls through to the
+       ``x-api-key`` header (which Kylas validates on the real API call).
+
+    A request that satisfies none of these still gets 401 and must log in.
     """
 
     def __init__(self, provider: "KylasOAuthProxy") -> None:
@@ -171,10 +180,21 @@ class _ApiKeyAwareBearerBackend(BearerAuthBackend):
         self._provider = provider
 
     async def authenticate(self, conn):
-        # Real OAuth Bearer token wins whenever present and valid.
+        # Proxy-issued OAuth Bearer token wins whenever present and valid.
         result = await super().authenticate(conn)
         if result is not None:
             return result
+
+        # A raw Kylas access token presented as a Bearer token. Verify it directly
+        # against Kylas /users/me; if valid, forward it as a real Bearer token.
+        raw_token = self._bearer_token(conn)
+        if raw_token:
+            access = await self._provider._token_validator.verify_token(raw_token)
+            if access is not None:
+                scopes = list(access.scopes or [])
+                logger.debug("Request authenticated via raw Kylas access token")
+                return AuthCredentials(scopes), AuthenticatedUser(access)
+
         api_key = next(
             (conn.headers.get(k) for k in conn.headers if k.lower() == _API_KEY_HEADER), None
         )
@@ -185,6 +205,20 @@ class _ApiKeyAwareBearerBackend(BearerAuthBackend):
         synthetic = AccessToken(token="", client_id="kylas-x-api-key", scopes=scopes)
         logger.debug("Request authenticated via x-api-key header (OAuth gate bypassed)")
         return AuthCredentials(scopes), AuthenticatedUser(synthetic)
+
+    @staticmethod
+    def _bearer_token(conn) -> Optional[str]:
+        """Return the raw token from an ``Authorization: Bearer <token>`` header, if any."""
+        header = next(
+            (conn.headers.get(k) for k in conn.headers if k.lower() == "authorization"), None
+        )
+        if not header:
+            return None
+        scheme, _, value = header.partition(" ")
+        if scheme.lower() != "bearer":
+            return None
+        value = value.strip()
+        return value or None
 
 
 class KylasOAuthProxy(OAuthProxy):
