@@ -1,8 +1,7 @@
 """
 Test suite for Kylas CRM MCP Server (Lead only).
 
-Run: python test_tools.py
-Or: pytest test_tools.py -v
+Run: pytest tests/ -v
 """
 
 import asyncio
@@ -16,30 +15,34 @@ except ImportError:
         class mark:
             asyncio = lambda f: f
 
-import main
-from main import (
+from app import config, server, client, helpers, entities
+from app.helpers import (
     _normalize_country_code,
+    _format_field,
+    _normalize_field_values,
+    _get_filterable_fields_map,
+    _build_search_json_rule,
+    _format_entity_labels_for_instructions,
+)
+from app.entities import (
     get_lead_field_instructions_logic,
     create_lead_logic,
     search_leads_logic,
     lookup_users_logic,
     lookup_products_logic,
-    _format_field,
-    _normalize_field_values,
-    _get_filterable_fields_map,
-    _build_search_json_rule,
-    search_entity_logic,
-    search_entity_by_term_logic,
-    search_idle_entities_logic,
     search_leads_by_term_logic,
     search_meetings_by_term_logic,
-    _format_entity_labels_for_instructions,
     get_quotation_field_instructions_logic,
     get_quotation_logic,
     _format_quotation_for_display,
     search_quotations_logic,
     search_quotations_by_term_logic,
     search_idle_quotations_logic,
+)
+from app.tools import (
+    search_entity_logic,
+    search_entity_by_term_logic,
+    search_idle_entities_logic,
 )
 
 
@@ -359,7 +362,7 @@ def test_normalize_field_values_picklist_at_top_level():
 
 @pytest.mark.asyncio
 async def test_get_lead_field_instructions_success():
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_FIELDS_RESPONSE
@@ -399,7 +402,7 @@ async def test_get_lead_field_instructions_omits_large_picklist():
             },
         }
     ]
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = mock_response_with_timezone
@@ -421,7 +424,7 @@ async def test_get_lead_field_instructions_omits_large_picklist():
 
 @pytest.mark.asyncio
 async def test_create_lead_dynamic_field_values():
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_CREATE_LEAD_RESPONSE
@@ -453,7 +456,7 @@ async def test_create_lead_dynamic_field_values():
 
 @pytest.mark.asyncio
 async def test_create_lead_minimal_fields():
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {"id": 1, "firstName": "A", "lastName": "B"}
@@ -498,7 +501,7 @@ def test_build_search_json_rule_date_datetime():
         "convertedAt": {"type": "DATETIME_PICKER", "standard": True},
     }
     # today operator: value null, timeZone from default (patch so tests are deterministic)
-    with patch("main.DEFAULT_TIMEZONE", "Asia/Calcutta"):
+    with patch("app.helpers.DEFAULT_TIMEZONE", "Asia/Calcutta"):
         rules, err = _build_search_json_rule(
             [{"field": "createdAt", "operator": "today", "value": None}],
             filterable_map,
@@ -527,7 +530,7 @@ def test_build_search_json_rule_date_datetime():
     assert rules2["rules"][0]["timeZone"] == "Asia/Calcutta"
 
     # is_not_null: value null (uses default timeZone)
-    with patch("main.DEFAULT_TIMEZONE", "Asia/Calcutta"):
+    with patch("app.helpers.DEFAULT_TIMEZONE", "Asia/Calcutta"):
         rules3, err3 = _build_search_json_rule(
             [{"field": "convertedAt", "operator": "is_not_null", "value": None}],
             filterable_map,
@@ -607,7 +610,7 @@ def test_build_search_json_rule_rejects_non_filterable():
 
 @pytest.mark.asyncio
 async def test_lookup_users_logic():
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -627,7 +630,7 @@ async def test_lookup_users_logic():
         assert "First Last" in result
         assert "More than one user matched" in result
 
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {"content": [{"id": 594, "name": "Akshay"}], "totalElements": 1, "totalPages": 1}
@@ -643,7 +646,7 @@ async def test_lookup_users_logic():
 
 @pytest.mark.asyncio
 async def test_lookup_products_logic():
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -663,7 +666,7 @@ async def test_lookup_products_logic():
         assert "Widget A" in result
         assert "More than one product matched" in result
 
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {"content": [{"id": 245208, "name": "Widget Pro"}], "totalElements": 1, "totalPages": 1}
@@ -679,7 +682,7 @@ async def test_lookup_products_logic():
 
 @pytest.mark.asyncio
 async def test_search_leads_logic():
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -695,7 +698,7 @@ async def test_search_leads_logic():
         mock_client.__aexit__.return_value = None
         mock_get_client.return_value = mock_client
 
-        with patch("main._fetch_lead_fields") as mock_fetch:
+        with patch("app.entities._fetch_lead_fields") as mock_fetch:
             mock_fetch.return_value = [
                 {"id": 1, "name": "firstName", "type": "TEXT_FIELD", "active": True, "filterable": True, "standard": True},
             ]
@@ -718,7 +721,7 @@ async def run_manual_tests():
 
     # Test 1
     print("\n[TEST 1] get_lead_field_instructions")
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_FIELDS_RESPONSE
@@ -733,7 +736,7 @@ async def run_manual_tests():
 
     # Test 2
     print("\n[TEST 2] create_lead with dynamic field_values (custom field ID resolved to internal name)")
-    with patch("main.get_client") as mock_get_client, patch("main._get_custom_field_id_to_name") as mock_id_to_name:
+    with patch("app.entities.get_client") as mock_get_client, patch("app.entities._get_custom_field_id_to_name") as mock_id_to_name:
         mock_id_to_name.return_value = {"57256": "companySize"}
         mock_client = AsyncMock()
         mock_response = MagicMock()
@@ -783,7 +786,7 @@ async def run_manual_tests():
 @pytest.mark.asyncio
 async def test_search_entity_lead_with_filters():
     """search_entity should return formatted lead results when filters provided."""
-    from main import _ENTITY_CONFIG
+    from app.tools import _ENTITY_CONFIG
     with patch.dict(_ENTITY_CONFIG, {"lead": {"search_fn": AsyncMock(return_value="Found 5 leads"), "search_page_offset": 0}}):
         filters = [{"field": "firstName", "operator": "contains", "value": "John"}]
         result = await search_entity_logic("lead", filters, page=0, size=20)
@@ -800,7 +803,7 @@ async def test_search_entity_lead_without_filters_should_error():
 @pytest.mark.asyncio
 async def test_search_entity_meeting_empty_filters():
     """search_entity for meeting should allow empty filters (returns all)."""
-    with patch("main._ENTITY_CONFIG") as mock_config:
+    with patch("app.tools._ENTITY_CONFIG") as mock_config:
         mock_search = AsyncMock(return_value="Found 10 meetings")
         mock_config.get.return_value = {"search_fn": mock_search, "search_page_offset": 0}
         result = await search_entity_logic("meeting", [], page=0, size=20)
@@ -812,8 +815,8 @@ async def test_search_entity_meeting_empty_filters():
 
 @pytest.mark.asyncio
 async def test_create_meeting_logic_strips_deals():
-    from main import create_meeting_logic
-    with patch("main.get_client") as mock_get_client:
+    from app.entities import create_meeting_logic
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {"id": 123, "title": "Test Meeting"}
@@ -846,7 +849,8 @@ async def test_create_meeting_logic_strips_deals():
 
 @pytest.mark.asyncio
 async def test_create_meeting_logic_rejects_only_deals():
-    from main import create_meeting_logic, KylasAPIError
+    from app.client import KylasAPIError
+    from app.entities import create_meeting_logic
     
     # Payload with ONLY an invalid invitee (deal)
     field_values = {
@@ -876,7 +880,7 @@ async def test_search_entity_invalid_entity_type():
 @pytest.mark.asyncio
 async def test_search_entity_by_term_lead():
     """search_entity_by_term should search leads by term and format concisely."""
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -902,7 +906,7 @@ async def test_search_entity_by_term_lead():
 @pytest.mark.asyncio
 async def test_search_entity_by_term_meeting():
     """search_entity_by_term for meeting should search title field and format concisely including owner details."""
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -942,7 +946,7 @@ async def test_search_entity_by_term_invalid_entity():
     """search_entity_by_term should error on invalid entity type."""
     # The search_entity_by_term tool checks entity_type validity
     # We'll test the error path directly
-    from main import _ENTITY_CONFIG
+    from app.tools import _ENTITY_CONFIG
     cfg = _ENTITY_CONFIG.get("invalid")
     assert cfg is None
 
@@ -982,14 +986,14 @@ async def test_fetch_entity_labels_success():
         "CONTACT": {"displayName": "Quontact", "displayNamePlural": "Quontacts"},
     }
 
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.helpers.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = mock_labels
         mock_client.get.return_value = mock_response
         mock_get_client.return_value.__aenter__.return_value = mock_client
 
-        result = await main._fetch_entity_labels()
+        result = await helpers._fetch_entity_labels()
 
         assert result == mock_labels
         mock_client.get.assert_called_once()
@@ -1006,15 +1010,15 @@ async def test_fetch_entity_labels_not_cached():
     first_tenant_labels = {"LEAD": {"displayName": "Lid", "displayNamePlural": "Lids"}}
     second_tenant_labels = {"LEAD": {"displayName": "Prospect", "displayNamePlural": "Prospects"}}
 
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.helpers.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.side_effect = [first_tenant_labels, second_tenant_labels]
         mock_client.get.return_value = mock_response
         mock_get_client.return_value.__aenter__.return_value = mock_client
 
-        result_a = await main._fetch_entity_labels()
-        result_b = await main._fetch_entity_labels()
+        result_a = await helpers._fetch_entity_labels()
+        result_b = await helpers._fetch_entity_labels()
 
         assert result_a == first_tenant_labels
         assert result_b == second_tenant_labels
@@ -1024,13 +1028,13 @@ async def test_fetch_entity_labels_not_cached():
 @pytest.mark.asyncio
 async def test_fetch_entity_labels_api_error():
     """Test graceful handling when label fetch fails."""
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.helpers.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_client.get.side_effect = Exception("API connection failed")
         mock_get_client.return_value.__aenter__.return_value = mock_client
 
         # Should not raise, should return empty dict
-        result = await main._fetch_entity_labels()
+        result = await helpers._fetch_entity_labels()
 
         assert result == {}
 
@@ -1043,7 +1047,7 @@ def test_format_entity_labels_for_instructions():
         "CONTACT": {"displayName": "Quontact", "displayNamePlural": "Quontacts"},
     }
 
-    result = main._format_entity_labels_for_instructions(labels)
+    result = helpers._format_entity_labels_for_instructions(labels)
 
     # Should contain display names and lowercase standard types
     assert "Lid" in result
@@ -1063,7 +1067,7 @@ async def test_system_instructions_include_labels():
     }
 
     # Format labels
-    formatted = main._format_entity_labels_for_instructions(test_labels)
+    formatted = helpers._format_entity_labels_for_instructions(test_labels)
 
     # Verify formatted output contains expected content
     assert "Lid" in formatted
@@ -1076,21 +1080,21 @@ async def test_system_instructions_include_labels():
 def test_normalize_deal_payload_ownedby_int():
     """ownedBy as plain int should be wrapped as {"id": int}."""
     payload = {"name": "Deal A", "ownedBy": 7236}
-    result = main._normalize_deal_payload(payload)
+    result = entities._normalize_deal_payload(payload)
     assert result["ownedBy"] == {"id": 7236}
 
 
 def test_normalize_deal_payload_ownedby_already_dict():
     """ownedBy already a dict should be left unchanged."""
     payload = {"name": "Deal A", "ownedBy": {"id": 7236}}
-    result = main._normalize_deal_payload(payload)
+    result = entities._normalize_deal_payload(payload)
     assert result["ownedBy"] == {"id": 7236}
 
 
 def test_normalize_deal_payload_ownedby_bool_not_touched():
     """True/False must not be treated as int for ownedBy."""
     payload = {"ownedBy": True}
-    result = main._normalize_deal_payload(payload)
+    result = entities._normalize_deal_payload(payload)
     assert result["ownedBy"] is True
 
 
@@ -1098,21 +1102,21 @@ def test_normalize_deal_payload_monetary_with_existing():
     """Monetary field as plain number wraps using currencyId from existing deal."""
     existing = {"estimatedValue": {"currencyId": 431, "value": 1000}}
     payload = {"estimatedValue": 32}
-    result = main._normalize_deal_payload(payload, existing=existing)
+    result = entities._normalize_deal_payload(payload, existing=existing)
     assert result["estimatedValue"] == {"currencyId": 431, "value": 32}
 
 
 def test_normalize_deal_payload_monetary_no_existing():
     """Monetary field as plain number without existing deal is left as-is (no currencyId)."""
     payload = {"value": 500}
-    result = main._normalize_deal_payload(payload)
+    result = entities._normalize_deal_payload(payload)
     assert result["value"] == 500
 
 
 def test_normalize_deal_payload_monetary_already_dict():
     """Monetary field already a dict should be left unchanged."""
     payload = {"estimatedValue": {"currencyId": 99, "value": 250}}
-    result = main._normalize_deal_payload(payload)
+    result = entities._normalize_deal_payload(payload)
     assert result["estimatedValue"] == {"currencyId": 99, "value": 250}
 
 
@@ -1124,7 +1128,7 @@ def test_normalize_deal_payload_all_monetary_fields():
         "value": {"currencyId": 3, "value": 0},
     }
     payload = {"estimatedValue": 100, "actualValue": 200, "value": 300}
-    result = main._normalize_deal_payload(payload, existing=existing)
+    result = entities._normalize_deal_payload(payload, existing=existing)
     assert result["estimatedValue"] == {"currencyId": 1, "value": 100}
     assert result["actualValue"] == {"currencyId": 2, "value": 200}
     assert result["value"] == {"currencyId": 3, "value": 300}
@@ -1133,7 +1137,7 @@ def test_normalize_deal_payload_all_monetary_fields():
 def test_normalize_deal_payload_no_relevant_fields():
     """Payload with no ownedBy or monetary fields passes through unchanged."""
     payload = {"name": "Test Deal", "closingDate": "2025-12-31"}
-    result = main._normalize_deal_payload(payload)
+    result = entities._normalize_deal_payload(payload)
     assert result == {"name": "Test Deal", "closingDate": "2025-12-31"}
 
 
@@ -1226,23 +1230,23 @@ def _make_mock_context(client_name: str, client_version: str):
 def test_get_mcp_client_name_with_name_and_version():
     """Returns 'Name(version)' when both client name and version are present."""
     mock_ctx = _make_mock_context("Claude Desktop", "1.2.3")
-    with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
-        result = main._get_mcp_client_name()
+    with patch.object(server.mcp, "get_context", return_value=mock_ctx, create=True):
+        result = client._get_mcp_client_name()
     assert result == "Claude Desktop(1.2.3)"
 
 
 def test_get_mcp_client_name_without_version():
     """Returns just the name when version is empty."""
     mock_ctx = _make_mock_context("cursor", "")
-    with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
-        result = main._get_mcp_client_name()
+    with patch.object(server.mcp, "get_context", return_value=mock_ctx, create=True):
+        result = client._get_mcp_client_name()
     assert result == "cursor"
 
 
 def test_get_mcp_client_name_outside_request_context():
     """Returns 'unknown' when called outside a request (get_context raises)."""
-    with patch.object(main.mcp, "get_context", side_effect=LookupError, create=True):
-        result = main._get_mcp_client_name()
+    with patch.object(server.mcp, "get_context", side_effect=LookupError, create=True):
+        result = client._get_mcp_client_name()
     assert result == "unknown"
 
 
@@ -1252,18 +1256,18 @@ def test_get_mcp_client_name_no_client_params():
     mock_session.client_params = None
     mock_ctx = MagicMock()
     mock_ctx.session = mock_session
-    with patch.object(main.mcp, "get_context", return_value=mock_ctx, create=True):
-        result = main._get_mcp_client_name()
+    with patch.object(server.mcp, "get_context", return_value=mock_ctx, create=True):
+        result = client._get_mcp_client_name()
     assert result == "unknown"
 
 
 def test_throttled_client_context_user_agent_format():
     """User-Agent header must be 'kylas_mcp_server({version}) on {client}'."""
-    with patch("main._resolve_auth_headers", return_value={"api-key": "test-key"}), \
-         patch("main._get_mcp_client_name", return_value="Claude Desktop(1.2.3)"):
-        ctx = main._ThrottledClientContext()
+    with patch("app.client._resolve_auth_headers", return_value={"api-key": "test-key"}), \
+         patch("app.client._get_mcp_client_name", return_value="Claude Desktop(1.2.3)"):
+        ctx = client._ThrottledClientContext()
         ua = ctx._raw.headers.get("user-agent")
-    assert ua == f"kylas_mcp_server({main.SERVER_VERSION}) on Claude Desktop(1.2.3)"
+    assert ua == f"kylas_mcp_server({config.SERVER_VERSION}) on Claude Desktop(1.2.3)"
 
 
 # ---------------------------------------------------------------------------
@@ -1273,7 +1277,7 @@ def test_throttled_client_context_user_agent_format():
 @pytest.mark.asyncio
 async def test_create_entity_lead_success():
     """create_entity dispatches to create_lead_logic and formats the response."""
-    from main import create_entity, _ENTITY_CRUD_CONFIG
+    from app.tools import create_entity, _ENTITY_CRUD_CONFIG
     mock_result = {"id": 42, "firstName": "Jane", "lastName": "Doe"}
     with patch.dict(_ENTITY_CRUD_CONFIG, {"lead": {
         "create_fn": AsyncMock(return_value=mock_result),
@@ -1289,7 +1293,7 @@ async def test_create_entity_lead_success():
 @pytest.mark.asyncio
 async def test_create_entity_deal_success():
     """create_entity dispatches to create_deal_logic and formats the response."""
-    from main import create_entity, _ENTITY_CRUD_CONFIG
+    from app.tools import create_entity, _ENTITY_CRUD_CONFIG
     mock_result = {"id": 99, "name": "Big Deal"}
     with patch.dict(_ENTITY_CRUD_CONFIG, {"deal": {
         "create_fn": AsyncMock(return_value=mock_result),
@@ -1304,7 +1308,7 @@ async def test_create_entity_deal_success():
 @pytest.mark.asyncio
 async def test_create_entity_invalid_type():
     """create_entity returns an error message for unknown entity_type."""
-    from main import create_entity
+    from app.tools import create_entity
     result = await create_entity("unicorn", {"name": "test"})
     assert "✗" in result
     assert "unicorn" in result
@@ -1314,7 +1318,8 @@ async def test_create_entity_invalid_type():
 @pytest.mark.asyncio
 async def test_create_entity_api_error():
     """create_entity surfaces KylasAPIError cleanly."""
-    from main import create_entity, _ENTITY_CRUD_CONFIG, KylasAPIError
+    from app.client import KylasAPIError
+    from app.tools import create_entity, _ENTITY_CRUD_CONFIG
     err = KylasAPIError("Bad request")
     err.message = "Bad request"
     err.response_body = "{}"
@@ -1334,7 +1339,7 @@ async def test_create_entity_api_error():
 @pytest.mark.asyncio
 async def test_update_entity_lead_success():
     """update_entity dispatches to update_fn for lead and formats the response."""
-    from main import update_entity, _ENTITY_CRUD_CONFIG
+    from app.tools import update_entity, _ENTITY_CRUD_CONFIG
     mock_result = {"id": 55, "firstName": "Alice", "lastName": "Smith"}
     with patch.dict(_ENTITY_CRUD_CONFIG, {"lead": {
         "update_fn": AsyncMock(return_value=mock_result),
@@ -1349,7 +1354,7 @@ async def test_update_entity_lead_success():
 @pytest.mark.asyncio
 async def test_update_entity_deal_success():
     """update_entity dispatches to update_fn for deal and formats the response."""
-    from main import update_entity, _ENTITY_CRUD_CONFIG
+    from app.tools import update_entity, _ENTITY_CRUD_CONFIG
     mock_result = {"id": 77, "name": "Mega Deal"}
     with patch.dict(_ENTITY_CRUD_CONFIG, {"deal": {
         "update_fn": AsyncMock(return_value=mock_result),
@@ -1364,7 +1369,7 @@ async def test_update_entity_deal_success():
 @pytest.mark.asyncio
 async def test_update_entity_call_log_success():
     """update_entity dispatches to update_fn for call_log and formats the response."""
-    from main import update_entity, _ENTITY_CRUD_CONFIG
+    from app.tools import update_entity, _ENTITY_CRUD_CONFIG
     mock_result = {"id": 33, "callType": "outgoing", "outcome": "connected"}
     with patch.dict(_ENTITY_CRUD_CONFIG, {"call_log": {
         "update_fn": AsyncMock(return_value=mock_result),
@@ -1379,7 +1384,7 @@ async def test_update_entity_call_log_success():
 @pytest.mark.asyncio
 async def test_update_entity_invalid_type():
     """update_entity returns an error message for unknown entity_type."""
-    from main import update_entity
+    from app.tools import update_entity
     result = await update_entity("unicorn", 1, {"name": "test"})
     assert "✗" in result
     assert "unicorn" in result
@@ -1389,7 +1394,8 @@ async def test_update_entity_invalid_type():
 @pytest.mark.asyncio
 async def test_update_entity_api_error():
     """update_entity surfaces KylasAPIError cleanly."""
-    from main import update_entity, _ENTITY_CRUD_CONFIG, KylasAPIError
+    from app.client import KylasAPIError
+    from app.tools import update_entity, _ENTITY_CRUD_CONFIG
     err = KylasAPIError("Not found")
     err.message = "Not found"
     err.response_body = "{}"
@@ -1405,7 +1411,7 @@ async def test_update_entity_api_error():
 @pytest.mark.asyncio
 async def test_update_entity_value_error():
     """update_entity surfaces ValueError (e.g. missing phone country code) cleanly."""
-    from main import update_entity, _ENTITY_CRUD_CONFIG
+    from app.tools import update_entity, _ENTITY_CRUD_CONFIG
     with patch.dict(_ENTITY_CRUD_CONFIG, {"lead": {
         "update_fn": AsyncMock(side_effect=ValueError("phone: country/dial code required")),
         "name_fn": lambda r: "Lead",
@@ -1418,7 +1424,7 @@ async def test_update_entity_value_error():
 @pytest.mark.asyncio
 async def test_update_entity_calls_update_fn_with_correct_args():
     """update_entity passes entity_id and field_values to update_fn."""
-    from main import update_entity, _ENTITY_CRUD_CONFIG
+    from app.tools import update_entity, _ENTITY_CRUD_CONFIG
     mock_update = AsyncMock(return_value={"id": 10, "name": "Acme"})
     with patch.dict(_ENTITY_CRUD_CONFIG, {"company": {
         "update_fn": mock_update,
@@ -1433,28 +1439,32 @@ async def test_update_entity_calls_update_fn_with_correct_args():
 # ---------------------------------------------------------------------------
 
 def test_is_stage_lock_error_no_body():
-    from main import _is_stage_lock_error, KylasAPIError
+    from app.client import KylasAPIError
+    from app.helpers import _is_stage_lock_error
     err = KylasAPIError("some error")
     err.response_body = None
     assert _is_stage_lock_error(err) is False
 
 
 def test_is_stage_lock_error_invalid_json():
-    from main import _is_stage_lock_error, KylasAPIError
+    from app.client import KylasAPIError
+    from app.helpers import _is_stage_lock_error
     err = KylasAPIError("some error")
     err.response_body = "not json"
     assert _is_stage_lock_error(err) is False
 
 
 def test_is_stage_lock_error_correct_code():
-    from main import _is_stage_lock_error, KylasAPIError
+    from app.client import KylasAPIError
+    from app.helpers import _is_stage_lock_error
     err = KylasAPIError("stage lock")
     err.response_body = json.dumps({"code": "01001086", "message": "Stage lock"})
     assert _is_stage_lock_error(err) is True
 
 
 def test_is_stage_lock_error_different_code():
-    from main import _is_stage_lock_error, KylasAPIError
+    from app.client import KylasAPIError
+    from app.helpers import _is_stage_lock_error
     err = KylasAPIError("other error")
     err.response_body = json.dumps({"code": "00000001", "message": "Other"})
     assert _is_stage_lock_error(err) is False
@@ -1466,7 +1476,8 @@ def test_is_stage_lock_error_different_code():
 
 @pytest.mark.asyncio
 async def test_advance_deal_sequentially_invalid_current_stage():
-    from main import _advance_deal_to_stage_sequentially, KylasAPIError
+    from app.client import KylasAPIError
+    from app.entities import _advance_deal_to_stage_sequentially
     stages = [{"id": 1, "name": "S1", "forecastingType": "OPEN"}, {"id": 2, "name": "S2", "forecastingType": "OPEN"}]
     with pytest.raises(KylasAPIError, match="not found in pipeline"):
         await _advance_deal_to_stage_sequentially(99, stages, current_stage_id=999, target_stage_id=2, base_deal={})
@@ -1474,7 +1485,8 @@ async def test_advance_deal_sequentially_invalid_current_stage():
 
 @pytest.mark.asyncio
 async def test_advance_deal_sequentially_invalid_target_stage():
-    from main import _advance_deal_to_stage_sequentially, KylasAPIError
+    from app.client import KylasAPIError
+    from app.entities import _advance_deal_to_stage_sequentially
     stages = [{"id": 1, "name": "S1", "forecastingType": "OPEN"}, {"id": 2, "name": "S2", "forecastingType": "OPEN"}]
     with pytest.raises(KylasAPIError, match="not found in pipeline"):
         await _advance_deal_to_stage_sequentially(99, stages, current_stage_id=1, target_stage_id=999, base_deal={})
@@ -1482,7 +1494,8 @@ async def test_advance_deal_sequentially_invalid_target_stage():
 
 @pytest.mark.asyncio
 async def test_advance_deal_sequentially_target_before_current():
-    from main import _advance_deal_to_stage_sequentially, KylasAPIError
+    from app.client import KylasAPIError
+    from app.entities import _advance_deal_to_stage_sequentially
     stages = [
         {"id": 1, "name": "S1", "forecastingType": "OPEN"},
         {"id": 2, "name": "S2", "forecastingType": "OPEN"},
@@ -1494,7 +1507,7 @@ async def test_advance_deal_sequentially_target_before_current():
 
 @pytest.mark.asyncio
 async def test_advance_deal_sequentially_happy_path():
-    from main import _advance_deal_to_stage_sequentially
+    from app.entities import _advance_deal_to_stage_sequentially
     stages = [
         {"id": 10, "name": "S1", "forecastingType": "OPEN"},
         {"id": 20, "name": "S2", "forecastingType": "OPEN"},
@@ -1502,7 +1515,7 @@ async def test_advance_deal_sequentially_happy_path():
     ]
     base_deal = {"id": 5, "pipeline": {"id": 1, "stage": {"id": 10}}}
 
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         # Each PUT returns the deal with the new stage
         responses = [
@@ -1531,7 +1544,7 @@ async def test_advance_deal_sequentially_happy_path():
 # ---------------------------------------------------------------------------
 
 def test_operator_normalization_and_scheduled_at_alias_meeting():
-    from main import _build_meeting_search_json_rule
+    from app.entities import _build_meeting_search_json_rule
     filterable_map = {
         "from": {"type": "DATETIME_PICKER", "standard": True},
         "title": {"type": "TEXT_FIELD", "standard": True},
@@ -1562,7 +1575,7 @@ def test_operator_normalization_and_scheduled_at_alias_meeting():
 
 def test_build_deal_search_json_rule_date_converted_to_utc():
     """Regression: deal date filters convert local value → UTC (the original timezone bug)."""
-    from main import _build_deal_search_json_rule
+    from app.entities import _build_deal_search_json_rule
     filterable_map = {"createdAt": {"type": "DATETIME_PICKER", "standard": True}}
     filters = [
         {
@@ -1583,9 +1596,9 @@ def test_build_deal_search_json_rule_date_converted_to_utc():
 
 @pytest.mark.asyncio
 async def test_search_meetings_logic_sort_alias():
-    from main import search_meetings_logic
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_meeting_fields") as mock_fetch_fields:
+    from app.entities import search_meetings_logic
+    with patch("app.entities.get_client") as mock_get_client, \
+         patch("app.entities._fetch_meeting_fields") as mock_fetch_fields:
          
         mock_fetch_fields.return_value = [
             {"id": 1, "name": "title", "type": "TEXT_FIELD", "active": True, "filterable": True, "standard": True},
@@ -1616,7 +1629,7 @@ async def test_search_meetings_logic_sort_alias():
 
 
 def test_operator_normalization_in_general_search_rule_builder():
-    from main import _build_search_json_rule
+    from app.helpers import _build_search_json_rule
     filterable_map = {
         "firstName": {"type": "TEXT_FIELD", "standard": True},
         "createdAt": {"type": "DATETIME_PICKER", "standard": True},
@@ -1634,7 +1647,7 @@ def test_operator_normalization_in_general_search_rule_builder():
 
 def test_normalize_meeting_sort():
     """_normalize_meeting_sort maps unsupported sort fields to valid ones."""
-    from main import _normalize_meeting_sort
+    from app.entities import _normalize_meeting_sort
     # Unsupported fields are mapped to 'from'
     assert _normalize_meeting_sort("updatedAt,desc") == "from,desc"
     assert _normalize_meeting_sort("scheduledAt,asc") == "from,asc"
@@ -1653,8 +1666,8 @@ def test_normalize_meeting_sort():
 @pytest.mark.asyncio
 async def test_search_meetings_by_term_sort_normalization():
     """search_meetings_by_term_logic should normalize sort (e.g. updatedAt -> from)."""
-    from main import search_meetings_by_term_logic
-    with patch("main.get_client") as mock_get_client:
+    from app.entities import search_meetings_by_term_logic
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -1822,7 +1835,7 @@ MOCK_QUOTATION_SEARCH_RESPONSE = {
 @pytest.mark.asyncio
 async def test_get_quotation_field_instructions_success():
     """get_quotation_field_instructions_logic returns a cheat sheet with standard and custom fields."""
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
@@ -1884,7 +1897,7 @@ def test_format_quotation_for_display_no_contacts():
 @pytest.mark.asyncio
 async def test_get_quotation_logic():
     """get_quotation_logic fetches a single quotation by ID."""
-    with patch("main.get_client") as mock_get_client:
+    with patch("app.entities.get_client") as mock_get_client:
         mock_client = AsyncMock()
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_QUOTATION_DETAIL
@@ -1904,8 +1917,8 @@ async def test_get_quotation_logic():
 @pytest.mark.asyncio
 async def test_search_quotations_logic_with_filters():
     """search_quotations_logic returns formatted results when filters match."""
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+    with patch("app.entities.get_client") as mock_get_client, \
+         patch("app.entities._fetch_quotation_fields") as mock_fetch_fields:
 
         mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
 
@@ -1940,8 +1953,8 @@ async def test_search_quotations_logic_with_filters():
 @pytest.mark.asyncio
 async def test_search_quotations_logic_no_results():
     """search_quotations_logic returns a 'no results' message when nothing matches."""
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+    with patch("app.entities.get_client") as mock_get_client, \
+         patch("app.entities._fetch_quotation_fields") as mock_fetch_fields:
 
         mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
 
@@ -1964,8 +1977,8 @@ async def test_search_quotations_logic_no_results():
 @pytest.mark.asyncio
 async def test_search_quotations_by_term_logic():
     """search_quotations_by_term_logic searches by free-text term."""
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+    with patch("app.entities.get_client") as mock_get_client, \
+         patch("app.entities._fetch_quotation_fields") as mock_fetch_fields:
 
         mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
 
@@ -2011,9 +2024,9 @@ async def test_search_quotations_by_term_empty_term():
 @pytest.mark.asyncio
 async def test_search_idle_quotations_logic():
     """search_idle_quotations_logic finds quotations not updated for N days."""
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_quotation_fields") as mock_fetch_fields, \
-         patch("main._fetch_current_user") as mock_user:
+    with patch("app.entities.get_client") as mock_get_client, \
+         patch("app.entities._fetch_quotation_fields") as mock_fetch_fields, \
+         patch("app.entities._fetch_current_user") as mock_user:
 
         mock_user.return_value = {"timezone": "Asia/Calcutta"}
         mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
@@ -2036,7 +2049,7 @@ async def test_search_idle_quotations_logic():
 @pytest.mark.asyncio
 async def test_search_entity_quotation_via_dispatcher():
     """search_entity("quotation", ...) dispatches to search_quotations_logic."""
-    from main import _ENTITY_CONFIG
+    from app.tools import _ENTITY_CONFIG
     with patch.dict(_ENTITY_CONFIG, {"quotation": {
         "search_fn": AsyncMock(return_value="Found 3 quotation(s)"),
         "search_page_offset": 0,
@@ -2049,7 +2062,7 @@ async def test_search_entity_quotation_via_dispatcher():
 @pytest.mark.asyncio
 async def test_search_entity_by_term_quotation_via_dispatcher():
     """search_entity_by_term("quotation", ...) dispatches to search_quotations_by_term_logic."""
-    from main import _ENTITY_CONFIG
+    from app.tools import _ENTITY_CONFIG
     with patch.dict(_ENTITY_CONFIG, {"quotation": {
         "by_term_fn": AsyncMock(return_value="Found 1 quotation(s) for 'Annual'"),
         "search_page_offset": 0,
@@ -2061,7 +2074,7 @@ async def test_search_entity_by_term_quotation_via_dispatcher():
 
 def test_quotation_not_in_crud_config():
     """Quotation must NOT be in _ENTITY_CRUD_CONFIG (read-only entity)."""
-    from main import _ENTITY_CRUD_CONFIG
+    from app.tools import _ENTITY_CRUD_CONFIG
     assert "quotation" not in _ENTITY_CRUD_CONFIG, (
         "Quotation is read-only and must not have a CRUD config entry"
     )
@@ -2069,7 +2082,7 @@ def test_quotation_not_in_crud_config():
 
 def test_quotation_in_entity_config():
     """Quotation must be registered in _ENTITY_CONFIG for search dispatch."""
-    from main import _ENTITY_CONFIG
+    from app.tools import _ENTITY_CONFIG
     cfg = _ENTITY_CONFIG.get("quotation")
     assert cfg is not None, "quotation must be in _ENTITY_CONFIG"
     assert cfg["search_fn"] is not None
@@ -2082,8 +2095,8 @@ def test_quotation_in_entity_config():
 @pytest.mark.asyncio
 async def test_search_quotations_sort_validation():
     """search_quotations_logic only passes sort if the field is sortable."""
-    with patch("main.get_client") as mock_get_client, \
-         patch("main._fetch_quotation_fields") as mock_fetch_fields:
+    with patch("app.entities.get_client") as mock_get_client, \
+         patch("app.entities._fetch_quotation_fields") as mock_fetch_fields:
 
         mock_fetch_fields.return_value = MOCK_QUOTATION_FIELDS_RESPONSE
 

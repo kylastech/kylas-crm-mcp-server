@@ -3,7 +3,7 @@
 .env
 .env.*
 main.py
-kylas_oauth.py
+app
 requirements.txt
 .venv
 .idea
@@ -16,7 +16,7 @@ __pycache__
 docs
 .claude
 *.egg-info
-test_tools.py
+tests
 PUBLISHING.md
 .github
 .DS_Store
