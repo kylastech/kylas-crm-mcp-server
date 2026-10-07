@@ -8,8 +8,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Application
-COPY main.py ./
-COPY app/ ./app/
+COPY main.py kylas_oauth.py ./
 COPY registry/ ./registry/
 
 ENV PYTHONUNBUFFERED=1
