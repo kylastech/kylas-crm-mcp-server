@@ -1,3 +1,5 @@
+version: "3.8"
+
 services:
   kylas-mcp:
     build: .
@@ -14,8 +16,7 @@ services:
       - KYLAS_CLIENT_SECRET=${KYLAS_CLIENT_SECRET}
       - MCP_SERVER_BASE_URL=${MCP_SERVER_BASE_URL}
     ports:
-      # Host port 8000 is often taken locally; override with HOST_PORT=... if needed
-      - "${HOST_PORT:-8090}:8000"
+      - "8000:8000"
     volumes:
       - fastmcp-data:/root/.local/share/fastmcp
     restart: unless-stopped
