@@ -195,8 +195,8 @@ def test_format_field_custom_with_picklist():
     assert "[CUSTOM]" in lines[0]
     assert "Field ID: '57300'" in lines[0]
     assert "Options" in lines[1]
-    assert "Small (ID: 12345)" in lines[2]
-    assert "Large (ID: 67890)" in lines[3]
+    assert "Small (internal name: ''),(ID: 12345)" in lines[2]
+    assert "Large (internal name: ''),(ID: 67890)" in lines[3]
 
 
 def test_format_field_omits_large_picklist_options():
@@ -377,8 +377,8 @@ async def test_get_lead_field_instructions_success():
         assert "KYLAS CRM - LEAD FIELDS CHEAT SHEET" in result
         assert "[STANDARD] 'First Name' (API Name: 'firstName')" in result
         assert "[CUSTOM] 'Company Size' (Field ID: '57300'" in result
-        assert "Website (ID: 1001)" in result
-        assert "Small (ID: 12345)" in result
+        assert "Website (internal name: ''),(ID: 1001)" in result
+        assert "Small (internal name: ''),(ID: 12345)" in result
 
 
 @pytest.mark.asyncio
@@ -418,8 +418,8 @@ async def test_get_lead_field_instructions_omits_large_picklist():
         assert 'build_payload(id, fields=["timezone"])' in result
         assert "Asia/Calcutta" not in result
         # Non-large picklists are unaffected.
-        assert "Website (ID: 1001)" in result
-        assert "Small (ID: 12345)" in result
+        assert "Website (internal name: ''),(ID: 1001)" in result
+        assert "Small (internal name: ''),(ID: 12345)" in result
 
 
 @pytest.mark.asyncio
@@ -1851,10 +1851,10 @@ async def test_get_quotation_field_instructions_success():
         assert "[STANDARD]" in result
         assert "'Summary'" in result
         assert "'quotationNumber'" in result
-        assert "Draft (ID: 9001)" in result
+        assert "Draft (internal name: ''),(ID: 9001)" in result
         assert "## CUSTOM FIELDS" in result
         assert "'Region'" in result
-        assert "North (ID: 50001)" in result
+        assert "North (internal name: ''),(ID: 50001)" in result
 
 
 def test_format_quotation_for_display_full():
