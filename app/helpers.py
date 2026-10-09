@@ -203,7 +203,7 @@ async def _fetch_entity_labels() -> Dict[str, Dict[str, str]]:
     """
     try:
         async with get_client() as client:
-            resp = await client.get("/v1/entities/label")
+            resp = await client.get(f"{BASE_URL}/v1/entities/label")
             labels = resp.json()
             summary = "\n".join(
                 f"  • {etype:8} => {data.get('displayName', etype)} / {data.get('displayNamePlural', etype)}"
