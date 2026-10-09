@@ -1,0 +1,74 @@
+# registry/report.yaml
+#
+# Registry entries for the "report" bucket (Kylas reports, sd-report service).
+#
+# Same split as every other bucket file: this YAML says what the operation is
+# and how an LLM should use it; app/reports.py owns the request schema
+# (REPORT_CREATE_SCHEMA), the live config reference and the execution
+# (create_report_logic). Unlike the entity buckets, the live reference comes
+# from GET /v1/reports/config/{entityPlural} — the same call the Kylas web
+# app's report builder makes — so build_payload needs an extra "entity"
+# argument for these ids.
+#
+# Phase 1: report.create for category ONE_DIMENSIONAL only. Filters whose
+# values need a lookup that has no registry id yet (teams, campaigns,
+# activities, pipeline stages, meeting invitees/organizer, record lookups)
+# are listed as "NOT SUPPORTED YET" in the reference and rejected on create.
+
+- id: report.create
+  bucket: report
+  intent: create
+  method: POST
+  path: /v3/reports
+  dynamic_fields: true
+  description: "Create a one-dimensional report (chart or table) on leads, deals, contacts, companies, tasks, meetings, calls, emails or quotations."
+  usage_notes: >
+    Call build_payload("report.create", entity="<entity>") FIRST — entity is
+    required and is one of lead, deal, contact, company, task, meeting, call,
+    email, quotation (the STANDARD type). tenant_fields_reference then lists,
+    for that entity only: the dimensions you can group by, the metrics, the
+    date fields and date operators, and every filter with its allowed
+    operators and value format. Use ONLY ids listed there. Large picklist
+    filters (country, timezone, companyIndustry, requirementCurrency,
+    currency, ...) show an "options omitted" stub — re-call build_payload
+    with fields=["<that filter>"] if the user mentioned one.
+
+    The payload is SHORT and flat — the server validates it against the live
+    config and builds the full Kylas report body itself (types, field input
+    types, time-of-day, UTC conversion, category). Keys: entity, name (3-255
+    chars), description (optional), chart_type (bar | pie | table, default
+    bar), group_by {field, format}, metrics [{type, field}], date_range
+    {field, operator, value?}, filters [{field, operator, value?}] (optional).
+
+    group_by: exactly one dimension. format is REQUIRED for date dimensions
+    (YEARLY, QUARTERLY, MONTHLY, WEEKLY, DAILY; FINANCIAL_YEARLY /
+    FINANCIAL_QUARTERLY only for INR tenants) and must be omitted otherwise.
+    If the dimension lists "REQUIRES filter(s)", add those filters.
+
+    metrics: COUNT id = number of records. With more than one metric the
+    chart becomes a table (the server switches it and says so in "notes").
+
+    date_range is required. If the user gave no period, use createdAt with
+    current_month — the web app's default — and tell the user. For "between"
+    give value [start, end] in the user's own local time (date or datetime);
+    the server converts to UTC. last_n_days / next_n_days take value N
+    (1-364). The date_range field cannot also be used as a filter.
+
+    filters: lookup filters (owner, created by, product, pipeline, ...) take
+    numeric ids — resolve them via the registry id named in the reference
+    (user.lookup, product.lookup, pipeline.lookup); never guess an id.
+    Picklist filters take an option from the reference (id, internal name or
+    label are all accepted). is_null / is_not_null / is_empty / is_not_empty
+    take no value; in / not_in take a list.
+
+    On success data is {id, name, reportType, chartType, category, notes?}.
+    Tell the user the report was created only when execute_request returned
+    ok true.
+  example:
+    entity: lead
+    name: "Leads by source - this month"
+    chart_type: bar
+    group_by: {field: source}
+    metrics: [{type: COUNT, field: id}]
+    date_range: {field: createdAt, operator: current_month}
+    filters: [{field: country, operator: equal, value: IN}]
