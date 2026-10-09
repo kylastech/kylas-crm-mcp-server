@@ -1911,7 +1911,7 @@ async def test_get_quotation_logic():
 
         assert result["id"] == 7001
         assert result["quotationNumber"] == "QT-0042"
-        mock_client.get.assert_called_once_with("/quotations/7001")
+        mock_client.get.assert_called_once_with("/v1/quotations/7001")
 
 
 @pytest.mark.asyncio

@@ -163,7 +163,7 @@ async def get_lead_field_instructions() -> str:
 async def _fetch_current_user() -> Dict[str, Any]:
     """Fetch current user from GET /users/me. Returns full user object (timezone, recordActions, name, etc.)."""
     async with get_client() as client:
-        response = await client.get("/users/me")
+        response = await client.get("/v1/users/me")
         return await handle_api_response(response, "Fetch current user")
 
 
@@ -455,7 +455,7 @@ async def get_pipeline_stages_logic(pipeline_id: int) -> str:
         }
     }
     async with get_client() as client:
-        response = await client.post("/pipelines/summary", json=payload)
+        response = await client.post("/v1/pipelines/summary", json=payload)
         data = await handle_api_response(response, "Pipeline summary")
     # Response is array of {id, name, stages: [{id, name, position, forecastingType}]}
     pipelines = data if isinstance(data, list) else data.get("content", data.get("data", []))
@@ -598,7 +598,7 @@ def parse_datetime_to_utc_iso_tool(local_datetime: str, timezone: str) -> str:
 async def _get_pipeline_details_raw(pipeline_id: int) -> Dict[str, Any]:
     """Fetch raw pipeline details dict from GET /pipelines/{id}."""
     async with get_client() as client:
-        response = await client.get(f"/pipelines/{int(pipeline_id)}")
+        response = await client.get(f"/v1/pipelines/{int(pipeline_id)}")
         return await handle_api_response(response, "Get pipeline details")
 
 
@@ -642,7 +642,7 @@ async def _advance_deal_to_stage_sequentially(
                 forecast_type = stage.get("forecastingType")
                 if forecast_type:
                     merged["forecastingType"] = forecast_type
-            response = await client.put(f"/deals/{deal_id}", json=merged)
+            response = await client.put(f"/v1/deals/{deal_id}", json=merged)
             result = await handle_api_response(response, f"Advance deal {deal_id} to stage {stage_id}")
             logger.info("Deal %s advanced to stage %s (%s)", deal_id, stage_id, stage.get("name", ""))
 
@@ -661,7 +661,7 @@ async def create_lead_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
         raise KylasAPIError("field_values cannot be empty")
     logger.info("📝 Creating lead with fields: %s", list(payload.keys()))
     async with get_client() as client:
-        response = await client.post("/leads", json=payload)
+        response = await client.post("/v1/leads", json=payload)
         result = await handle_api_response(response, "Create lead")
         logger.info("✅ Lead created with ID: %s", result.get("id"))
         return result
@@ -684,7 +684,7 @@ async def update_lead_logic(lead_id: int, field_values: Dict[str, Any]) -> Dict[
         raise KylasAPIError("field_values produced an empty payload.")
     logger.info("🔄 Updating lead %s with fields: %s", lead_id, list(payload.keys()))
     async with get_client() as client:
-        get_response = await client.get(f"/leads/{lead_id}")
+        get_response = await client.get(f"/v1/leads/{lead_id}")
         existing = await handle_api_response(get_response, "Get lead")
         merged = dict(existing)
         for key, value in payload.items():
@@ -722,7 +722,7 @@ async def update_lead_logic(lead_id: int, field_values: Dict[str, Any]) -> Dict[
                     raise KylasAPIError("Lead has no pipeline; cannot set stage. Use move_lead_to_stage instead.")
             else:
                 merged[key] = value
-        response = await client.put(f"/leads/{lead_id}", json=merged)
+        response = await client.put(f"/v1/leads/{lead_id}", json=merged)
         result = await handle_api_response(response, "Update lead")
         logger.info("✅ Lead %s updated", lead_id)
         return result
@@ -736,7 +736,7 @@ async def get_lead_logic(lead_id: int) -> Dict[str, Any]:
     """Fetch a single lead by ID (GET /leads/{id}). Returns full lead object."""
     lead_id = int(lead_id)
     async with get_client() as client:
-        response = await client.get(f"/leads/{lead_id}")
+        response = await client.get(f"/v1/leads/{lead_id}")
         return await handle_api_response(response, "Get lead")
 
 
@@ -876,7 +876,7 @@ async def search_leads_logic(
         params["sort"] = sort
     logger.info("Searching leads with %d filter(s)", len(filters))
     async with get_client() as client:
-        response = await client.post("/search/lead", params=params, json=payload)
+        response = await client.post("/v1/search/lead", params=params, json=payload)
         data = await handle_api_response(response, "Search leads")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -1032,7 +1032,7 @@ async def create_contact_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
         raise KylasAPIError("field_values cannot be empty")
     logger.info("Creating contact with fields: %s", list(payload.keys()))
     async with get_client() as client:
-        response = await client.post("/contacts", json=payload)
+        response = await client.post("/v1/contacts", json=payload)
         result = await handle_api_response(response, "Create contact")
         logger.info("Contact created with ID: %s", result.get("id"))
         return result
@@ -1051,7 +1051,7 @@ async def update_contact_logic(contact_id: int, field_values: Dict[str, Any]) ->
         raise KylasAPIError("field_values produced an empty payload.")
     logger.info("Updating contact %s with fields: %s", contact_id, list(payload.keys()))
     async with get_client() as client:
-        get_response = await client.get(f"/contacts/{contact_id}")
+        get_response = await client.get(f"/v1/contacts/{contact_id}")
         existing = await handle_api_response(get_response, "Get contact")
         merged = dict(existing)
         for key, value in payload.items():
@@ -1059,7 +1059,7 @@ async def update_contact_logic(contact_id: int, field_values: Dict[str, Any]) ->
                 merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
             else:
                 merged[key] = value
-        response = await client.put(f"/contacts/{contact_id}", json=merged)
+        response = await client.put(f"/v1/contacts/{contact_id}", json=merged)
         result = await handle_api_response(response, "Update contact")
         logger.info("Contact %s updated", contact_id)
         return result
@@ -1147,7 +1147,7 @@ async def get_contact_logic(contact_id: int) -> Dict[str, Any]:
     """Fetch a single contact by ID (GET /contacts/{id}). Returns full contact object."""
     contact_id = int(contact_id)
     async with get_client() as client:
-        response = await client.get(f"/contacts/{contact_id}")
+        response = await client.get(f"/v1/contacts/{contact_id}")
         return await handle_api_response(response, "Get contact")
 
 
@@ -1206,7 +1206,7 @@ async def search_contacts_logic(
         params["sort"] = sort
     logger.info("Searching contacts with %d filter(s)", len(filters))
     async with get_client() as client:
-        response = await client.post("/search/contact", params=params, json=payload)
+        response = await client.post("/v1/search/contact", params=params, json=payload)
         data = await handle_api_response(response, "Search contacts")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -1345,7 +1345,7 @@ async def create_task_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
         raise KylasAPIError("field_values cannot be empty")
     logger.info("Creating task with fields: %s", list(payload.keys()))
     async with get_client() as client:
-        response = await client.post("/tasks", json=payload)
+        response = await client.post("/v1/tasks", json=payload)
         result = await handle_api_response(response, "Create task")
         logger.info("Task created with ID: %s", result.get("id"))
         return result
@@ -1364,7 +1364,7 @@ async def update_task_logic(task_id: int, field_values: Dict[str, Any]) -> Dict[
         raise KylasAPIError("field_values produced an empty payload.")
     logger.info("Updating task %s with fields: %s", task_id, list(payload.keys()))
     async with get_client() as client:
-        get_response = await client.get(f"/tasks/{task_id}")
+        get_response = await client.get(f"/v1/tasks/{task_id}")
         existing = await handle_api_response(get_response, "Get task")
         merged = dict(existing)
         for key, value in payload.items():
@@ -1372,7 +1372,7 @@ async def update_task_logic(task_id: int, field_values: Dict[str, Any]) -> Dict[
                 merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
             else:
                 merged[key] = value
-        response = await client.put(f"/tasks/{task_id}", json=merged)
+        response = await client.put(f"/v1/tasks/{task_id}", json=merged)
         result = await handle_api_response(response, "Update task")
         logger.info("Task %s updated", task_id)
         return result
@@ -1444,7 +1444,7 @@ async def get_task_logic(task_id: int) -> Dict[str, Any]:
     """
     task_id = int(task_id)
     async with get_client() as client:
-        response = await client.get(f"/tasks/{task_id}")
+        response = await client.get(f"/v1/tasks/{task_id}")
         return await handle_api_response(response, "Get task")
 
 
@@ -1503,7 +1503,7 @@ async def search_tasks_logic(
         params["sort"] = sort
     logger.info("Searching tasks with %d filter(s): jsonRule=%s", len(filters), json_rule)
     async with get_client() as client:
-        response = await client.post("/tasks/search", params=params, json=payload)
+        response = await client.post("/v1/tasks/search", params=params, json=payload)
         data = await handle_api_response(response, "Search tasks")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -1647,7 +1647,7 @@ async def _fetch_raw_tasks_for_relation(
     if sort:
         params["sort"] = sort
     async with get_client() as client:
-        response = await client.post("/tasks/search", params=params, json=payload)
+        response = await client.post("/v1/tasks/search", params=params, json=payload)
         data = await handle_api_response(response, f"Search tasks ({relation_field} is_not_null)")
     return data.get("content", data.get("data", []))
 
@@ -1986,7 +1986,7 @@ async def create_deal_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("Creating deal with fields: %s", list(payload.keys()))
     async with get_client() as client:
         try:
-            response = await client.post("/deals", json=payload)
+            response = await client.post("/v1/deals", json=payload)
             result = await handle_api_response(response, "Create deal")
             logger.info("Deal created with ID: %s", result.get("id"))
             return result
@@ -2021,7 +2021,7 @@ async def create_deal_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     first_payload["forecastingType"] = first_stage.get("forecastingType", first_payload.get("forecastingType"))
 
     async with get_client() as client:
-        response = await client.post("/deals", json=first_payload)
+        response = await client.post("/v1/deals", json=first_payload)
         deal = await handle_api_response(response, "Create deal (first stage)")
 
     deal_id = deal["id"]
@@ -2043,7 +2043,7 @@ async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[
         raise KylasAPIError("field_values produced an empty payload.")
     logger.info("Updating deal %s with fields: %s", deal_id, list(payload.keys()))
     async with get_client() as client:
-        get_response = await client.get(f"/deals/{deal_id}")
+        get_response = await client.get(f"/v1/deals/{deal_id}")
         existing = await handle_api_response(get_response, "Get deal")
         payload = _normalize_deal_payload(payload, existing=existing)
         merged = dict(existing)
@@ -2171,7 +2171,7 @@ async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[
                     current_stage_id_for_lock = existing_stage.get("id")
 
         try:
-            response = await client.put(f"/deals/{deal_id}", json=merged)
+            response = await client.put(f"/v1/deals/{deal_id}", json=merged)
             result = await handle_api_response(response, "Update deal")
             logger.info("Deal %s updated", deal_id)
             return result
@@ -2200,7 +2200,7 @@ async def get_deal_logic(deal_id: int) -> Dict[str, Any]:
     """Fetch a single deal by ID (GET /deals/{id}). Returns full deal object."""
     deal_id = int(deal_id)
     async with get_client() as client:
-        response = await client.get(f"/deals/{deal_id}")
+        response = await client.get(f"/v1/deals/{deal_id}")
         return await handle_api_response(response, "Get deal")
 
 
@@ -2363,7 +2363,7 @@ async def search_deals_logic(
         params["sort"] = sort
     logger.info("Searching deals with %d filter(s)", len(filters))
     async with get_client() as client:
-        response = await client.post("/search/deal", params=params, json=payload)
+        response = await client.post("/v1/search/deal", params=params, json=payload)
         data = await handle_api_response(response, "Search deals")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -2456,7 +2456,7 @@ async def search_deals_by_term_logic(
         params["sort"] = sort
     logger.info("Searching deals by term: %r", term)
     async with get_client() as client:
-        response = await client.post("/search/deal", params=params, json=payload)
+        response = await client.post("/v1/search/deal", params=params, json=payload)
         data = await handle_api_response(response, "Search deals by term")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -2709,7 +2709,7 @@ async def create_company_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
         raise KylasAPIError("field_values cannot be empty")
     logger.info("Creating company with fields: %s", list(payload.keys()))
     async with get_client() as client:
-        response = await client.post("/companies", json=payload)
+        response = await client.post("/v1/companies", json=payload)
         result = await handle_api_response(response, "Create company")
         logger.info("Company created with ID: %s", result.get("id"))
         return result
@@ -2728,7 +2728,7 @@ async def update_company_logic(company_id: int, field_values: Dict[str, Any]) ->
         raise KylasAPIError("field_values produced an empty payload.")
     logger.info("Updating company %s with fields: %s", company_id, list(payload.keys()))
     async with get_client() as client:
-        get_response = await client.get(f"/companies/{company_id}")
+        get_response = await client.get(f"/v1/companies/{company_id}")
         existing = await handle_api_response(get_response, "Get company")
         merged = dict(existing)
         for key, value in payload.items():
@@ -2736,7 +2736,7 @@ async def update_company_logic(company_id: int, field_values: Dict[str, Any]) ->
                 merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
             else:
                 merged[key] = value
-        response = await client.put(f"/companies/{company_id}", json=merged)
+        response = await client.put(f"/v1/companies/{company_id}", json=merged)
         result = await handle_api_response(response, "Update company")
         logger.info("Company %s updated", company_id)
         return result
@@ -2746,7 +2746,7 @@ async def get_company_logic(company_id: int) -> Dict[str, Any]:
     """Fetch a single company by ID (GET /companies/{id}). Returns full company object."""
     company_id = int(company_id)
     async with get_client() as client:
-        response = await client.get(f"/companies/{company_id}")
+        response = await client.get(f"/v1/companies/{company_id}")
         return await handle_api_response(response, "Get company")
 
 
@@ -2846,7 +2846,7 @@ async def search_companies_logic(
         params["sort"] = sort
     logger.info("Searching companies with %d filter(s)", len(filters))
     async with get_client() as client:
-        response = await client.post("/search/company", params=params, json=payload)
+        response = await client.post("/v1/search/company", params=params, json=payload)
         data = await handle_api_response(response, "Search companies")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -3114,7 +3114,7 @@ async def lookup_leads_for_meeting_logic(query: str) -> str:
     q = (query or "firstName:").strip() or "firstName:"
     logger.info("Meeting lead lookup: q=%s", q)
     async with get_client() as client:
-        response = await client.get("/search/lead/lookup", params={"q": q})
+        response = await client.get("/v1/search/lead/lookup", params={"q": q})
         data = await handle_api_response(response, "Lookup leads for meeting")
     rows = _meeting_lookup_rows_from_response(data)
     return _format_meeting_entity_lookup_result("lead(s)", q, rows)
@@ -3125,7 +3125,7 @@ async def lookup_contacts_for_meeting_logic(query: str) -> str:
     q = (query or "firstName:").strip() or "firstName:"
     logger.info("Meeting contact lookup: q=%s", q)
     async with get_client() as client:
-        response = await client.get("/search/contact/lookup", params={"q": q})
+        response = await client.get("/v1/search/contact/lookup", params={"q": q})
         data = await handle_api_response(response, "Lookup contacts for meeting")
     rows = _meeting_lookup_rows_from_response(data)
     return _format_meeting_entity_lookup_result("contact(s)", q, rows)
@@ -3136,7 +3136,7 @@ async def lookup_deals_for_meeting_logic(query: str) -> str:
     q = (query or "name:").strip() or "name:"
     logger.info("Meeting deal lookup: q=%s", q)
     async with get_client() as client:
-        response = await client.get("/search/deal/lookup", params={"q": q})
+        response = await client.get("/v1/search/deal/lookup", params={"q": q})
         data = await handle_api_response(response, "Lookup deals for meeting")
     rows = _meeting_lookup_rows_from_response(data)
     return _format_meeting_entity_lookup_result("deal(s)", q, rows)
@@ -3147,7 +3147,7 @@ async def lookup_companies_for_meeting_logic(query: str) -> str:
     q = (query or "comp:").strip() or "comp:"
     logger.info("Meeting company lookup: q=%s", q)
     async with get_client() as client:
-        response = await client.get("/companies/lookup", params={"view": "meeting", "q": q})
+        response = await client.get("/v1/companies/lookup", params={"view": "meeting", "q": q})
         data = await handle_api_response(response, "Lookup companies for meeting")
     rows = _meeting_lookup_rows_from_response(data)
     return _format_meeting_entity_lookup_result("compan(y/ies)", q, rows)
@@ -3266,7 +3266,7 @@ async def create_meeting_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
 
     logger.info("Creating meeting: %s", payload.get("title", ""))
     async with get_client() as client:
-        response = await client.post("/meetings", json=payload)
+        response = await client.post("/v1/meetings", json=payload)
         result = await handle_api_response(response, "Create meeting")
         logger.info("Meeting created with ID: %s", result.get("id"))
         return result
@@ -3280,7 +3280,7 @@ async def update_meeting_logic(meeting_id: int, field_values: Dict[str, Any]) ->
         raise KylasAPIError("field_values cannot be empty for update.")
     logger.info("Updating meeting %s with fields: %s", meeting_id, list(fv.keys()))
     async with get_client() as client:
-        get_response = await client.get(f"/meetings/{meeting_id}")
+        get_response = await client.get(f"/v1/meetings/{meeting_id}")
         existing = await handle_api_response(get_response, "Get meeting")
         merged = dict(existing)
         for key, value in fv.items():
@@ -3304,7 +3304,7 @@ async def update_meeting_logic(meeting_id: int, field_values: Dict[str, Any]) ->
                 merged["customFieldValues"] = {**(merged.get("customFieldValues") or {}), **value}
             else:
                 merged[key] = value
-        response = await client.put(f"/meetings/{meeting_id}", json=merged)
+        response = await client.put(f"/v1/meetings/{meeting_id}", json=merged)
         result = await handle_api_response(response, "Update meeting")
         logger.info("Meeting %s updated", meeting_id)
         return result
@@ -3314,7 +3314,7 @@ async def get_meeting_logic(meeting_id: int) -> Dict[str, Any]:
     """Fetch a single meeting by ID (GET /meetings/{id})."""
     meeting_id = int(meeting_id)
     async with get_client() as client:
-        response = await client.get(f"/meetings/{meeting_id}")
+        response = await client.get(f"/v1/meetings/{meeting_id}")
         return await handle_api_response(response, "Get meeting")
 
 
@@ -3416,9 +3416,9 @@ async def cancel_meeting(meeting_id: int) -> str:
         logger.info("Cancelling meeting %s", meeting_id)
         async with get_client() as client:
             # First get the meeting, then POST to cancel
-            get_response = await client.get(f"/meetings/{meeting_id}")
+            get_response = await client.get(f"/v1/meetings/{meeting_id}")
             existing = await handle_api_response(get_response, "Get meeting")
-            response = await client.post(f"/meetings/{meeting_id}/cancel", json=existing)
+            response = await client.post(f"/v1/meetings/{meeting_id}/cancel", json=existing)
             await handle_api_response(response, "Cancel meeting")
             return f"✓ Meeting {meeting_id} cancelled successfully."
     except KylasAPIError as e:
@@ -3549,7 +3549,7 @@ async def search_meetings_logic(
     params = {"page": _meetings_search_api_page(page), "size": min(size, 500), "sort": sort}
     logger.info("Searching meetings with %d filter(s)", len(filters))
     async with get_client() as client:
-        response = await client.post("/meetings/search", params=params, json=payload)
+        response = await client.post("/v1/meetings/search", params=params, json=payload)
         data = await handle_api_response(response, "Search meetings")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -3753,7 +3753,7 @@ async def create_call_log_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
 
     logger.info("Creating call log: %s on %s", payload.get("callType"), payload.get("relatedTo", {}).get("entity", "?"))
     async with get_client() as client:
-        response = await client.post("/call-logs/", json=payload)
+        response = await client.post("/v1/call-logs/", json=payload)
         result = await handle_api_response(response, "Create call log")
         logger.info("Call log created with ID: %s", result.get("id"))
         return result
@@ -3767,7 +3767,7 @@ async def update_call_log_logic(call_log_id: int, field_values: Dict[str, Any]) 
         raise KylasAPIError("field_values cannot be empty for update.")
     logger.info("Updating call log %s", call_log_id)
     async with get_client() as client:
-        response = await client.put(f"/call-logs/{call_log_id}", json=fv)
+        response = await client.put(f"/v1/call-logs/{call_log_id}", json=fv)
         result = await handle_api_response(response, "Update call log")
         logger.info("Call log %s updated", call_log_id)
         return result
@@ -4087,7 +4087,7 @@ async def search_call_logs_logic(
         params["sort"] = sort
     logger.info("Searching call logs with %d filter(s)", len(filters))
     async with get_client() as client:
-        response = await client.post("/call-logs/search", params=params, json=payload)
+        response = await client.post("/v1/call-logs/search", params=params, json=payload)
         data = await handle_api_response(response, "Search call logs")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -4145,7 +4145,7 @@ async def add_note(entity_type: str, entity_id: int, note_text: str) -> str:
         )
 
         async with get_client() as client:
-            response = await client.post("/notes/relation", json=payload)
+            response = await client.post("/v1/notes/relation", json=payload)
             await handle_api_response(response, "Add note")
 
             logger.info(f"Note added to {entity_type_upper} {entity_id}")
@@ -4186,7 +4186,7 @@ async def search_leads_by_term_logic(
         params["sort"] = sort
     logger.info("Searching leads by term: %r", term)
     async with get_client() as client:
-        response = await client.post("/search/lead", params=params, json=payload)
+        response = await client.post("/v1/search/lead", params=params, json=payload)
         data = await handle_api_response(response, "Search leads by term")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -4226,7 +4226,7 @@ async def search_contacts_by_term_logic(
         params["sort"] = sort
     logger.info("Searching contacts by term: %r", term)
     async with get_client() as client:
-        response = await client.post("/search/contact", params=params, json=payload)
+        response = await client.post("/v1/search/contact", params=params, json=payload)
         data = await handle_api_response(response, "Search contacts by term")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -4266,7 +4266,7 @@ async def search_tasks_by_term_logic(
         params["sort"] = sort
     logger.info("Searching tasks by term: %r", term)
     async with get_client() as client:
-        response = await client.post("/tasks/search", params=params, json=payload)
+        response = await client.post("/v1/tasks/search", params=params, json=payload)
         data = await handle_api_response(response, "Search tasks by term")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -4305,7 +4305,7 @@ async def search_companies_by_term_logic(
         params["sort"] = sort
     logger.info("Searching companies by term: %r", term)
     async with get_client() as client:
-        response = await client.post("/search/company", params=params, json=payload)
+        response = await client.post("/v1/search/company", params=params, json=payload)
         data = await handle_api_response(response, "Search companies by term")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -4353,7 +4353,7 @@ async def search_meetings_by_term_logic(
     params = {"page": _meetings_search_api_page(page), "size": min(size, 500), "sort": sort}
     logger.info("Searching meetings by term (title only): %r", term)
     async with get_client() as client:
-        response = await client.post("/meetings/search", params=params, json=payload)
+        response = await client.post("/v1/meetings/search", params=params, json=payload)
         data = await handle_api_response(response, "Search meetings by term")
     results = data.get("content", data.get("data", []))
     total = data.get("totalElements", data.get("total", len(results)))
@@ -4374,7 +4374,7 @@ async def search_meetings_by_term_logic(
 async def _fetch_quotation_fields() -> List[Dict[str, Any]]:
     """Fetch quotation field metadata (GET /quotations/fields). Returns list of active field dicts."""
     async with get_client() as client:
-        response = await client.get("/quotations/fields", params={"page": 0, "size": 100})
+        response = await client.get("/v1/quotations/fields", params={"page": 0, "size": 100})
         data = await handle_api_response(response, "Fetch quotation fields")
         if isinstance(data, list):
             fields = data
@@ -4488,7 +4488,7 @@ async def get_quotation_logic(quotation_id: int) -> Dict[str, Any]:
     """Fetch a single quotation by ID (GET /quotations/{id})."""
     quotation_id = int(quotation_id)
     async with get_client() as client:
-        response = await client.get(f"/quotations/{quotation_id}")
+        response = await client.get(f"/v1/quotations/{quotation_id}")
         return await handle_api_response(response, "Get quotation")
 
 
@@ -4550,7 +4550,7 @@ async def search_quotations_logic(
             params["sort"] = sort
     logger.info("Searching quotations with %d filter(s)", len(filters))
     async with get_client() as client:
-        response = await client.post("/quotations/search", params=params, json=payload)
+        response = await client.post("/v1/quotations/search", params=params, json=payload)
         data = await handle_api_response(response, "Search quotations")
     results = data.get("content", data.get("data", [])) if isinstance(data, dict) else []
     total = data.get("totalElements", data.get("total", len(results))) if isinstance(data, dict) else len(results)
@@ -4597,7 +4597,7 @@ async def search_quotations_by_term_logic(
         params["sort"] = sort
     logger.info("Searching quotations by term: %r", term)
     async with get_client() as client:
-        response = await client.post("/quotations/search", params=params, json=payload)
+        response = await client.post("/v1/quotations/search", params=params, json=payload)
         data = await handle_api_response(response, "Search quotations by term")
     results = data.get("content", data.get("data", [])) if isinstance(data, dict) else []
     total = data.get("totalElements", data.get("total", len(results))) if isinstance(data, dict) else len(results)

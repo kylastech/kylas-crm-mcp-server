@@ -49,8 +49,6 @@ _REPORT_ENTITY_PLURAL: Dict[str, str] = {
 # sd-ui offers meeting regardless of the meeting READ permission (Form.tsx:1043).
 _ALWAYS_REPORTABLE_ENTITIES = {"meeting"}
 
-# Config lives on /v1 (BASE_URL); save/run live on /v3 — same split as sd-ui.
-REPORTS_V3_BASE = re.sub(r"/v1/?$", "/v3", BASE_URL.rstrip("/"))
 
 # ---------------------------------------------------------------------------
 # Large picklists — same named list as the layout cheat sheets, plus deal/
@@ -267,7 +265,7 @@ def normalize_report_entity(entity: Any) -> str:
 async def _fetch_report_config(entity: str) -> Dict[str, Any]:
     """GET /reports/config/{plural}. Drops organizerFields like sd-ui's filterReportConfig."""
     async with get_client() as client:
-        response = await client.get(f"/reports/config/{_REPORT_ENTITY_PLURAL[entity]}")
+        response = await client.get(f"/v1/reports/config/{_REPORT_ENTITY_PLURAL[entity]}")
         data = await handle_api_response(response, f"Fetch report config for {entity}")
     if isinstance(data, list):  # defensive: /reports/config (all entities) returns a list
         data = next((c for c in data if c.get("entity") == entity), {}) if data else {}
@@ -282,7 +280,7 @@ async def _fetch_report_config(entity: str) -> Dict[str, Any]:
 async def _fetch_report_permissions() -> List[Dict[str, Any]]:
     """GET /users/me/permissions — [{name, action: {read, readAll, write, ...}}] (sd-ui AppActions)."""
     async with get_client() as client:
-        response = await client.get("/users/me/permissions")
+        response = await client.get("/v1/users/me/permissions")
         data = await handle_api_response(response, "Fetch user permissions")
     if isinstance(data, list):
         return data
@@ -296,7 +294,7 @@ async def _fetch_tenant_currency() -> Optional[str]:
     Returns None on any failure — financial options are then hidden (safe default)."""
     try:
         async with get_client() as client:
-            response = await client.get("/tenants")
+            response = await client.get("/v1/tenants")
             data = await handle_api_response(response, "Fetch tenant settings")
         return (data or {}).get("currency") if isinstance(data, dict) else None
     except KylasAPIError as e:
@@ -936,7 +934,7 @@ async def create_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     body, notes = build_report_body(payload, config, timezone, tenant_currency)
 
     async with get_client() as client:
-        response = await client.post(f"{REPORTS_V3_BASE}/reports", json=body)
+        response = await client.post("/v3/reports", json=body)
         created = await handle_api_response(response, "Create report")
 
     result = {

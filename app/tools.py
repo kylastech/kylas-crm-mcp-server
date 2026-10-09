@@ -10,6 +10,7 @@ from app.config import logger
 from app.server import mcp
 from app.client import KylasAPIError, _reset_api_call_count
 from app.helpers import OPERATOR_MAPPING, _build_search_json_rule
+from app.reports import create_report_logic
 from app.entities import (
     _build_call_log_search_json_rule,
     _build_company_search_json_rule,
@@ -224,6 +225,10 @@ _ENTITY_CRUD_CONFIG: Dict[str, Dict[str, Any]] = {
         "create_fn": create_call_log_logic,
         "update_fn": update_call_log_logic,
         "name_fn": lambda r: f"{r.get('callType', '')} / {r.get('outcome', '')}",
+    },
+    "report": {
+        "create_fn": create_report_logic,
+        "name_fn": lambda r: r.get("name", "Report"),
     },
 }
 
@@ -954,7 +959,7 @@ async def _fold_field_metadata_into_schema(
 
 
 @mcp.tool()
-async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
+async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Optional[str] = None) -> str:
     """
     Step 2 of 3 in the generic CRM tool flow: get everything about the ONE
     endpoint you already picked via list_tool. Takes that id, plus an optional
@@ -1120,23 +1125,39 @@ async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
     fetched_live = False
     live_fetch_error = None
     if entry.get("dynamic_fields"):
-        fetch_fields_fn = _BUCKET_FIELD_FETCHERS.get(entry["bucket"])
-        if fetch_fields_fn is None:
-            live_fetch_error = f"No field-metadata fetcher wired for bucket '{entry['bucket']}' yet."
-        else:
+        if entry["bucket"] == "report":
+            if not entity:
+                return json.dumps({
+                    "ok": False,
+                    "error": "The 'report' bucket requires an 'entity' argument (e.g. build_payload(\"report.create\", entity=\"lead\"))."
+                }, indent=2)
             try:
-                schema = await _fold_field_metadata_into_schema(
-                    schema, fetch_fields_fn,
-                    for_search=(entry["intent"] == "search"),
-                    requested_picklists=fields,
-                    bucket=entry["bucket"],
-                )
+                from app.reports import build_report_reference
+                ref = await build_report_reference(entity, fields)
+                schema.update(ref)
                 fetched_live = True
-            except KylasAPIError as e:
-                # Don't fail the whole call for this — method/path/usage_notes/example
-                # need no network access at all and are still genuinely useful on
-                # their own; only the live tenant field/picklist enrichment is missing.
-                live_fetch_error = e.message
+            except ValueError as e:
+                return json.dumps({"ok": False, "error": str(e)}, indent=2)
+            except Exception as e:
+                live_fetch_error = str(e)
+        else:
+            fetch_fields_fn = _BUCKET_FIELD_FETCHERS.get(entry["bucket"])
+            if fetch_fields_fn is None:
+                live_fetch_error = f"No field-metadata fetcher wired for bucket '{entry['bucket']}' yet."
+            else:
+                try:
+                    schema = await _fold_field_metadata_into_schema(
+                        schema, fetch_fields_fn,
+                        for_search=(entry["intent"] == "search"),
+                        requested_picklists=fields,
+                        bucket=entry["bucket"],
+                    )
+                    fetched_live = True
+                except KylasAPIError as e:
+                    # Don't fail the whole call for this — method/path/usage_notes/example
+                    # need no network access at all and are still genuinely useful on
+                    # their own; only the live tenant field/picklist enrichment is missing.
+                    live_fetch_error = e.message
 
     result = {
         "id": entry["id"],

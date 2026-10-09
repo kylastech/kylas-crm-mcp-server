@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("kylas-mcp")
 
-BASE_URL = os.getenv("KYLAS_BASE_URL", "https://api.kylas.io/v1")
+BASE_URL = os.getenv("KYLAS_BASE_URL", "https://api.kylas.io")
 API_KEY = os.getenv("KYLAS_API_KEY")
 KYLAS_CLIENT_ID = os.getenv("KYLAS_CLIENT_ID")
 KYLAS_CLIENT_SECRET = os.getenv("KYLAS_CLIENT_SECRET")
