@@ -130,9 +130,10 @@ Do NOT fetch records with *.search and add them up yourself, and do NOT
 build the report in a document or spreadsheet, when the user asked for a
 Kylas report — that produces an unsaved copy computed from at most one page
 of records. Only do that if the user explicitly asks for an export or a
-one-off summary in chat. Currently only ONE_DIMENSIONAL reports (one
-group-by field) are supported; for anything else (funnel, goal, multi-
-dimensional, hierarchy) tell the user it isn't supported yet.
+one-off summary in chat. Supported: ONE_DIMENSIONAL reports (one group-by
+field) and MULTI_DIMENSIONAL reports (category "MULTI_DIMENSIONAL", group_by
+a list of 2-3 fields, e.g. "leads by owner and source"). For funnel, goal
+vs achievement and hierarchy reports tell the user they aren't supported yet.
 
 ## The 3-step flow
 

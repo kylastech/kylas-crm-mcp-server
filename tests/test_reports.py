@@ -345,8 +345,8 @@ def test_value_shapes_per_field_type():
 def test_basic_validation_errors():
     with pytest.raises(ValueError, match="name is required"):
         _build(_payload(name="ab"))
-    with pytest.raises(ValueError, match="ONE_DIMENSIONAL"):
-        _build(_payload(category="MULTI_DIMENSIONAL"))
+    with pytest.raises(ValueError, match="category must be one of"):
+        _build(_payload(category="HIERARCHY"))
     with pytest.raises(ValueError, match="Unknown report entity"):
         _build(_payload(entity="widgets"))
 
@@ -722,3 +722,91 @@ async def test_build_payload_preview_schema_name_optional():
         result = json.loads(await build_payload("report.preview", entity="lead"))
     assert result["fetched_live"] is True and "name" not in result["schema"]["required"]
     assert "tenant_fields_reference" in result["schema"]
+
+
+# ---------------------------------------------------------------------------
+# MULTI_DIMENSIONAL
+# ---------------------------------------------------------------------------
+
+def _multi(**overrides):
+    return _payload(category="MULTI_DIMENSIONAL", **overrides)
+
+
+def test_multi_dimensional_body_matches_sd_ui_get_config():
+    body, notes = _build(_multi(group_by=[{"field": "createdAt", "format": "monthly"}, {"field": "ownerId"}, "source"]))
+    assert body["category"] == "MULTI_DIMENSIONAL" and notes == []
+    assert body["config"]["groupBy"] == [
+        {"name": "createdAt", "format": "MONTHLY", "primaryField": None, "property": None},
+        {"name": "ownerId", "format": None, "primaryField": None, "property": None},
+        {"name": "source", "format": None, "primaryField": None, "property": None},
+    ]
+
+
+def test_multi_dimensional_rules():
+    with pytest.raises(ValueError, match="at most 3"):
+        _build(_multi(group_by=["ownerId", "source", "createdAt", "pipelineStage"]))
+    with pytest.raises(ValueError, match="already a dimension"):
+        _build(_multi(group_by=["ownerId", "ownerId"]))
+    with pytest.raises(ValueError, match="format is required"):
+        _build(_multi(group_by=["ownerId", "createdAt"]))
+    with pytest.raises(ValueError, match="bar, table"):
+        _build(_multi(group_by=["ownerId", "source"], chart_type="pie"))
+    with pytest.raises(ValueError, match="exactly one group_by"):
+        _build(_payload(group_by=["ownerId", "source"]))  # ONE_DIMENSIONAL with two
+    body, notes = _build(_multi(group_by=["ownerId", "source"], metrics=[{"type": "COUNT", "field": "id"},
+                                                                         {"type": "SUM", "field": "requirementBudget"}]))
+    assert body["chartType"] == "table" and notes
+
+
+def test_multi_dimensional_parent_child_and_required_filter():
+    cfg = _config()
+    cfg["dimensions"].append(_dim("pipeline", "Pipeline", "PIPELINE"))
+    # stage grouped AFTER pipeline: no pipeline filter needed
+    body, _ = build_report_body(_multi(group_by=["pipeline", "pipelineStage"]), cfg, "Asia/Kolkata", "INR")
+    assert [g["name"] for g in body["config"]["groupBy"]] == ["pipeline", "pipelineStage"]
+    # stage before pipeline: rejected
+    with pytest.raises(ValueError, match="'pipeline' must come before 'pipelineStage'"):
+        build_report_body(_multi(group_by=["pipelineStage", "pipeline"]), cfg, "Asia/Kolkata", "INR")
+    # stage without pipeline dimension: needs the pipeline filter
+    with pytest.raises(ValueError, match="requires a 'pipeline' filter"):
+        build_report_body(_multi(group_by=["ownerId", "pipelineStage"]), cfg, "Asia/Kolkata", "INR")
+
+
+def test_multi_dimensional_team_dimension_adds_primary_filter():
+    body, notes = _build(_multi(group_by=["ownerFields", "source"]))
+    assert body["config"]["groupBy"][0]["property"] == "teams"
+    assert body["config"]["rules"][-1]["id"] == "ownerId" and body["config"]["rules"][-1]["operator"] == "is_not_null"
+
+
+NESTED_RECORDS = [
+    {"id": 31800, "name": "Janardan Borse", "values": [], "dimensions": [
+        {"id": 650646, "name": "Google", "values": [14, 3692500.0], "dimensions": []},
+        {"id": None, "name": None, "values": [91, 12345.0], "dimensions": []},
+    ]},
+    {"id": 32551, "name": "Michael parker", "values": [], "dimensions": [
+        {"id": None, "name": None, "values": [1, 0], "dimensions": []},
+    ]},
+]
+
+
+def test_preview_flattens_nested_results_with_subtotals():
+    body, _ = _build(_multi(group_by=["ownerId", "source"], metrics=[{"type": "COUNT", "field": "id"},
+                                                                    {"type": "SUM", "field": "requirementBudget"}]))
+    dims = [next(d for d in _config()["dimensions"] if d["id"] == i) for i in ("ownerId", "source")]
+    out = reports.format_preview_rows("lead", body, dims, NESTED_RECORDS, "INR")
+    assert out["columns"] == ["Owner", "Source", "Number of Leads", "Sum of Budget"]
+    assert out["rows"] == [
+        {"Owner": "Janardan Borse", "Source": "Google", "Number of Leads": 14, "Sum of Budget": 3692500},
+        {"Owner": "Janardan Borse", "Source": "Not Available", "Number of Leads": 91, "Sum of Budget": 12345},
+        {"Owner": "Michael parker", "Source": "Not Available", "Number of Leads": 1, "Sum of Budget": 0},
+    ]
+    assert out["subtotals"] == [
+        {"Owner": "Janardan Borse", "Number of Leads": 105, "Sum of Budget": 3704845},
+        {"Owner": "Michael parker", "Number of Leads": 1, "Sum of Budget": 0},
+    ]
+    assert out["totals"] == {"Number of Leads": 106, "Sum of Budget": 3704845}
+
+
+def test_reference_documents_multi_dimensional():
+    text = get_report_config_instructions_logic("lead", _config(), set(), "INR")
+    assert "MULTI_DIMENSIONAL = group_by is a" in text and "must come after its parent" in text

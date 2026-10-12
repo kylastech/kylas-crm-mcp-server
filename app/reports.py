@@ -62,6 +62,9 @@ _REPORT_LARGE_PICKLISTS = {"timezone", "requirementcurrency", "currency"} | _LAR
 # ---------------------------------------------------------------------------
 
 _CHART_TYPES = ("bar", "pie", "table")
+_MULTI_DIMENSIONAL_CHART_TYPES = ("bar", "table")  # ReportForm.ts MULTIDIMENSIONAL_CHART_TYPES
+_SUPPORTED_CATEGORIES = ("ONE_DIMENSIONAL", "MULTI_DIMENSIONAL")
+_MAX_DIMENSIONS = 3  # ReportDimensions.tsx: "Add New" hidden at 3
 _DATE_FIELD_TYPES = {"DATE_PICKER", "DATETIME_PICKER"}
 
 _DIMENSION_FORMATS = ("YEARLY", "QUARTERLY", "FINANCIAL_YEARLY", "FINANCIAL_QUARTERLY", "MONTHLY", "WEEKLY", "DAILY")
@@ -218,20 +221,33 @@ _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 # expands it into the full POST /v3/reports body (see build_report_body).
 REPORT_CREATE_SCHEMA: Dict[str, Any] = {
     "type": "object",
-    "required": ["entity", "name", "group_by", "metrics", "date_range"],
-    "properties": {
-        "entity": {"type": "string", "enum": list(REPORT_ENTITIES),
-                   "description": "Same entity you passed to build_payload."},
-        "name": {"type": "string", "minLength": 3, "maxLength": 255},
-        "description": {"type": "string", "maxLength": 255},
-        "chart_type": {"type": "string", "enum": list(_CHART_TYPES), "default": "bar"},
-        "group_by": {
+    "$defs": {
+        "groupBy": {
             "type": "object",
             "required": ["field"],
             "properties": {
                 "field": {"type": "string", "description": "A dimension id from tenant_fields_reference."},
                 "format": {"type": "string", "description": "Required for date dimensions (YEARLY, MONTHLY, ...)."},
             },
+        },
+    },
+    "required": ["entity", "name", "group_by", "metrics", "date_range"],
+    "properties": {
+        "entity": {"type": "string", "enum": list(REPORT_ENTITIES),
+                   "description": "Same entity you passed to build_payload."},
+        "name": {"type": "string", "minLength": 3, "maxLength": 255},
+        "description": {"type": "string", "maxLength": 255},
+        "category": {"type": "string", "enum": list(_SUPPORTED_CATEGORIES), "default": "ONE_DIMENSIONAL",
+                     "description": "MULTI_DIMENSIONAL to group by 2-3 fields (e.g. owner AND source)."},
+        "chart_type": {"type": "string", "enum": list(_CHART_TYPES), "default": "bar",
+                       "description": "bar | pie | table; MULTI_DIMENSIONAL allows only bar | table."},
+        "group_by": {
+            "description": ("ONE_DIMENSIONAL: one {field, format?}. MULTI_DIMENSIONAL: a list of 1-3 "
+                            "{field, format?} in grouping order (outer level first)."),
+            "oneOf": [
+                {"$ref": "#/$defs/groupBy"},
+                {"type": "array", "minItems": 1, "maxItems": _MAX_DIMENSIONS, "items": {"$ref": "#/$defs/groupBy"}},
+            ],
         },
         "metrics": {
             "type": "array",
@@ -477,15 +493,23 @@ def get_report_config_instructions_logic(
 
     lines = [
         "=" * 60,
-        f"KYLAS REPORT BUILDER — {entity.upper()} (category ONE_DIMENSIONAL)",
+        f"KYLAS REPORT BUILDER — {entity.upper()} (categories ONE_DIMENSIONAL, MULTI_DIMENSIONAL)",
         "=" * 60,
         f"Tenant currency: {tenant_currency or 'unknown'} — financial year/quarter options "
         f"{'AVAILABLE' if financial else 'NOT available'}.",
         "",
-        "CHART TYPES (chart_type): bar, pie, table. With more than one metric only 'table' is",
-        "allowed — the server switches to table automatically and says so.",
+        "CHART TYPES (chart_type): bar, pie, table (MULTI_DIMENSIONAL: bar, table). With more than one",
+        "metric only 'table' is allowed — the server switches to table automatically and says so.",
         "",
-        "DIMENSIONS (group_by.field) — exactly one:",
+        "CATEGORY: ONE_DIMENSIONAL (default) = group_by is ONE dimension. MULTI_DIMENSIONAL = group_by is a",
+        f"list of 1-{_MAX_DIMENSIONS} dimensions in grouping order (outer first), no field twice, e.g. 'leads by owner",
+        "and source' -> [{field: ownerId}, {field: source}]. Every date dimension needs its own format.",
+        "Metrics are those of the FIRST dimension. A child field (pipelineStage, pipelineStageReason,",
+        "activities) must come after its parent (pipeline / campaignActivities) if both are dimensions;",
+        "its required parent filter is not needed when the parent is an earlier dimension."
+        + (" Task reports: only one associated-entity dimension." if entity == "task" else ""),
+        "",
+        "DIMENSIONS (group_by[].field):",
     ]
     formats = ", ".join(dimension_formats_for(tenant_currency))
     for d in dimensions:
@@ -796,34 +820,63 @@ def build_report_body(
     description = payload.get("description") or ""
     _require(isinstance(description, str) and len(description) <= 255, "description must be text of at most 255 characters.")
     category = (payload.get("category") or "ONE_DIMENSIONAL").upper()
-    _require(category == "ONE_DIMENSIONAL", "Only category ONE_DIMENSIONAL is supported in this version.")
+    _require(category in _SUPPORTED_CATEGORIES,
+             f"category must be one of {', '.join(_SUPPORTED_CATEGORIES)} — funnel, hierarchy and goal reports "
+             f"aren't supported yet.")
+    multi = category == "MULTI_DIMENSIONAL"
 
-    # --- Dimension (exactly one) ---
-    group_by = payload.get("group_by")
-    if isinstance(group_by, list):
-        _require(len(group_by) == 1, "ONE_DIMENSIONAL reports take exactly one group_by dimension.")
-        group_by = group_by[0]
-    if isinstance(group_by, str):
-        group_by = {"field": group_by}
-    _require(isinstance(group_by, dict) and group_by.get("field"), "group_by.field is required.")
-    dimension = _find(dimensions, group_by["field"])
-    _require(dimension is not None, f"group_by.field '{group_by['field']}' is not a dimension of {entity}. "
-             f"Valid: {', '.join(d.get('id') for d in dimensions)}.")
-    fmt = group_by.get("format")
-    if dimension.get("fieldType") in _DATE_FIELD_TYPES:
-        allowed_formats = dimension_formats_for(tenant_currency)
-        _require(isinstance(fmt, str) and fmt.upper() in allowed_formats,
-                 f"group_by.format is required for date dimension '{dimension['id']}'. Use one of: {', '.join(allowed_formats)}.")
-        fmt = fmt.upper()
+    # --- Dimensions: exactly one (ONE_DIMENSIONAL) or 1-3 in order (MULTI_DIMENSIONAL) ---
+    raw_group_by = payload.get("group_by")
+    if isinstance(raw_group_by, (dict, str)):
+        raw_group_by = [raw_group_by]
+    _require(isinstance(raw_group_by, list) and raw_group_by,
+             "group_by is required: {\"field\": \"<dimension>\"} (a list of 1-3 for MULTI_DIMENSIONAL).")
+    if multi:
+        _require(len(raw_group_by) <= _MAX_DIMENSIONS,
+                 f"MULTI_DIMENSIONAL reports take at most {_MAX_DIMENSIONS} group_by dimensions.")
     else:
-        fmt = None
-    is_entity_fields = dimension.get("fieldType") == "ENTITY_FIELDS"
-    group_by_body = {
-        "name": dimension["id"],
-        "format": fmt,
-        "primaryField": dimension.get("primaryField") or None,
-        "property": "teams" if is_entity_fields else None,
-    }
+        _require(len(raw_group_by) == 1, "ONE_DIMENSIONAL reports take exactly one group_by dimension — "
+                 "use category MULTI_DIMENSIONAL to group by 2-3 fields.")
+    group_dimensions: List[Dict[str, Any]] = []
+    group_by_bodies: List[Dict[str, Any]] = []
+    for i, gb in enumerate(raw_group_by):
+        label = f"group_by[{i}]" if multi else "group_by"
+        if isinstance(gb, str):
+            gb = {"field": gb}
+        _require(isinstance(gb, dict) and gb.get("field"), f"{label}.field is required.")
+        dimension = _find(dimensions, gb["field"])
+        _require(dimension is not None, f"{label}.field '{gb['field']}' is not a dimension of {entity}. "
+                 f"Valid: {', '.join(d.get('id') for d in dimensions)}.")
+        _require(all(d["id"] != dimension["id"] for d in group_dimensions),
+                 f"{label}: '{dimension['id']}' is already a dimension — each field can be used once.")
+        fmt = gb.get("format")
+        if dimension.get("fieldType") in _DATE_FIELD_TYPES:
+            allowed_formats = dimension_formats_for(tenant_currency)
+            _require(isinstance(fmt, str) and fmt.upper() in allowed_formats,
+                     f"{label}.format is required for date dimension '{dimension['id']}'. Use one of: {', '.join(allowed_formats)}.")
+            fmt = fmt.upper()
+        else:
+            fmt = None
+        group_dimensions.append(dimension)
+        group_by_bodies.append({
+            "name": dimension["id"],
+            "format": fmt,
+            "primaryField": dimension.get("primaryField") or None,
+            "property": "teams" if dimension.get("fieldType") == "ENTITY_FIELDS" else None,
+        })
+    dimension = group_dimensions[0]  # metrics come from the first dimension (Form.tsx getMetricsFor)
+    dimension_ids = [d["id"] for d in group_dimensions]
+    # A child field (pipelineStage, activities, ...) may not come before its parent (ReportDimensions.tsx
+    # isDimensionOptionDisabled / handleChange).
+    for i, dim_id in enumerate(dimension_ids):
+        parent = _RELATED_FIELD_PARENT.get(dim_id)
+        if parent in dimension_ids:
+            _require(dimension_ids.index(parent) < i,
+                     f"'{parent}' must come before '{dim_id}' in group_by (parent before child).")
+    if entity == "task":
+        associated = [d for d in dimension_ids if d in _TASK_ASSOCIATED_FILTERS]
+        _require(len(associated) <= 1,
+                 f"Task reports allow only one associated-entity dimension at a time; got {', '.join(associated)}.")
 
     # --- Metrics ---
     raw_metrics = payload.get("metrics")
@@ -842,7 +895,9 @@ def build_report_body(
 
     # --- Chart type ---
     chart_type = str(payload.get("chart_type") or "bar").lower()
-    _require(chart_type in _CHART_TYPES, f"chart_type must be one of: {', '.join(_CHART_TYPES)}.")
+    allowed_charts = _MULTI_DIMENSIONAL_CHART_TYPES if multi else _CHART_TYPES
+    _require(chart_type in allowed_charts, f"chart_type must be one of: {', '.join(allowed_charts)}"
+             f"{' for MULTI_DIMENSIONAL reports' if multi else ''}.")
     if len(metrics_body) > 1 and chart_type != "table":
         notes.append(f"chart_type changed from '{chart_type}' to 'table' — reports with more than one metric can only be tables.")
         chart_type = "table"
@@ -925,22 +980,27 @@ def build_report_body(
                          f"team filter '{rule['id']}' is used.")
 
     # --- Required filters (dimension + filter dependencies) ---
-    if is_entity_fields:
-        primary = (dimension.get("requiredFilters") or [dimension.get("primaryField")])[0]
-        if primary and primary not in used:
-            primary_filter = _find(filters, primary)
-            _require(primary_filter is not None, f"Dimension '{dimension['id']}' needs filter '{primary}', which is not available.")
-            rules.append({
-                "operator": "is_not_null", "id": primary, "field": primary,
-                "fieldInputType": primary_filter.get("fieldType"), "type": rule_type_for(primary_filter),
-                "value": None, "from": None, "to": None, "property": None,
-                "primaryField": primary_filter.get("primaryField") or None,
-            })
-            used.add(primary)
-            notes.append(f"Added filter '{primary} is_not_null', required when grouping by '{dimension['id']}'.")
-    else:
-        for req in dimension.get("requiredFilters") or []:
-            _require(req in used, f"Grouping by '{dimension['id']}' requires a '{req}' filter — add it to filters.")
+    for position, dim in enumerate(group_dimensions):
+        if dim.get("fieldType") == "ENTITY_FIELDS":
+            primary = (dim.get("requiredFilters") or [dim.get("primaryField")])[0]
+            if primary and primary not in used:
+                primary_filter = _find(filters, primary)
+                _require(primary_filter is not None, f"Dimension '{dim['id']}' needs filter '{primary}', which is not available.")
+                rules.append({
+                    "operator": "is_not_null", "id": primary, "field": primary,
+                    "fieldInputType": primary_filter.get("fieldType"), "type": rule_type_for(primary_filter),
+                    "value": None, "from": None, "to": None, "property": None,
+                    "primaryField": primary_filter.get("primaryField") or None,
+                })
+                used.add(primary)
+                notes.append(f"Added filter '{primary} is_not_null', required when grouping by '{dim['id']}'.")
+            continue
+        for req in dim.get("requiredFilters") or []:
+            # No filter needed when the parent is an EARLIER dimension (ReportDimensions.tsx handleChange).
+            if req in dimension_ids[:position]:
+                continue
+            _require(req in used, f"Grouping by '{dim['id']}' requires a '{req}' filter — add it to filters"
+                     f"{' (or group by ' + repr(req) + ' before it)' if multi else ''}.")
     for rule in list(rules):
         flt = _find(filters, rule["id"])
         parent = _RELATED_FIELD_PARENT.get(rule["id"])
@@ -965,14 +1025,14 @@ def build_report_body(
         "prorated": False,
         "goal": None,
         "config": {
-            "groupBy": [group_by_body],
+            "groupBy": group_by_bodies,
             "metrics": metrics_body,
             "dateRange": date_range_body,
             "rules": rules,
         },
         "reportType": entity,
         "chartType": chart_type,
-        "category": "ONE_DIMENSIONAL",
+        "category": category,
     }
     return body, notes
 
@@ -1116,45 +1176,65 @@ def _clean_number(value: Any) -> Any:
     return value
 
 
+def _flatten_records(records: List[Dict[str, Any]], depth: int) -> List[Tuple[List[Any], List[Any]]]:
+    """Nested AggregateRecords (parents carry empty values, leaves the numbers — sd-report
+    MULTI_DIMENSIONAL shape) -> [(group names per level, leaf values)]."""
+    flat: List[Tuple[List[Any], List[Any]]] = []
+    for record in records or []:
+        name = record.get("name") if record.get("name") is not None else "Not Available"
+        children = record.get("dimensions") or []
+        if depth > 1 and children:
+            for names, values in _flatten_records(children, depth - 1):
+                flat.append(([name] + names, values))
+        else:
+            flat.append(([name] + ["Not Available"] * (depth - 1), record.get("values") or []))
+    return flat
+
+
 def format_preview_rows(
-    entity: str, body: Dict[str, Any], dimension: Dict[str, Any], records: List[Dict[str, Any]],
+    entity: str, body: Dict[str, Any], dimensions: Any, records: List[Dict[str, Any]],
     tenant_currency: Optional[str] = None,
 ) -> Dict[str, Any]:
     """AggregateRecord list -> labelled table, like the web app's preview (ReportDataProcessing.ts):
-    the empty group reads "Not Available", money metrics carry the tenant currency."""
+    one column per group-by level, the empty group reads "Not Available", money metrics carry the
+    tenant currency. Multi-dimensional results are flattened, with subtotals per first-level group."""
     config = body["config"]
     metrics = config["metrics"]
-    group_label = _group_label(dimension, config["groupBy"][0])
-    metric_labels = [_metric_label(entity, m, dimension) for m in metrics]
+    dims = dimensions if isinstance(dimensions, list) else [dimensions]
+    dims = dims + [{} for _ in range(len(config["groupBy"]) - len(dims))]
+    group_labels = [_group_label(d or {"header": gb["name"]}, gb) for d, gb in zip(dims, config["groupBy"])]
+    metric_labels = [_metric_label(entity, m, dims[0] or {}) for m in metrics]
+    multi = len(group_labels) > 1
 
     rows = []
-    for record in records or []:
-        row = {group_label: record.get("name") if record.get("name") is not None else "Not Available"}
-        values = record.get("values") or []
+    for names, values in _flatten_records(records, len(group_labels)):
+        row = dict(zip(group_labels, names))
         for i, label in enumerate(metric_labels):
             row[label] = _clean_number(values[i]) if i < len(values) else None
         rows.append(row)
 
-    totals = {}
-    for m, label in zip(metrics, metric_labels):
-        if m["type"] in ("COUNT", "SUM"):
-            totals[label] = _clean_number(sum(r[label] or 0 for r in rows))
+    summable = [(m, label) for m, label in zip(metrics, metric_labels) if m["type"] in ("COUNT", "SUM")]
+    totals = {label: _clean_number(sum(r[label] or 0 for r in rows)) for _m, label in summable}
+
+    result: Dict[str, Any] = {"columns": group_labels + metric_labels}
     first = metric_labels[0] if metrics and metrics[0]["type"] in ("COUNT", "SUM") else None
-    if first and totals.get(first):
+    if not multi and first and totals.get(first):
         for r in rows:
             r["Share of total"] = f"{round(100 * (r[first] or 0) / totals[first], 1)}%"
-
-    result: Dict[str, Any] = {
-        "columns": [group_label] + metric_labels + (["Share of total"] if first and totals.get(first) else []),
-        "rows": rows[:_PREVIEW_MAX_ROWS],
-        "total_groups": len(rows),
-        "totals": totals,
-    }
+        result["columns"].append("Share of total")
+    result.update({"rows": rows[:_PREVIEW_MAX_ROWS], "total_groups": len(rows), "totals": totals})
+    if multi and summable:
+        subtotals: Dict[Any, Dict[str, Any]] = {}
+        for r in rows:
+            entry = subtotals.setdefault(r[group_labels[0]], {group_labels[0]: r[group_labels[0]]})
+            for _m, label in summable:
+                entry[label] = _clean_number((entry.get(label) or 0) + (r[label] or 0))
+        result["subtotals"] = list(subtotals.values())
     money = [label for m, label in zip(metrics, metric_labels) if m["field"] in _MONEY_FIELDS]
     if money and tenant_currency:
         result["currency"] = f"{', '.join(money)} in {tenant_currency}"
     if len(rows) > _PREVIEW_MAX_ROWS:
-        result["truncated"] = f"Showing the first {_PREVIEW_MAX_ROWS} of {len(rows)} groups."
+        result["truncated"] = f"Showing the first {_PREVIEW_MAX_ROWS} of {len(rows)} rows."
     return result
 
 
@@ -1193,7 +1273,8 @@ async def preview_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
         response = await client.post(f"/v3/reports/{_REPORT_ENTITY_PLURAL[entity]}", params=params, json=run_body)
         records = await handle_api_response(response, "Preview report")
 
-    dimension = _find([d for d in config.get("dimensions") or [] if _usable(d)], body["config"]["groupBy"][0]["name"]) or {}
+    usable_dimensions = [d for d in config.get("dimensions") or [] if _usable(d)]
+    group_dimensions = [_find(usable_dimensions, gb["name"]) or {} for gb in body["config"]["groupBy"]]
     result = {
         "saved": False,
         "message": ("Preview only — nothing was saved. To save it, call report.create with the same payload "
@@ -1202,7 +1283,7 @@ async def preview_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
         "chart_type": body["chartType"],
         "date_range": {k: body["config"]["dateRange"].get(k) for k in ("field", "operator", "value") if body["config"]["dateRange"].get(k) is not None},
         "filters_applied": len(body["config"]["rules"]),
-        **format_preview_rows(entity, body, dimension, records if isinstance(records, list) else [], tenant_currency),
+        **format_preview_rows(entity, body, group_dimensions, records if isinstance(records, list) else [], tenant_currency),
     }
     if notes:
         result["notes"] = notes

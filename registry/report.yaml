@@ -10,7 +10,7 @@
 # app's report builder makes — so build_payload needs an extra "entity"
 # argument for these ids.
 #
-# Phase 1: report.create for category ONE_DIMENSIONAL only. Lookup-backed
+# report.create / report.preview: categories ONE_DIMENSIONAL and MULTI_DIMENSIONAL. Lookup-backed
 # filters resolve through separate registry ids (team.lookup, campaign.lookup,
 # campaign.activities, *.search_by_term, pipeline.details,
 # meeting.lookup_related). Email receivedBy/user and GPS filters stay
@@ -22,7 +22,7 @@
   method: POST
   path: /v3/reports
   dynamic_fields: true
-  description: "Create and save a Kylas report (bar/pie chart or table, grouped by one field, over a date range, with filters) on leads, deals, contacts, companies, tasks, meetings, calls, emails or quotations. build_payload needs entity=\"<entity>\"."
+  description: "Create and save a Kylas report (bar/pie chart or table, grouped by one to three fields, over a date range, with filters) on leads, deals, contacts, companies, tasks, meetings, calls, emails or quotations. build_payload needs entity=\"<entity>\"."
   usage_notes: >
     Call build_payload("report.create", entity="<entity>") FIRST — entity is
     required and is one of lead, deal, contact, company, task, meeting, call,
@@ -36,10 +36,12 @@
 
     The payload is SHORT and flat — the server validates it against the live
     config and builds the full Kylas report body itself (types, field input
-    types, time-of-day, UTC conversion, category). Keys: entity, name (3-255
-    chars), description (optional), chart_type (bar | pie | table, default
-    bar), group_by {field, format}, metrics [{type, field}], date_range
-    {field, operator, value?}, filters [{field, operator, value?}] (optional).
+    types, time-of-day, UTC conversion). Keys: entity, name (3-255 chars),
+    description (optional), category (ONE_DIMENSIONAL default |
+    MULTI_DIMENSIONAL), chart_type (bar | pie | table, default bar), group_by
+    {field, format} (or a list for MULTI_DIMENSIONAL), metrics [{type,
+    field}], date_range {field, operator, value?}, filters [{field, operator,
+    value?}] (optional).
 
     name: ALWAYS give the report a proper, descriptive Title Case name that
     says what it shows — "<what is counted/summed> by <group-by> - <period>",
@@ -50,10 +52,19 @@
     Never use a vague name like "Report", "Test" or "New Report". Keep the
     whole name within 255 characters.
 
-    group_by: exactly one dimension. format is REQUIRED for date dimensions
+    group_by: ONE_DIMENSIONAL takes exactly one dimension. To group by two or
+    three fields ("leads by owner AND source", "deals per month by owner")
+    set category MULTI_DIMENSIONAL and pass group_by as a list of 1-3
+    {field, format?} in grouping order, outer level first, no field twice —
+    e.g. [{field: ownerId}, {field: source}]. MULTI_DIMENSIONAL allows only
+    bar or table charts; metrics come from the FIRST dimension. A child field
+    (pipelineStage, pipelineStageReason, activities) must come after its
+    parent (pipeline, campaignActivities) when both are dimensions; then the
+    parent filter is not required. Task reports allow only one
+    associated-entity dimension. format is REQUIRED for every date dimension
     (YEARLY, QUARTERLY, MONTHLY, WEEKLY, DAILY; FINANCIAL_YEARLY /
     FINANCIAL_QUARTERLY only for INR tenants) and must be omitted otherwise.
-    If the dimension lists "REQUIRES filter(s)", add those filters.
+    If a dimension lists "REQUIRES filter(s)", add those filters.
 
     metrics: COUNT id = number of records. With more than one metric the
     chart becomes a table (the server switches it and says so in "notes").
@@ -126,11 +137,13 @@
     a proper name ending in " (Made by MCP)". Never claim a preview was saved.
 
     On success data is {saved: false, entity, chart_type, date_range,
-    filters_applied, columns, rows, total_groups, totals, currency?, notes?,
-    truncated?}. rows is a list of objects keyed by the column names: the
-    group label (e.g. "Source"), one column per metric (e.g. "Number of
-    Leads", "Sum of Budget") and "Share of total" for the first metric when
-    it's a count or sum. A group named "Not Available" means records with no
+    filters_applied, columns, rows, total_groups, totals, subtotals?, currency?,
+    notes?, truncated?}. rows is a list of objects keyed by the column names:
+    one column per group-by level (e.g. "Owner", "Source"), one per metric
+    (e.g. "Number of Leads", "Sum of Budget") and, for ONE_DIMENSIONAL,
+    "Share of total" for the first metric when it's a count or sum.
+    MULTI_DIMENSIONAL results are flattened to one row per innermost group,
+    with subtotals per first-level group. A group named "Not Available" means records with no
     value for that field. totals sums every COUNT/SUM metric. Present it as a
     markdown table with the totals, and mention the date range and filters.
   example:
