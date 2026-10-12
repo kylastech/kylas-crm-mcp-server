@@ -188,3 +188,52 @@
     an "Error:" prefix before trusting it, the same caveat that already
     applies to the other _meta lookup ids that self-catch their own errors.
   example: {local_datetime: "11 Feb 2026 7:30 AM", timezone: "Asia/Calcutta"}
+
+# ---------------------------------------------------------------------------
+# Report-filter lookups (teams, campaigns, campaign activities). Same lookup
+# URLs the Kylas web app's report builder calls; schemas come from the
+# lookup_* tools in app/entities.py.
+# ---------------------------------------------------------------------------
+
+- id: team.lookup
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /v1/teams/lookup
+  dynamic_fields: false
+  description: "Look up teams by name — team ids for team (\"…Fields\") report filters such as ownerFields."
+  usage_notes: >
+    query: the team name or part of it (sent as name:<query>); leave it
+    empty to list every team. Returns "ID | Name" rows. Use the ID as the
+    value of a team filter in report.create (e.g. ownerFields equal <id>,
+    or in [<id>, <id>]). If several teams match, ask the user which one —
+    never guess an ID.
+  example: {query: "Sales"}
+
+- id: campaign.lookup
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /v1/campaigns/lookup
+  dynamic_fields: false
+  description: "Look up campaigns by name — campaign ids for the campaignActivities report filter."
+  usage_notes: >
+    query: the campaign name or part of it (sent as name:<query>); leave it
+    empty to list every campaign. Returns "ID | Name" rows. Use the ID as
+    the value of the campaignActivities filter in report.create. To filter
+    on a campaign's activities, call campaign.activities with that ID next.
+  example: {query: "Summer"}
+
+- id: campaign.activities
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /v1/campaigns/{campaign_id}
+  dynamic_fields: false
+  description: "List one campaign's activities — activity ids for the activities report filter."
+  usage_notes: >
+    campaign_id: the campaign's ID from campaign.lookup. Returns "ID | Name"
+    rows for that campaign's activities. In report.create the activities
+    filter also needs a campaignActivities filter on the SAME campaign
+    with operator equal.
+  example: {campaign_id: 12345}
