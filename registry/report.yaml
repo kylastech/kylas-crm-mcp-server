@@ -40,6 +40,15 @@
     bar), group_by {field, format}, metrics [{type, field}], date_range
     {field, operator, value?}, filters [{field, operator, value?}] (optional).
 
+    name: ALWAYS give the report a proper, descriptive Title Case name that
+    says what it shows — "<what is counted/summed> by <group-by> - <period>",
+    plus the key filters — and ALWAYS end it with " (Made by MCP)". Examples:
+    "Leads by Source - This Month (Made by MCP)", "Deal Value by Owner - Q3
+    2026 (Made by MCP)", "Leads by Owner - India, Last 30 Days (Made by MCP)".
+    If the user gave their own name, use it and still append " (Made by MCP)".
+    Never use a vague name like "Report", "Test" or "New Report". Keep the
+    whole name within 255 characters.
+
     group_by: exactly one dimension. format is REQUIRED for date dimensions
     (YEARLY, QUARTERLY, MONTHLY, WEEKLY, DAILY; FINANCIAL_YEARLY /
     FINANCIAL_QUARTERLY only for INR tenants) and must be omitted otherwise.
@@ -66,7 +75,7 @@
     ok true.
   example:
     entity: lead
-    name: "Leads by source - this month"
+    name: "Leads by Source - This Month (Made by MCP)"
     chart_type: bar
     group_by: {field: source}
     metrics: [{type: COUNT, field: id}]

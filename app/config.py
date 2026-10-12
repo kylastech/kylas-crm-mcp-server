@@ -115,6 +115,8 @@ report of leads by source this month", "make a pie chart of deals by owner"
   2. execute_request("report.create", {entity, name, chart_type, group_by,
      metrics, date_range, filters}) — the short payload described in
      usage_notes; the server validates it and builds the full Kylas body.
+     name: a proper descriptive Title Case name ending with " (Made by MCP)",
+     e.g. "Leads by Source - This Month (Made by MCP)" — never "Report"/"Test".
 
 Do NOT fetch records with *.search and add them up yourself, and do NOT
 build the report in a document or spreadsheet, when the user asked for a
