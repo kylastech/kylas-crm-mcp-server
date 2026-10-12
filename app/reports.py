@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dateutil import parser as dateutil_parser
 
-from app.config import BASE_URL, DEFAULT_TIMEZONE, logger
+from app.config import DEFAULT_TIMEZONE, logger
 from app.client import KylasAPIError, _reset_api_call_count, get_client, handle_api_response
 from app.helpers import _convert_date_value_to_utc
 from app.entities import _LARGE_COMPANY_PICKLISTS, _fetch_current_user
