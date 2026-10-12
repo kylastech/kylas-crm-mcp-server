@@ -758,7 +758,7 @@ def list_tool(
 
     Registry contents right now (this will grow — always confirm here rather than
     assuming an id exists, since not every bucket has every intent):
-      buckets: lead, contact, deal, task, company, meeting, call_log, quotation, _meta
+      buckets: lead, contact, deal, task, company, meeting, call_log, quotation, report, _meta
       intents: get, search, search_by_term, search_idle, create, update, lookup
       (lead/deal/company have all of get/search/search_by_term/search_idle/
       create/update; contact/meeting have the same 5 minus search_idle;
@@ -767,7 +767,9 @@ def list_tool(
       call_log has only search/create/update plus lookup (call_log.by_entity)
       — no get, no search_by_term, no search_idle; meeting also has lookup
       (meeting.lookup_related) on top of its other 4; quotation is READ-ONLY
-      — get/search/search_by_term/search_idle only, no create/update; _meta
+      — get/search/search_by_term/search_idle only, no create/update; report
+      has only create (report.create — creates and SAVES a real Kylas report /
+      chart; its build_payload call REQUIRES entity="<entity>"); _meta
       is bucket-less and has lookup entries only (user.lookup,
       product.lookup, pipeline.lookup, pipeline.details,
       datetime.parse_to_utc). Call list_tool(bucket=...) to see exactly
@@ -775,7 +777,7 @@ def list_tool(
       across buckets.)
 
     bucket: restrict to one bucket (e.g. "lead", "contact", "deal", "task",
-      "company", "meeting", "call_log", "quotation", "_meta"). Omit to search
+      "company", "meeting", "call_log", "quotation", "report", "_meta"). Omit to search
       every bucket.
     intent: restrict to one intent — "get", "search", "search_by_term",
       "search_idle", "create", "update", or "lookup". Omit to match any.
@@ -968,6 +970,13 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
     tool still never sees or checks those values; that only happens (if at
     all) in execute_request, described there.
 
+    REPORT ids (bucket "report", e.g. "report.create") ALSO REQUIRE the
+    "entity" argument — the CRM entity the report is about:
+      build_payload("report.create", entity="lead")
+    Valid entities: lead, deal, contact, company, task, meeting, call, email,
+    quotation (the STANDARD type). Calling a report id without entity returns
+    an error — just call again with entity set.
+
     Returns a JSON object with these fields:
       id             - the id you asked for, echoed back.
       method, path   - the real Kylas HTTP method and path for this endpoint,
@@ -1092,6 +1101,16 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
       omitted" stub for a field you turn out to need, just call build_payload
       again naming that field. Re-calling is idempotent. NEVER guess a
       picklist option id or internal name to avoid the second call.
+
+    entity: REQUIRED for report ids (bucket "report"), ignored for every other
+      id. One of lead, deal, contact, company, task, meeting, call, email,
+      quotation — the STANDARD type (call get_entity_labels() if the user used
+      a renamed entity). The report reference (dimensions, metrics, date
+      fields, filters and their options) is fetched live for that entity, so a
+      report on a different entity needs a new build_payload call. "fields"
+      works here too: large picklist filters (country, timezone, ...) are
+      omitted unless named, e.g. build_payload("report.create", entity="lead",
+      fields=["country"]).
     """
     entry = _REGISTRY.get(id)
     if not entry:
@@ -1129,7 +1148,12 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
             if not entity:
                 return json.dumps({
                     "ok": False,
-                    "error": "The 'report' bucket requires an 'entity' argument (e.g. build_payload(\"report.create\", entity=\"lead\"))."
+                    "error": (
+                        f"'{id}' needs the entity argument. Call again as "
+                        f"build_payload(\"{id}\", entity=\"<entity>\") — entity is the standard type of the "
+                        "records the report is about, one of: lead, deal, contact, company, task, meeting, "
+                        "call, email, quotation (e.g. \"leads by source\" -> entity=\"lead\")."
+                    ),
                 }, indent=2)
             try:
                 from app.reports import build_report_reference

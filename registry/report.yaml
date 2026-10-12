@@ -21,7 +21,7 @@
   method: POST
   path: /v3/reports
   dynamic_fields: true
-  description: "Create a one-dimensional report (chart or table) on leads, deals, contacts, companies, tasks, meetings, calls, emails or quotations."
+  description: "Create and save a Kylas report (bar/pie chart or table, grouped by one field, over a date range, with filters) on leads, deals, contacts, companies, tasks, meetings, calls, emails or quotations. build_payload needs entity=\"<entity>\"."
   usage_notes: >
     Call build_payload("report.create", entity="<entity>") FIRST — entity is
     required and is one of lead, deal, contact, company, task, meeting, call,

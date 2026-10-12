@@ -31,7 +31,7 @@ async def _fetch_lead_fields() -> List[Dict[str, Any]]:
     """Fetch lead field metadata from Kylas API. Returns list of field dicts."""
     async with get_client() as client:
         response = await client.get(
-            "/entities/lead/fields",
+            "/v1/entities/lead/fields",
             params={"entityType": "lead", "custom-only": "false", "page": 0, "size": 100}
         )
         data = await handle_api_response(response, "Fetch lead fields")
@@ -245,7 +245,7 @@ async def lookup_users_logic(
     async with get_client() as client:
         while True:
             response = await client.get(
-                "/users/lookup",
+                "/v1/users/lookup",
                 params={"q": q, "page": current_page, "size": page_size},
             )
             data = await handle_api_response(response, "User lookup")
@@ -321,7 +321,7 @@ async def lookup_products_logic(query: str, page: int = 0, size: int = 50) -> st
         q = f"name:{q}"
     async with get_client() as client:
         response = await client.get(
-            "/products/lookup",
+            "/v1/products/lookup",
             params={"q": q, "page": page, "size": min(size, 50)},
         )
         data = await handle_api_response(response, "Product lookup")
@@ -386,7 +386,7 @@ async def lookup_pipelines_logic(
         q = "name:"
     async with get_client() as client:
         response = await client.get(
-            "/pipelines/lookup",
+            "/v1/pipelines/lookup",
             params={"entityType": entity_type, "q": q, "page": page, "size": min(size, 50)},
         )
         data = await handle_api_response(response, "Pipeline lookup")
@@ -1004,7 +1004,7 @@ async def _fetch_contact_fields() -> List[Dict[str, Any]]:
     """Fetch contact field metadata from Kylas API."""
     async with get_client() as client:
         response = await client.get(
-            "/entities/contact/fields",
+            "/v1/entities/contact/fields",
             params={"entityType": "contact", "custom-only": "false", "page": 0, "size": 100}
         )
         data = await handle_api_response(response, "Fetch contact fields")
@@ -1265,7 +1265,7 @@ async def lookup_leads_for_task(search_term: str = "") -> Dict[str, Any]:
     query = f"firstName:{search_term}" if search_term else "firstName:"
     async with get_client() as client:
         response = await client.get(
-            "/search/lead/lookup",
+            "/v1/search/lead/lookup",
             params={"converted": "false", "q": query}
         )
         return await handle_api_response(response, "Lookup leads for task")
@@ -1277,7 +1277,7 @@ async def lookup_contacts_for_task(search_term: str = "") -> Dict[str, Any]:
     payload = {"deal": [], "idToExclude": [], "company": []}
     async with get_client() as client:
         response = await client.post(
-            "/search/contact/associated-with-entity",
+            "/v1/search/contact/associated-with-entity",
             params={"view": "task", "q": query},
             json=payload
         )
@@ -1290,7 +1290,7 @@ async def lookup_deals_for_task(search_term: str = "") -> Dict[str, Any]:
     payload = {"contact": [], "idToExclude": [], "company": []}
     async with get_client() as client:
         response = await client.post(
-            "/search/deal/associated-with-entity",
+            "/v1/search/deal/associated-with-entity",
             params={"view": "task", "q": query},
             json=payload
         )
@@ -1303,7 +1303,7 @@ async def lookup_companies_for_task(search_term: str = "") -> Dict[str, Any]:
     payload = {"deal": [], "idToExclude": [], "contact": []}
     async with get_client() as client:
         response = await client.post(
-            "/search/company/associated-with-entity",
+            "/v1/search/company/associated-with-entity",
             params={"view": "task", "q": query},
             json=payload
         )
@@ -1317,7 +1317,7 @@ async def _fetch_task_fields() -> List[Dict[str, Any]]:
     """Fetch task field metadata from Kylas API."""
     async with get_client() as client:
         response = await client.get(
-            "/entities/task/fields",
+            "/v1/entities/task/fields",
             params={"entityType": "task", "custom-only": "false", "page": 0, "size": 100}
         )
         data = await handle_api_response(response, "Fetch task fields")
@@ -1792,7 +1792,7 @@ async def _fetch_deal_fields() -> List[Dict[str, Any]]:
     """Fetch deal field metadata from Kylas API. Returns list of field dicts."""
     async with get_client() as client:
         response = await client.get(
-            "/deals/fields",
+            "/v1/deals/fields",
             params={"page": 0, "size": 100}
         )
         data = await handle_api_response(response, "Fetch deal fields")
@@ -2563,7 +2563,7 @@ async def _fetch_company_fields() -> List[Dict[str, Any]]:
     """Fetch company field metadata from Kylas API. Returns list of field dicts."""
     async with get_client() as client:
         response = await client.get(
-            "/companies/fields",
+            "/v1/companies/fields",
             params={"page": 0, "size": 100}
         )
         data = await handle_api_response(response, "Fetch company fields")
@@ -2879,7 +2879,7 @@ async def _fetch_meeting_fields() -> List[Dict[str, Any]]:
     """Fetch meeting field metadata from Kylas API. Returns list of field dicts."""
     async with get_client() as client:
         response = await client.get(
-            "/meetings/fields",
+            "/v1/meetings/fields",
             params={"custom-only": "false", "page": 0, "size": 100}
         )
         data = await handle_api_response(response, "Fetch meeting fields")
@@ -3046,7 +3046,7 @@ async def lookup_meeting_invitees_logic(query: str) -> str:
     logger.info("Meeting invitee lookup: q=%s", q)
     async with get_client() as client:
         response = await client.get(
-            "/search/meeting-invitee/lookup",
+            "/v1/search/meeting-invitee/lookup",
             params={"q": q},
         )
         data = await handle_api_response(response, "Meeting invitee lookup")
@@ -3439,7 +3439,7 @@ async def delete_meeting(meeting_id: int) -> str:
         meeting_id = int(meeting_id)
         logger.info("Deleting meeting %s", meeting_id)
         async with get_client() as client:
-            response = await client.delete(f"/meetings/{meeting_id}")
+            response = await client.delete(f"/v1/meetings/{meeting_id}")
             await handle_api_response(response, "Delete meeting")
             return f"✓ Meeting {meeting_id} deleted successfully."
     except KylasAPIError as e:
@@ -3649,7 +3649,7 @@ async def _fetch_call_log_fields() -> List[Dict[str, Any]]:
     """Fetch call log field metadata from Kylas API."""
     async with get_client() as client:
         response = await client.get(
-            "/call-logs/fields",
+            "/v1/call-logs/fields",
             params={"custom-only": "false", "page": 0, "size": 100}
         )
         data = await handle_api_response(response, "Fetch call log fields")
@@ -3859,7 +3859,7 @@ async def get_call_logs(entity_id: int, entity_type: str, page: int = 0, size: i
 
         async with get_client() as client:
             response = await client.get(
-                "/call-logs",
+                "/v1/call-logs",
                 params={
                     "relatedToId": entity_id,
                     "relatedToType": entity_type_lower,

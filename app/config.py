@@ -97,6 +97,33 @@ gets reported as 1:30 AM the next day, and nothing about the response looks
 wrong. The same timezone is also what you pass as timeZone in date filters,
 and what datetime.parse_to_utc needs for create/update payloads.
 
+## KYLAS REPORTS — create them with report.create, never by hand
+
+This server CAN create real, saved Kylas reports (the same reports as the
+Reports module of the Kylas web app — a chart or table grouped by one field,
+over a date range, with optional filters). When the user asks to create,
+make, build or save a report / chart / graph in Kylas — e.g. "create a
+report of leads by source this month", "make a pie chart of deals by owner"
+— use the registry id report.create:
+
+  1. build_payload("report.create", entity="<entity>")   <- entity is REQUIRED
+     entity = the STANDARD type the report is about: lead, deal, contact,
+     company, task, meeting, call, email or quotation ("leads by source" ->
+     "lead"). Without it build_payload returns an error — just call again
+     with entity set. The response's tenant_fields_reference lists the only
+     valid group-by fields, metrics, date fields and filters for that entity.
+  2. execute_request("report.create", {entity, name, chart_type, group_by,
+     metrics, date_range, filters}) — the short payload described in
+     usage_notes; the server validates it and builds the full Kylas body.
+
+Do NOT fetch records with *.search and add them up yourself, and do NOT
+build the report in a document or spreadsheet, when the user asked for a
+Kylas report — that produces an unsaved copy computed from at most one page
+of records. Only do that if the user explicitly asks for an export or a
+one-off summary in chat. Currently only ONE_DIMENSIONAL reports (one
+group-by field) are supported; for anything else (funnel, goal, multi-
+dimensional, hierarchy) tell the user it isn't supported yet.
+
 ## The 3-step flow
 
 1. list_tool(bucket?, intent?)
@@ -105,7 +132,9 @@ and what datetime.parse_to_utc needs for create/update payloads.
    no arguments first if you don't know what's available yet; narrow with
    bucket/intent once you have a sense of what you're looking for.
 
-2. build_payload(id, fields?)
+2. build_payload(id, fields?, entity?)
+   (entity is REQUIRED for report ids such as report.create — see KYLAS
+   REPORTS above — and ignored for everything else.)
    Get everything about the ONE endpoint you picked: its real HTTP method and
    path, usage_notes (the actual field-shape rules for that specific
    endpoint — read these, they are load-bearing, not decorative), a
@@ -254,7 +283,10 @@ compare in the user's timezone, not in UTC, or you will be off by the
 offset and state it with confidence.
 
 ## REPORT FORMATTING — apply whenever presenting 3+ records or a summary
-Structure every report like this:
+(This is about how you WRITE a summary of records in your chat reply. It is
+not how to create a Kylas report — for that use report.create, see KYLAS
+REPORTS above.)
+Structure every summary like this:
 1. TL;DR — one sentence capturing the most important signal (e.g. "3 deals
    are overdue, totalling ₹8.4L at risk").
 2. Body — a markdown table whenever showing 3+ records (columns: the most
