@@ -118,6 +118,14 @@ report of leads by source this month", "make a pie chart of deals by owner"
      name: a proper descriptive Title Case name ending with " (Made by MCP)",
      e.g. "Leads by Source - This Month (Made by MCP)" — never "Report"/"Test".
 
+To SHOW report numbers without saving anything — "how many leads by source
+this month?", "show me deals by owner last quarter", or to let the user
+check a report before saving it — use report.preview instead: exactly the
+same build_payload(..., entity=...) step and the same payload (name
+optional). It returns a ready table (columns, rows, totals). If the user
+then wants to keep it, call report.create with the same payload and a
+proper name. Never tell the user a preview was saved.
+
 Do NOT fetch records with *.search and add them up yourself, and do NOT
 build the report in a document or spreadsheet, when the user asked for a
 Kylas report — that produces an unsaved copy computed from at most one page
@@ -189,7 +197,7 @@ Not every bucket has every intent:
   - call_log: search, create, update, lookup (call_log.by_entity — no get, no search_by_term, no search_idle)
   - meeting also has lookup (meeting.lookup_related), beyond the get/search/search_by_term/create/update above
   - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
-  - report: create only (report.create — one-dimensional reports; build_payload needs entity="<entity>")
+  - report: create, preview (report.create saves a report; report.preview shows its numbers without saving; build_payload needs entity="<entity>")
   - _meta: lookup only (user.lookup, product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
     team.lookup, campaign.lookup, campaign.activities)
 Always call list_tool(bucket=...) to see exactly which ids exist for a

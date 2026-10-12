@@ -1053,3 +1053,157 @@ async def create_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     if notes:
         result["notes"] = notes
     return result
+
+
+# ---------------------------------------------------------------------------
+# report.preview — run the report WITHOUT saving it (sd-ui "Generate Preview")
+# ---------------------------------------------------------------------------
+
+# sd-ui models/Report.ts MONEY_FIELDS — metrics shown in the tenant currency.
+_MONEY_FIELDS = {"actualValue", "estimatedValue", "annualRevenue", "requirementBudget",
+                 "companyAnnualRevenue", "price", "grandTotal", "subTotal"}
+_METRIC_LABEL_PREFIX = {"COUNT": "Number", "SUM": "Sum", "AVERAGE": "Average"}
+# ReportBuilder.tsx:170 — the builder preview sends baseCurrencyId for these entities only
+# (sd-report's /companies run endpoint requires it).
+_BASE_CURRENCY_ENTITIES = {"deal", "company"}
+_PREVIEW_MAX_ROWS = 200
+_PREVIEW_PLACEHOLDER_NAME = "Report preview"
+
+# Same short payload as report.create; name is optional because nothing is saved.
+REPORT_PREVIEW_SCHEMA: Dict[str, Any] = {
+    **REPORT_CREATE_SCHEMA,
+    "required": [k for k in REPORT_CREATE_SCHEMA["required"] if k != "name"],
+}
+
+
+async def _fetch_base_currency_id(tenant_currency: Optional[str]) -> Optional[int]:
+    """GET /v1/picklists/standard -> CURRENCY entry whose name is the tenant currency
+    (sd-ui baseCurrencyIdSelector). None when it can't be resolved."""
+    if not tenant_currency:
+        return None
+    try:
+        async with get_client() as client:
+            response = await client.get("/v1/picklists/standard")
+            data = await handle_api_response(response, "Fetch standard picklists")
+    except KylasAPIError as e:
+        logger.warning("Could not fetch standard picklists for base currency: %s", e.message)
+        return None
+    match = next((c for c in (data or {}).get("CURRENCY") or [] if c.get("name") == tenant_currency), None)
+    return match.get("id") if match else None
+
+
+def _metric_label(entity: str, metric: Dict[str, Any], dimension: Dict[str, Any]) -> str:
+    """sd-ui getMetricLabelByFieldAndType: "Number of Leads", "Sum of Budget", ..."""
+    if (metric["type"], metric["field"]) == ("COUNT", "id"):
+        return f"Number of {_REPORT_ENTITY_PLURAL[entity].capitalize()}"
+    header = next((m.get("header") for m in dimension.get("supportedMetrics") or []
+                   if m.get("type") == metric["type"] and m.get("field") == metric["field"]), None)
+    return f"{_METRIC_LABEL_PREFIX.get(metric['type'], metric['type'].title())} of {header or metric['field']}"
+
+
+def _group_label(dimension: Dict[str, Any], group_by: Dict[str, Any]) -> str:
+    label = dimension.get("header") or dimension.get("id")
+    if group_by.get("format"):
+        label += f" ({group_by['format'].replace('_', ' ').title()})"
+    if group_by.get("property"):
+        label += f" ({group_by['property'].title()})"
+    return label
+
+
+def _clean_number(value: Any) -> Any:
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else round(value, 2)
+    return value
+
+
+def format_preview_rows(
+    entity: str, body: Dict[str, Any], dimension: Dict[str, Any], records: List[Dict[str, Any]],
+    tenant_currency: Optional[str] = None,
+) -> Dict[str, Any]:
+    """AggregateRecord list -> labelled table, like the web app's preview (ReportDataProcessing.ts):
+    the empty group reads "Not Available", money metrics carry the tenant currency."""
+    config = body["config"]
+    metrics = config["metrics"]
+    group_label = _group_label(dimension, config["groupBy"][0])
+    metric_labels = [_metric_label(entity, m, dimension) for m in metrics]
+
+    rows = []
+    for record in records or []:
+        row = {group_label: record.get("name") if record.get("name") is not None else "Not Available"}
+        values = record.get("values") or []
+        for i, label in enumerate(metric_labels):
+            row[label] = _clean_number(values[i]) if i < len(values) else None
+        rows.append(row)
+
+    totals = {}
+    for m, label in zip(metrics, metric_labels):
+        if m["type"] in ("COUNT", "SUM"):
+            totals[label] = _clean_number(sum(r[label] or 0 for r in rows))
+    first = metric_labels[0] if metrics and metrics[0]["type"] in ("COUNT", "SUM") else None
+    if first and totals.get(first):
+        for r in rows:
+            r["Share of total"] = f"{round(100 * (r[first] or 0) / totals[first], 1)}%"
+
+    result: Dict[str, Any] = {
+        "columns": [group_label] + metric_labels + (["Share of total"] if first and totals.get(first) else []),
+        "rows": rows[:_PREVIEW_MAX_ROWS],
+        "total_groups": len(rows),
+        "totals": totals,
+    }
+    money = [label for m, label in zip(metrics, metric_labels) if m["field"] in _MONEY_FIELDS]
+    if money and tenant_currency:
+        result["currency"] = f"{', '.join(money)} in {tenant_currency}"
+    if len(rows) > _PREVIEW_MAX_ROWS:
+        result["truncated"] = f"Showing the first {_PREVIEW_MAX_ROWS} of {len(rows)} groups."
+    return result
+
+
+async def preview_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """report.preview: validate + expand the same short payload as report.create, run it with
+    POST /v3/reports/{entityPlural} (nothing is saved) and return a labelled table."""
+    _reset_api_call_count()
+    payload = dict(payload or {})
+    entity = normalize_report_entity(payload.get("entity"))
+    if not str(payload.get("name") or "").strip():
+        payload["name"] = _PREVIEW_PLACEHOLDER_NAME
+
+    denied = await _check_entity_permission(entity)
+    _require(denied is None, denied or "")
+
+    config = await _fetch_report_config(entity)
+    tenant_currency = await _fetch_tenant_currency()
+    user = await _fetch_current_user()
+    user_timezone = (user or {}).get("timezone")
+    timezone = user_timezone or DEFAULT_TIMEZONE
+
+    body, notes = build_report_body(payload, config, timezone, tenant_currency)
+    if not user_timezone:
+        notes.append(f"Your profile has no timezone, so date ranges were interpreted in {DEFAULT_TIMEZONE}.")
+
+    params: Dict[str, Any] = {"timezone": timezone}
+    if entity in _BASE_CURRENCY_ENTITIES:
+        base_currency_id = await _fetch_base_currency_id(tenant_currency)
+        if base_currency_id is not None:
+            params["baseCurrencyId"] = base_currency_id
+        else:
+            _require(entity != "company", "Could not resolve the tenant's base currency, which company reports need.")
+
+    run_body = dict(body["config"], category=body["category"])
+    async with get_client() as client:
+        response = await client.post(f"/v3/reports/{_REPORT_ENTITY_PLURAL[entity]}", params=params, json=run_body)
+        records = await handle_api_response(response, "Preview report")
+
+    dimension = _find([d for d in config.get("dimensions") or [] if _usable(d)], body["config"]["groupBy"][0]["name"]) or {}
+    result = {
+        "saved": False,
+        "message": ("Preview only — nothing was saved. To save it, call report.create with the same payload "
+                    "(and a proper name ending in \" (Made by MCP)\")."),
+        "entity": entity,
+        "chart_type": body["chartType"],
+        "date_range": {k: body["config"]["dateRange"].get(k) for k in ("field", "operator", "value") if body["config"]["dateRange"].get(k) is not None},
+        "filters_applied": len(body["config"]["rules"]),
+        **format_preview_rows(entity, body, dimension, records if isinstance(records, list) else [], tenant_currency),
+    }
+    if notes:
+        result["notes"] = notes
+    return result

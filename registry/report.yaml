@@ -104,3 +104,38 @@
     metrics: [{type: COUNT, field: id}]
     date_range: {field: createdAt, operator: current_month}
     filters: [{field: country, operator: equal, value: IN}]
+
+- id: report.preview
+  bucket: report
+  intent: preview
+  method: POST
+  path: /v3/reports/{entityPlural}
+  dynamic_fields: true
+  description: "Run a report and show its numbers WITHOUT saving it (same payload as report.create). build_payload needs entity=\"<entity>\"."
+  usage_notes: >
+    Same flow and the SAME short payload as report.create —
+    build_payload("report.preview", entity="<entity>") returns the identical
+    reference, and every report.create rule applies (group_by, metrics,
+    date_range, filters, lookups). The only difference: name is optional and
+    NOTHING is saved in Kylas.
+
+    Use it when the user wants to SEE the numbers ("how many leads by source
+    this month?", "show me deals by owner last quarter") or before saving a
+    report they asked for, so they can check it. After a preview, ask the user
+    whether to save it; if yes, call report.create with the same payload plus
+    a proper name ending in " (Made by MCP)". Never claim a preview was saved.
+
+    On success data is {saved: false, entity, chart_type, date_range,
+    filters_applied, columns, rows, total_groups, totals, currency?, notes?,
+    truncated?}. rows is a list of objects keyed by the column names: the
+    group label (e.g. "Source"), one column per metric (e.g. "Number of
+    Leads", "Sum of Budget") and "Share of total" for the first metric when
+    it's a count or sum. A group named "Not Available" means records with no
+    value for that field. totals sums every COUNT/SUM metric. Present it as a
+    markdown table with the totals, and mention the date range and filters.
+  example:
+    entity: lead
+    chart_type: bar
+    group_by: {field: source}
+    metrics: [{type: COUNT, field: id}]
+    date_range: {field: createdAt, operator: current_month}

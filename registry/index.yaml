@@ -35,3 +35,4 @@ intents:
   - create
   - update
   - lookup
+  - preview

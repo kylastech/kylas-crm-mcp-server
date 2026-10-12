@@ -631,3 +631,94 @@ async def test_new_lookup_ids_route_through_execute_request():
     assert team["ok"] and "ID: 11" in team["data"] and "Sales" in team["data"]
     assert activities["ok"] and "ID: 31" in activities["data"] and "Email blast" in activities["data"]
     assert campaigns["ok"] and "ID: 10" in campaigns["data"] and "More than one" in campaigns["data"]
+
+
+# ---------------------------------------------------------------------------
+# report.preview
+# ---------------------------------------------------------------------------
+
+PREVIEW_RECORDS = [
+    {"id": 650646, "name": "Google", "values": [14, 3692500.0], "recordDetails": None, "dimensions": []},
+    {"id": 650647, "name": "Facebook", "values": [4, 1765000.0], "recordDetails": None, "dimensions": []},
+    {"id": None, "name": None, "values": [2, 12345.5], "recordDetails": None, "dimensions": []},
+]
+
+
+def test_format_preview_rows_labels_totals_and_share():
+    body, _ = _build(_payload(metrics=[{"type": "COUNT", "field": "id"}, {"type": "SUM", "field": "requirementBudget"}]))
+    dimension = next(d for d in _config()["dimensions"] if d["id"] == "source")
+    out = reports.format_preview_rows("lead", body, dimension, PREVIEW_RECORDS, "INR")
+    assert out["columns"] == ["Source", "Number of Leads", "Sum of Budget", "Share of total"]
+    assert out["rows"][0] == {"Source": "Google", "Number of Leads": 14, "Sum of Budget": 3692500, "Share of total": "70.0%"}
+    assert out["rows"][2]["Source"] == "Not Available" and out["rows"][2]["Sum of Budget"] == 12345.5
+    assert out["totals"] == {"Number of Leads": 20, "Sum of Budget": 5469845.5}
+    assert out["total_groups"] == 3 and out["currency"] == "Sum of Budget in INR"
+
+
+def test_format_preview_rows_date_dimension_label_and_average_has_no_total():
+    body, _ = _build(_payload(group_by={"field": "createdAt", "format": "MONTHLY"},
+                              metrics=[{"type": "AVERAGE", "field": "requirementBudget"}]))
+    dimension = next(d for d in _config()["dimensions"] if d["id"] == "createdAt")
+    out = reports.format_preview_rows("lead", body, dimension, [{"id": None, "name": "Jul'2026", "values": [10.0]}])
+    assert out["columns"] == ["Created At (Monthly)", "Average of Budget"]
+    assert out["rows"] == [{"Created At (Monthly)": "Jul'2026", "Average of Budget": 10}]
+    assert out["totals"] == {}
+
+
+@pytest.mark.asyncio
+async def test_execute_preview_runs_without_saving_and_name_optional():
+    posted = []
+    client = _mock_client(ROUTES, posted)
+
+    async def _post(url, json=None, params=None, **kwargs):
+        posted.append((url, json, params))
+        r = MagicMock()
+        r.json.return_value = PREVIEW_RECORDS
+        r.raise_for_status = MagicMock()
+        return r
+
+    client.return_value.post.side_effect = _post
+    payload = _payload()
+    payload.pop("name")
+    with patch("app.reports.get_client", client), patch("app.entities.get_client", client):
+        result = json.loads(await execute_request("report.preview", payload))
+    assert result["ok"] is True, result
+    data = result["data"]
+    assert data["saved"] is False and data["rows"][0]["Source"] == "Google"
+    (url, body, params), = posted
+    assert url == "/v3/reports/leads" and params == {"timezone": "Asia/Kolkata"}
+    assert body["category"] == "ONE_DIMENSIONAL" and "name" not in body and body["groupBy"][0]["name"] == "source"
+
+
+@pytest.mark.asyncio
+async def test_preview_deal_sends_base_currency_id():
+    deal_config = dict(copy.deepcopy(LEAD_CONFIG), entity="deal")
+    routes = dict(ROUTES, **{
+        "/users/me/permissions": [{"name": "deal", "action": {"read": True}}],
+        "/reports/config/deals": deal_config,
+        "/v1/picklists/standard": {"CURRENCY": [{"id": 400, "name": "USD"}, {"id": 431, "name": "INR"}]},
+    })
+    posted = []
+    client = _mock_client(routes, posted)
+
+    async def _post(url, json=None, params=None, **kwargs):
+        posted.append((url, params))
+        r = MagicMock()
+        r.json.return_value = []
+        r.raise_for_status = MagicMock()
+        return r
+
+    client.return_value.post.side_effect = _post
+    with patch("app.reports.get_client", client), patch("app.entities.get_client", client):
+        result = json.loads(await execute_request("report.preview", _payload(entity="deal")))
+    assert result["ok"] is True, result
+    assert posted == [("/v3/reports/deals", {"timezone": "Asia/Kolkata", "baseCurrencyId": 431})]
+    assert result["data"]["rows"] == [] and result["data"]["total_groups"] == 0
+
+
+@pytest.mark.asyncio
+async def test_build_payload_preview_schema_name_optional():
+    with patch("app.reports.get_client", _mock_client(ROUTES, [])):
+        result = json.loads(await build_payload("report.preview", entity="lead"))
+    assert result["fetched_live"] is True and "name" not in result["schema"]["required"]
+    assert "tenant_fields_reference" in result["schema"]

@@ -10,7 +10,7 @@ from app.config import logger
 from app.server import mcp
 from app.client import KylasAPIError, _reset_api_call_count
 from app.helpers import OPERATOR_MAPPING, _build_search_json_rule
-from app.reports import create_report_logic
+from app.reports import REPORT_PREVIEW_SCHEMA, create_report_logic, preview_report_logic
 from app.entities import (
     _build_call_log_search_json_rule,
     _build_company_search_json_rule,
@@ -762,7 +762,7 @@ def list_tool(
     Registry contents right now (this will grow — always confirm here rather than
     assuming an id exists, since not every bucket has every intent):
       buckets: lead, contact, deal, task, company, meeting, call_log, quotation, report, _meta
-      intents: get, search, search_by_term, search_idle, create, update, lookup
+      intents: get, search, search_by_term, search_idle, create, update, lookup, preview
       (lead/deal/company have all of get/search/search_by_term/search_idle/
       create/update; contact/meeting have the same 5 minus search_idle;
       task has get/search/search_by_term/create/update plus lookup
@@ -771,8 +771,9 @@ def list_tool(
       — no get, no search_by_term, no search_idle; meeting also has lookup
       (meeting.lookup_related) on top of its other 4; quotation is READ-ONLY
       — get/search/search_by_term/search_idle only, no create/update; report
-      has only create (report.create — creates and SAVES a real Kylas report /
-      chart; its build_payload call REQUIRES entity="<entity>"); _meta
+      has create and preview (report.create — creates and SAVES a real Kylas
+      report / chart; report.preview — runs the same report and returns its
+      numbers WITHOUT saving; both need entity="<entity>" in build_payload); _meta
       is bucket-less and has lookup entries only (user.lookup,
       product.lookup, pipeline.lookup, pipeline.details,
       datetime.parse_to_utc, team.lookup, campaign.lookup,
@@ -784,7 +785,7 @@ def list_tool(
       "company", "meeting", "call_log", "quotation", "report", "_meta"). Omit to search
       every bucket.
     intent: restrict to one intent — "get", "search", "search_by_term",
-      "search_idle", "create", "update", or "lookup". Omit to match any.
+      "search_idle", "create", "update", "lookup" or "preview". Omit to match any.
 
     Example: list_tool(bucket="lead") returns all lead.* rows (get/search/
     search_by_term/search_idle/create/update), each with its own id and
@@ -974,7 +975,7 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
     tool still never sees or checks those values; that only happens (if at
     all) in execute_request, described there.
 
-    REPORT ids (bucket "report", e.g. "report.create") ALSO REQUIRE the
+    REPORT ids (bucket "report": report.create, report.preview) ALSO REQUIRE the
     "entity" argument — the CRM entity the report is about:
       build_payload("report.create", entity="lead")
     Valid entities: lead, deal, contact, company, task, meeting, call, email,
@@ -1142,6 +1143,8 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
         schema = _real_update_schema()
     elif entry["intent"] == "lookup":
         schema = _real_get_schema(_REGISTRY_ID_TO_META_TOOL.get(id, ""))
+    elif entry["intent"] == "preview":
+        schema = json.loads(json.dumps(REPORT_PREVIEW_SCHEMA))
     else:
         schema = entry.get("schema") or {}
 
@@ -1342,6 +1345,8 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
             update_payload = dict(payload)
             entity_id = update_payload.pop("entity_id")
             result = await update_entity_logic(bucket, entity_id, update_payload)
+        elif intent == "preview" and bucket == "report":
+            result = await preview_report_logic(payload)
         elif intent == "lookup":
             router = _META_LOOKUP_ROUTERS.get(id)
             if not router:
