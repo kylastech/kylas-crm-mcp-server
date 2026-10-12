@@ -52,6 +52,9 @@ from app.entities import (
     lookup_meeting_related_entity,
     lookup_pipelines_logic,
     lookup_products_logic,
+    lookup_teams_logic,
+    lookup_campaigns_logic,
+    get_campaign_activities_logic,
     lookup_users_logic,
     parse_datetime_to_utc_iso_tool,
     search_call_logs_logic,
@@ -772,7 +775,8 @@ def list_tool(
       chart; its build_payload call REQUIRES entity="<entity>"); _meta
       is bucket-less and has lookup entries only (user.lookup,
       product.lookup, pipeline.lookup, pipeline.details,
-      datetime.parse_to_utc). Call list_tool(bucket=...) to see exactly
+      datetime.parse_to_utc, team.lookup, campaign.lookup,
+      campaign.activities). Call list_tool(bucket=...) to see exactly
       which intents a given bucket actually has — don't assume parity
       across buckets.)
 
@@ -1487,6 +1491,7 @@ for _name in (
     "get_pipeline_details", "lookup_meeting_related_entity",
     "lookup_entity_for_task", "get_call_logs",
     "parse_datetime_to_utc_iso_tool", "search_tasks_with_any_relation",
+    "lookup_teams", "lookup_campaigns", "get_campaign_activities",
 ):
     _snapshot_original_tool_parameters(_name)
 
@@ -1506,6 +1511,9 @@ _REGISTRY_ID_TO_META_TOOL: Dict[str, str] = {
     "call_log.by_entity": "get_call_logs",
     "datetime.parse_to_utc": "parse_datetime_to_utc_iso_tool",
     "task.search_any_relation": "search_tasks_with_any_relation",
+    "team.lookup": "lookup_teams",
+    "campaign.lookup": "lookup_campaigns",
+    "campaign.activities": "get_campaign_activities",
 }
 
 
@@ -1520,6 +1528,22 @@ async def _lookup_users_router(payload: Dict[str, Any]) -> str:
         size=payload.get("size", 50),
         fetch_all_pages=payload.get("return_all", False),
     )
+
+
+def _name_lookup_router(logic_fn: Any) -> Any:
+    # team/campaign lookups take the same
+    # (query, page, size) as their real tools' schemas — one small factory.
+    async def _router(payload: Dict[str, Any]) -> str:
+        return await logic_fn(
+            query=payload.get("query", ""),
+            page=payload.get("page", 0),
+            size=payload.get("size", 50),
+        )
+    return _router
+
+
+async def _campaign_activities_router(payload: Dict[str, Any]) -> str:
+    return await get_campaign_activities_logic(payload["campaign_id"])
 
 
 async def _lookup_products_router(payload: Dict[str, Any]) -> str:
@@ -1627,6 +1651,9 @@ _META_LOOKUP_ROUTERS: Dict[str, Any] = {
     "call_log.by_entity": _call_log_by_entity_router,
     "datetime.parse_to_utc": _datetime_parse_router,
     "task.search_any_relation": _task_search_any_relation_router,
+    "team.lookup": _name_lookup_router(lookup_teams_logic),
+    "campaign.lookup": _name_lookup_router(lookup_campaigns_logic),
+    "campaign.activities": _campaign_activities_router,
 }
 
 

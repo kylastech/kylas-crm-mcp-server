@@ -10,10 +10,11 @@
 # app's report builder makes — so build_payload needs an extra "entity"
 # argument for these ids.
 #
-# Phase 1: report.create for category ONE_DIMENSIONAL only. Filters whose
-# values need a lookup that has no registry id yet (teams, campaigns,
-# activities, pipeline stages, meeting invitees/organizer, record lookups)
-# are listed as "NOT SUPPORTED YET" in the reference and rejected on create.
+# Phase 1: report.create for category ONE_DIMENSIONAL only. Lookup-backed
+# filters resolve through separate registry ids (team.lookup, campaign.lookup,
+# campaign.activities, *.search_by_term, pipeline.details,
+# meeting.lookup_related). Email receivedBy/user and GPS filters stay
+# unsupported and are marked "NOT SUPPORTED" in the reference.
 
 - id: report.create
   bucket: report
@@ -60,12 +61,34 @@
     date_range is required. If the user gave no period, use createdAt with
     current_month — the web app's default — and tell the user. For "between"
     give value [start, end] in the user's own local time (date or datetime);
-    the server converts to UTC. last_n_days / next_n_days take value N
+    the server converts to UTC; the range may span at most 1825 days (about
+    5 years), 90 days for email. last_n_days / next_n_days take value N
     (1-364). The date_range field cannot also be used as a filter.
 
-    filters: lookup filters (owner, created by, product, pipeline, ...) take
-    numeric ids — resolve them via the registry id named in the reference
-    (user.lookup, product.lookup, pipeline.lookup); never guess an id.
+    filters: lookup filters take ids — resolve each one through the registry
+    id its reference line names in "resolve_via" (full list_tool ->
+    build_payload -> execute_request cycle); never guess an id:
+      users (owner, created by, ...)      -> user.lookup
+      products                            -> product.lookup
+      pipeline                            -> pipeline.lookup
+      pipeline stage                      -> pipeline.details (Stage ID values
+                                             of the pipeline in your pipeline
+                                             filter, which must be equal/in)
+      teams ("…Fields" filters)           -> team.lookup (server adds the
+                                             "<user field> is_not_null" filter)
+      campaign (campaignActivities)       -> campaign.lookup
+      campaign activities (activities)    -> campaign.activities (campaign
+                                             filter must be equal)
+      linked leads/contacts/deals/companies -> lead/contact/deal/company
+                                             .search_by_term (use the ID; task
+                                             reports allow ONE of these)
+      meeting participants / organizer    -> meeting.lookup_related with
+                                             entity_type "invitee"; the value is
+                                             the OBJECT {id, entity, name} (a
+                                             list for in/not_in), not a bare id
+    Email sentBy takes bare user id(s) from user.lookup (equal / in only).
+    Filters marked "NOT SUPPORTED" (email receivedBy/user, GPS radius) can't
+    be used.
     Picklist filters take an option from the reference (id, internal name or
     label are all accepted). is_null / is_not_null / is_empty / is_not_empty
     take no value; in / not_in take a list.
