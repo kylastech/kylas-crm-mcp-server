@@ -24,6 +24,7 @@ buckets:
   - task
   - company
   - quotation
+  - report
   - _meta
 
 intents:
