@@ -493,6 +493,9 @@ def get_report_config_instructions_logic(
                  "converted to UTC by the server); 'last_n_days'/'next_n_days' -> N (1-364); others -> omit.")
     if entity == "email":
         lines.append("  Email: past ranges only; a custom 'between' range may span at most 90 days.")
+    else:
+        lines.append(f"  A custom 'between' range may span at most {_MAX_CUSTOM_RANGE_DAYS} days (about 5 years); "
+                     "the same limit applies to 'between' on date filters.")
     lines.append("  The date-range field can NOT also be used in filters.")
 
     lines.extend(["", "FILTERS (filters[] = {field, operator, value}) — optional, each field at most once:"])
@@ -517,6 +520,8 @@ def _format_report_filter(entity: str, f: Dict[str, Any], requested: set, tenant
     required = list(f.get("requiredFilters") or []) + ([parent] if parent and parent not in (f.get("requiredFilters") or []) else [])
     if required:
         lines.append(f"     requires filter(s): {', '.join(required)}")
+    if parent == "pipeline":
+        lines.append("     the 'pipeline' filter must then use operator 'equal' or 'in'.")
     if resolver:
         extra = ""
         if resolver == "pipeline.lookup":

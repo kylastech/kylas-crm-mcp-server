@@ -134,6 +134,14 @@ def test_reference_hides_unusable_and_marks_phase2_filters():
     assert "pipelineStageCompleted" not in text
 
 
+def test_reference_states_range_limit_and_pipeline_operator_rule():
+    text = get_report_config_instructions_logic("lead", _config(), set(), "INR")
+    assert "at most 1825 days" in text
+    assert "the 'pipeline' filter must then use operator 'equal' or 'in'" in text
+    email_text = get_report_config_instructions_logic("email", _config(), set(), "INR")
+    assert "at most 90 days" in email_text and "1825" not in email_text
+
+
 def test_reference_financial_options_follow_tenant_currency():
     inr = get_report_config_instructions_logic("lead", _config(), set(), "INR")
     usd = get_report_config_instructions_logic("lead", _config(), set(), "USD")
