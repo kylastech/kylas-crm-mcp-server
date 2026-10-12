@@ -10,7 +10,8 @@
 # app's report builder makes — so build_payload needs an extra "entity"
 # argument for these ids.
 #
-# report.create / report.preview: categories ONE_DIMENSIONAL and MULTI_DIMENSIONAL. Lookup-backed
+# report.create / report.preview: ONE_DIMENSIONAL, MULTI_DIMENSIONAL, HIERARCHY, funnel and
+# GOALS_VS_ACHIEVEMENT reports. Lookup-backed
 # filters resolve through separate registry ids (team.lookup, campaign.lookup,
 # campaign.activities, *.search_by_term, pipeline.details,
 # meeting.lookup_related). Email receivedBy/user and GPS filters stay
@@ -22,7 +23,7 @@
   method: POST
   path: /v3/reports
   dynamic_fields: true
-  description: "Create and save a Kylas report (bar/pie chart or table, grouped by one to three fields, over a date range, with filters) on leads, deals, contacts, companies, tasks, meetings, calls, emails or quotations. build_payload needs entity=\"<entity>\"."
+  description: "Create and save a Kylas report (bar/pie/table grouped by one to three fields, hierarchy, funnel or goal vs achievement, over a date range, with filters) on leads, deals, contacts, companies, tasks, meetings, calls, emails or quotations. build_payload needs entity=\"<entity>\"."
   usage_notes: >
     Call build_payload("report.create", entity="<entity>") FIRST — entity is
     required and is one of lead, deal, contact, company, task, meeting, call,
@@ -65,6 +66,26 @@
     (YEARLY, QUARTERLY, MONTHLY, WEEKLY, DAILY; FINANCIAL_YEARLY /
     FINANCIAL_QUARTERLY only for INR tenants) and must be omitted otherwise.
     If a dimension lists "REQUIRES filter(s)", add those filters.
+
+    Other report types (same payload, extra keys):
+      HIERARCHY — category HIERARCHY, group_by one USER field (ownerId,
+        createdBy, ...), up to 3 metrics; chart set automatically. Rows
+        roll up the reporting hierarchy: self / reportees / total.
+      FUNNEL — chart_type "funnel", lead or deal only, ONE_DIMENSIONAL.
+        Leave group_by and metrics out (fixed to pipelineStage / COUNT id).
+        REQUIRES filter {field: pipeline, operator: equal, value: <id from
+        pipeline.lookup>} — exactly one pipeline. Optional funnel_color
+        (#1F99DA default; #7824FF #DA1F99 #F3A53B #52A351 #DA2D1F #351FDA
+        #FFD10F #005F00 #FF9300).
+      GOALS_VS_ACHIEVEMENT — category GOALS_VS_ACHIEVEMENT + goal_id
+        (goal.lookup, then goal.details); entity must be the goal's entity
+        (lead, deal, meeting or call). Leave group_by and metrics out — they
+        come from the goal, as do its locked filters; chart is donut.
+        date_range defaults to the goal's frequency (current week for a
+        weekly goal, ...) and may be changed; extra filters allowed.
+        prorated defaults to true; the server turns it off (with a note)
+        when the range is longer than the goal frequency or is before/after
+        the current date-time.
 
     metrics: COUNT id = number of records. With more than one metric the
     chart becomes a table (the server switches it and says so in "notes").
@@ -143,7 +164,12 @@
     (e.g. "Number of Leads", "Sum of Budget") and, for ONE_DIMENSIONAL,
     "Share of total" for the first metric when it's a count or sum.
     MULTI_DIMENSIONAL results are flattened to one row per innermost group,
-    with subtotals per first-level group. A group named "Not Available" means records with no
+    with subtotals per first-level group. HIERARCHY rows are per user with
+    self / reportees / total columns. FUNNEL rows are pipeline stages in
+    order (visited, skipped, outcome, % of entered for closed stages). GOAL
+    rows show Achieved, Goal, % achieved and colour band per person, with
+    the overall totals and a "goal" block (frequency, prorated). Each of
+    these has a "how_to_read" line — pass its meaning on to the user. A group named "Not Available" means records with no
     value for that field. totals sums every COUNT/SUM metric. Present it as a
     markdown table with the totals, and mention the date range and filters.
   example:

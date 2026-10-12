@@ -55,6 +55,8 @@ from app.entities import (
     lookup_teams_logic,
     lookup_campaigns_logic,
     get_campaign_activities_logic,
+    lookup_goals_logic,
+    get_goal_details_logic,
     lookup_users_logic,
     parse_datetime_to_utc_iso_tool,
     search_call_logs_logic,
@@ -777,7 +779,7 @@ def list_tool(
       is bucket-less and has lookup entries only (user.lookup,
       product.lookup, pipeline.lookup, pipeline.details,
       datetime.parse_to_utc, team.lookup, campaign.lookup,
-      campaign.activities). Call list_tool(bucket=...) to see exactly
+      campaign.activities, goal.lookup, goal.details). Call list_tool(bucket=...) to see exactly
       which intents a given bucket actually has — don't assume parity
       across buckets.)
 
@@ -1497,6 +1499,7 @@ for _name in (
     "lookup_entity_for_task", "get_call_logs",
     "parse_datetime_to_utc_iso_tool", "search_tasks_with_any_relation",
     "lookup_teams", "lookup_campaigns", "get_campaign_activities",
+    "lookup_goals", "get_goal_details",
 ):
     _snapshot_original_tool_parameters(_name)
 
@@ -1519,6 +1522,8 @@ _REGISTRY_ID_TO_META_TOOL: Dict[str, str] = {
     "team.lookup": "lookup_teams",
     "campaign.lookup": "lookup_campaigns",
     "campaign.activities": "get_campaign_activities",
+    "goal.lookup": "lookup_goals",
+    "goal.details": "get_goal_details",
 }
 
 
@@ -1549,6 +1554,14 @@ def _name_lookup_router(logic_fn: Any) -> Any:
 
 async def _campaign_activities_router(payload: Dict[str, Any]) -> str:
     return await get_campaign_activities_logic(payload["campaign_id"])
+
+
+async def _goal_lookup_router(payload: Dict[str, Any]) -> str:
+    return await lookup_goals_logic(payload.get("entity_type", ""))
+
+
+async def _goal_details_router(payload: Dict[str, Any]) -> str:
+    return await get_goal_details_logic(payload["goal_id"])
 
 
 async def _lookup_products_router(payload: Dict[str, Any]) -> str:
@@ -1659,6 +1672,8 @@ _META_LOOKUP_ROUTERS: Dict[str, Any] = {
     "team.lookup": _name_lookup_router(lookup_teams_logic),
     "campaign.lookup": _name_lookup_router(lookup_campaigns_logic),
     "campaign.activities": _campaign_activities_router,
+    "goal.lookup": _goal_lookup_router,
+    "goal.details": _goal_details_router,
 }
 
 

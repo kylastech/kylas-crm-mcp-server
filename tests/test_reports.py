@@ -346,7 +346,7 @@ def test_basic_validation_errors():
     with pytest.raises(ValueError, match="name is required"):
         _build(_payload(name="ab"))
     with pytest.raises(ValueError, match="category must be one of"):
-        _build(_payload(category="HIERARCHY"))
+        _build(_payload(category="PIVOT"))
     with pytest.raises(ValueError, match="Unknown report entity"):
         _build(_payload(entity="widgets"))
 
@@ -810,3 +810,215 @@ def test_preview_flattens_nested_results_with_subtotals():
 def test_reference_documents_multi_dimensional():
     text = get_report_config_instructions_logic("lead", _config(), set(), "INR")
     assert "MULTI_DIMENSIONAL = group_by is a" in text and "must come after its parent" in text
+
+
+# ---------------------------------------------------------------------------
+# HIERARCHY and FUNNEL
+# ---------------------------------------------------------------------------
+
+def test_hierarchy_body_and_rules():
+    body, notes = _build(_payload(category="HIERARCHY", group_by={"field": "ownerId"}, chart_type="bar",
+                                  metrics=[{"type": "COUNT", "field": "id"}, {"type": "SUM", "field": "requirementBudget"}]))
+    assert body["category"] == "HIERARCHY" and body["chartType"] == "hierarchy"
+    assert body["config"]["groupBy"] == [{"name": "ownerId", "format": None, "primaryField": None, "property": None}]
+    assert any("replaced by 'hierarchy'" in n for n in notes)
+    assert not any("table" in n for n in notes)  # no table switch for hierarchy
+    with pytest.raises(ValueError, match="group by a user field"):
+        _build(_payload(category="HIERARCHY", group_by={"field": "source"}))
+    with pytest.raises(ValueError, match="exactly one group_by"):
+        _build(_payload(category="HIERARCHY", group_by=["ownerId", "createdAt"]))
+    cfg = _config()
+    cfg["dimensions"][1]["supportedMetrics"] = METRICS + [{"type": "SUM", "field": "score", "header": "Score"},
+                                                          {"type": "AVERAGE", "field": "score", "header": "Score"}]
+    with pytest.raises(ValueError, match="at most 3 metrics"):
+        build_report_body(_payload(category="HIERARCHY", group_by={"field": "ownerId"}, metrics=[
+            {"type": "COUNT", "field": "id"}, {"type": "SUM", "field": "requirementBudget"},
+            {"type": "AVERAGE", "field": "requirementBudget"}, {"type": "SUM", "field": "score"}]), cfg, "Asia/Kolkata", "INR")
+
+
+def test_hierarchy_preview_rolls_values_up_the_tree():
+    body, _ = _build(_payload(category="HIERARCHY", group_by={"field": "ownerId"}))
+    records = [
+        {"id": 1, "name": "CEO", "reportingManagers": [], "active": True, "values": [5]},
+        {"id": 2, "name": "Manager", "reportingManagers": [{"id": 1, "name": "CEO"}], "active": True, "values": [3]},
+        {"id": 3, "name": "Rep A", "reportingManagers": [{"id": 2, "name": "Manager"}], "active": True, "values": [2]},
+        {"id": 4, "name": "Rep B", "reportingManagers": [{"id": 2, "name": "Manager"}, {"id": 1, "name": "CEO"}], "active": False, "values": []},
+    ]
+    out = reports.format_hierarchy_rows("lead", body, {}, records)
+    by_user = {r["User"]: r for r in out["rows"]}
+    assert by_user["CEO"]["Number of Leads (reportees)"] == 5 and by_user["CEO"]["Number of Leads (total)"] == 10
+    assert by_user["Manager"]["Number of Leads (reportees)"] == 2 and by_user["Manager"]["Reports to"] == "CEO"
+    assert by_user["Rep B (inactive)"]["Number of Leads (self)"] == 0 and by_user["Rep B (inactive)"]["Reports to"] == "Manager, CEO"
+    assert out["totals"] == {"Number of Leads": 10}
+
+
+def _funnel_config():
+    cfg = _config()
+    cfg["dimensions"].append(_dim("pipeline", "Pipeline", "PIPELINE"))
+    return cfg
+
+
+def test_funnel_body_matches_sd_ui_save():
+    body, _ = build_report_body(_payload(chart_type="funnel", group_by=None, metrics=None, funnel_color="#da2d1f",
+                                         filters=[{"field": "pipeline", "operator": "equal", "value": 872}]),
+                                _funnel_config(), "Asia/Kolkata", "INR")
+    assert body["chartType"] == "funnel" and body["category"] == "ONE_DIMENSIONAL" and body["funnelColor"] == "#DA2D1F"
+    assert body["config"]["groupBy"] == [{"name": "pipelineStage", "format": None, "primaryField": None, "property": None}]
+    assert body["config"]["metrics"] == [{"type": "COUNT", "field": "id"}]
+    assert "colorCodes" not in body["config"] and "chartType" not in body["config"]
+    assert body["config"]["rules"][0]["value"] == 872 and body["config"]["rules"][0]["operator"] == "equal"
+
+
+def _funnel_payload(**overrides):
+    base = _payload(chart_type="funnel", group_by=None, metrics=None)
+    base.update(overrides)
+    return base
+
+
+def test_funnel_rules():
+    ok = {"filters": [{"field": "pipeline", "operator": "equal", "value": 872}]}
+    with pytest.raises(ValueError, match="lead and deal only"):
+        build_report_body(dict(_funnel_payload(**ok), entity="contact"), _funnel_config(), "Asia/Kolkata", "INR")
+    with pytest.raises(ValueError, match="must be ONE_DIMENSIONAL"):
+        build_report_body(_funnel_payload(category="MULTI_DIMENSIONAL", **ok), _funnel_config(), "Asia/Kolkata", "INR")
+    with pytest.raises(ValueError, match="always group by 'pipelineStage'"):
+        build_report_body(_funnel_payload(group_by={"field": "source"}, **ok), _funnel_config(), "Asia/Kolkata", "INR")
+    with pytest.raises(ValueError, match="exactly one pipeline"):
+        build_report_body(_funnel_payload(filters=[{"field": "pipeline", "operator": "in", "value": [1, 2]}]),
+                          _funnel_config(), "Asia/Kolkata", "INR")
+    with pytest.raises(ValueError, match="funnel_color must be one of"):
+        build_report_body(_funnel_payload(funnel_color="#000000", **ok), _funnel_config(), "Asia/Kolkata", "INR")
+
+
+def test_funnel_preview_rows():
+    records = [
+        {"id": 1, "name": "Open", "values": [10, 0], "recordDetails": {"forecastingType": "OPEN"}},
+        {"id": 2, "name": "Demo", "values": [6, 2], "recordDetails": {"forecastingType": "OPEN"}},
+        {"id": 3, "name": "Won", "values": [3, 0], "recordDetails": {"forecastingType": "CLOSED_WON"}},
+        {"id": 4, "name": "Lost", "values": [1, 0], "recordDetails": {"forecastingType": "CLOSED_LOST"}},
+    ]
+    out = reports.format_funnel_rows("deal", records)
+    assert out["rows"][1] == {"Stage": "Demo", "Outcome": "Open", "Deals visited": 6, "Deals skipped": 2}
+    assert out["rows"][2]["% of entered"] == "30.0%" and out["rows"][3]["Outcome"] == "Lost"
+    assert out["totals"] == {"Deals entering the funnel": 10}
+
+
+@pytest.mark.asyncio
+async def test_funnel_preview_sends_chart_type_funnel():
+    posted = []
+    client = _mock_client(dict(ROUTES, **{"/reports/config/leads": _funnel_config()}), posted)
+
+    async def _post(url, json=None, params=None, **kwargs):
+        posted.append(json)
+        r = MagicMock()
+        r.json.return_value = []
+        r.raise_for_status = MagicMock()
+        return r
+
+    client.return_value.post.side_effect = _post
+    with patch("app.reports.get_client", client), patch("app.entities.get_client", client):
+        result = json.loads(await execute_request("report.preview", _funnel_payload(
+            filters=[{"field": "pipeline", "operator": "equal", "value": 872}])))
+    assert result["ok"] is True, result
+    assert posted[0]["chartType"] == "FUNNEL" and posted[0]["category"] == "ONE_DIMENSIONAL"
+
+
+# ---------------------------------------------------------------------------
+# GOALS_VS_ACHIEVEMENT
+# ---------------------------------------------------------------------------
+
+GOAL = {
+    "id": 548, "name": "ewewe", "entityType": "LEAD", "active": True, "value": 50.0,
+    "dimension": {"field": "ownerId", "header": "Owner", "format": None, "fieldType": "LOOK_UP"},
+    "metric": {"field": "id", "header": "Number of NPC", "type": "COUNT"},
+    "frequency": {"type": "WEEKLY", "header": "Weekly"},
+    "dateRange": {"operator": "current_week", "field": "createdAt", "fieldType": "DATETIME_PICKER"},
+    "filters": [{"operator": "equal", "field": "source", "header": "Source", "type": "long", "value": 650646,
+                 "fieldType": "PICK_LIST", "primaryField": None, "property": None}],
+}
+
+
+def _goal_payload(**overrides):
+    base = {"entity": "lead", "name": "Goal Report (Made by MCP)", "category": "GOALS_VS_ACHIEVEMENT", "goal_id": 548}
+    base.update(overrides)
+    return base
+
+
+def test_goal_body_fills_from_goal():
+    body, notes = build_report_body(_goal_payload(), _config(), "Asia/Kolkata", "INR", copy.deepcopy(GOAL))
+    assert body["category"] == "GOALS_VS_ACHIEVEMENT" and body["chartType"] == "donut"
+    assert body["goal"] == {"id": 548, "name": "ewewe"} and body["prorated"] is True
+    cfg = body["config"]
+    assert cfg["groupBy"][0]["name"] == "ownerId" and cfg["metrics"] == [{"type": "COUNT", "field": "id"}]
+    assert cfg["dateRange"]["operator"] == "current_week" and cfg["dateRange"]["from"] == "00:00"
+    assert cfg["rules"][0] == {"operator": "equal", "id": "source", "field": "source", "fieldInputType": "PICK_LIST",
+                               "type": "long", "value": 650646, "from": None, "to": None, "property": None, "primaryField": None}
+    assert [b["hexCode"] for b in cfg["colorCodes"]] == ["#DB2E20", "#FF9300", "#FFD10F", "#52A351"]
+
+
+def test_goal_rules():
+    goal = copy.deepcopy(GOAL)
+    with pytest.raises(ValueError, match="is on lead, not deal"):
+        build_report_body(_goal_payload(entity="deal"), _config(), "Asia/Kolkata", "INR", goal)
+    with pytest.raises(ValueError, match="inactive"):
+        build_report_body(_goal_payload(), _config(), "Asia/Kolkata", "INR", dict(goal, active=False))
+    with pytest.raises(ValueError, match="set by the goal"):
+        build_report_body(_goal_payload(filters=[{"field": "source", "operator": "equal", "value": "Facebook"}]),
+                          _config(), "Asia/Kolkata", "INR", goal)
+    with pytest.raises(ValueError, match="available for lead, deal, meeting, call"):
+        build_report_body(_goal_payload(entity="contact"), _config(), "Asia/Kolkata", "INR", goal)
+    # extra filters allowed
+    body, _ = build_report_body(_goal_payload(filters=[{"field": "country", "operator": "equal", "value": "IN"}]),
+                                _config(), "Asia/Kolkata", "INR", goal)
+    assert [r["id"] for r in body["config"]["rules"]] == ["source", "country"]
+
+
+def test_goal_prorated_rules():
+    goal = copy.deepcopy(GOAL)
+    body, notes = build_report_body(_goal_payload(date_range={"field": "createdAt", "operator": "current_year"}),
+                                    _config(), "Asia/Kolkata", "INR", goal)
+    assert body["prorated"] is False and any("longer than the goal's frequency" in n for n in notes)
+    body, _ = build_report_body(_goal_payload(date_range={"field": "createdAt", "operator": "today"}),
+                                _config(), "Asia/Kolkata", "INR", goal)
+    assert body["prorated"] is True
+    body, _ = build_report_body(_goal_payload(prorated=False), _config(), "Asia/Kolkata", "INR", goal)
+    assert body["prorated"] is False
+
+
+def test_format_goal_rows():
+    body, _ = build_report_body(_goal_payload(), _config(), "Asia/Kolkata", "INR", copy.deepcopy(GOAL))
+    data = {"result": [{"id": 1, "name": "Ravi", "value": [{"achieved": 8, "goal": 10.0, "percentage": 80.0}]},
+                       {"id": 2, "name": "Asha", "value": [{"achieved": 2, "goal": 10.0, "percentage": 20.0}]}],
+            "goalSummary": {"achieved": 10.0, "goal": 50.0, "percentage": 20.0}}
+    out = reports.format_goal_rows(body, GOAL, data, [{"header": "Owner"}])
+    assert out["rows"][0] == {"Owner": "Ravi", "Achieved": 8, "Goal": 10, "% achieved": "80%", "Band": "75%+ (green)"}
+    assert out["rows"][1]["Band"] == "below 25% (red)"
+    assert out["totals"] == {"Achieved": 10, "Goal": 50, "% achieved": "20%", "Band": "below 25% (red)"}
+
+
+@pytest.mark.asyncio
+async def test_goal_preview_uses_goal_endpoint_and_lookups():
+    posted = []
+    routes = dict(ROUTES, **{"/v1/reports/goals/548": copy.deepcopy(GOAL),
+                             "/v1/reports/goals": [{"id": 548, "name": "ewewe"}]})
+    client = _mock_client(routes, posted)
+
+    async def _post(url, json=None, params=None, **kwargs):
+        posted.append((url, params, json))
+        r = MagicMock()
+        r.json.return_value = {"result": [], "goalSummary": {"achieved": 0, "goal": 50, "percentage": 0}}
+        r.raise_for_status = MagicMock()
+        return r
+
+    client.return_value.post.side_effect = _post
+    with patch("app.reports.get_client", client), patch("app.entities.get_client", client):
+        result = json.loads(await execute_request("report.preview", _goal_payload()))
+        goals = json.loads(await execute_request("goal.lookup", {"entity_type": "lead"}))
+        details = json.loads(await execute_request("goal.details", {"goal_id": 548}))
+    assert result["ok"] is True, result
+    url, params, body = posted[0]
+    assert url == "/v1/reports/leads/goals/548" and params == {"timezone": "Asia/Kolkata", "prorated": "true"}
+    assert body["category"] == "GOALS_VS_ACHIEVEMENT" and "colorCodes" in body
+    assert result["data"]["goal"]["name"] == "ewewe"
+    assert goals["ok"] and "ID: 548" in goals["data"]
+    assert details["ok"] and "Weekly" in details["data"] and "COUNT id" in details["data"]

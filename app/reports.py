@@ -31,7 +31,7 @@ from dateutil import parser as dateutil_parser
 from app.config import DEFAULT_TIMEZONE, logger
 from app.client import KylasAPIError, _reset_api_call_count, get_client, handle_api_response
 from app.helpers import _convert_date_value_to_utc
-from app.entities import _LARGE_COMPANY_PICKLISTS, _fetch_current_user
+from app.entities import _LARGE_COMPANY_PICKLISTS, _fetch_current_user, get_goal_details_raw
 
 # ---------------------------------------------------------------------------
 # Entities and endpoints
@@ -63,7 +63,30 @@ _REPORT_LARGE_PICKLISTS = {"timezone", "requirementcurrency", "currency"} | _LAR
 
 _CHART_TYPES = ("bar", "pie", "table")
 _MULTI_DIMENSIONAL_CHART_TYPES = ("bar", "table")  # ReportForm.ts MULTIDIMENSIONAL_CHART_TYPES
-_SUPPORTED_CATEGORIES = ("ONE_DIMENSIONAL", "MULTI_DIMENSIONAL")
+_SUPPORTED_CATEGORIES = ("ONE_DIMENSIONAL", "MULTI_DIMENSIONAL", "HIERARCHY", "GOALS_VS_ACHIEVEMENT")
+# Goal vs Achievement (sd-ui Form.tsx updateReportWithGoalData; sd-report GoalController).
+_GOAL_ENTITIES = ("lead", "deal", "meeting", "call")
+_GOAL_FREQUENCY_OPERATOR = {"DAILY": "today", "WEEKLY": "current_week", "MONTHLY": "current_month",
+                            "QUARTERLY": "current_quarter", "ANNUALLY": "current_year"}
+_GOAL_FREQUENCY_DAYS = {"DAILY": 1, "WEEKLY": 7, "MONTHLY": 30, "QUARTERLY": 120, "ANNUALLY": 365}
+# ReportForm.ts getNumberOfDaysInDateRange (other operators: unknown -> prorating stays allowed)
+_RANGE_DAYS = {"today": 1, "current_week": 7, "last_week": 7, "next_week": 7,
+               "current_month": 30, "last_month": 30, "next_month": 30,
+               "current_quarter": 120, "last_quarter": 120, "next_quarter": 120,
+               "current_year": 365, "last_year": 365, "next_year": 365}
+# models/Report.ts INITIAL_GOAL_REPORT_COLOR_CONFIG
+_GOAL_COLOR_BANDS = [
+    {"hexCode": "#DB2E20", "operator": "less", "from": 0, "to": 25, "value": 25},
+    {"hexCode": "#FF9300", "operator": "between", "from": 25, "to": 50, "value": 50},
+    {"hexCode": "#FFD10F", "operator": "between", "from": 50, "to": 75, "value": 75},
+    {"hexCode": "#52A351", "operator": "greater_or_equal", "from": 75, "to": 100, "value": 75},
+]
+_HIERARCHY_MAX_METRICS = 3  # ReportMetrics.tsx: "Add New" hidden at 3 for HIERARCHY
+# Funnel (chart_type "funnel"): lead/deal, ONE_DIMENSIONAL, grouped by pipelineStage, COUNT id,
+# one pipeline (equal) — sd-ui applyFunnelDefaults + sd-report validateFunnelReportRequest.
+_FUNNEL_ENTITIES = ("lead", "deal")
+_FUNNEL_THEME_COLORS = ("#1F99DA", "#7824FF", "#DA1F99", "#F3A53B", "#52A351",
+                        "#DA2D1F", "#351FDA", "#FFD10F", "#005F00", "#FF9300")
 _MAX_DIMENSIONS = 3  # ReportDimensions.tsx: "Add New" hidden at 3
 _DATE_FIELD_TYPES = {"DATE_PICKER", "DATETIME_PICKER"}
 
@@ -231,16 +254,22 @@ REPORT_CREATE_SCHEMA: Dict[str, Any] = {
             },
         },
     },
-    "required": ["entity", "name", "group_by", "metrics", "date_range"],
+    "required": ["entity", "name", "date_range"],
     "properties": {
         "entity": {"type": "string", "enum": list(REPORT_ENTITIES),
                    "description": "Same entity you passed to build_payload."},
         "name": {"type": "string", "minLength": 3, "maxLength": 255},
         "description": {"type": "string", "maxLength": 255},
         "category": {"type": "string", "enum": list(_SUPPORTED_CATEGORIES), "default": "ONE_DIMENSIONAL",
-                     "description": "MULTI_DIMENSIONAL to group by 2-3 fields (e.g. owner AND source)."},
-        "chart_type": {"type": "string", "enum": list(_CHART_TYPES), "default": "bar",
-                       "description": "bar | pie | table; MULTI_DIMENSIONAL allows only bar | table."},
+                     "description": ("MULTI_DIMENSIONAL: group by 2-3 fields. HIERARCHY: one user field, rolled up "
+                                     "the reporting hierarchy. GOALS_VS_ACHIEVEMENT: progress against goal_id.")},
+        "chart_type": {"type": "string", "enum": list(_CHART_TYPES) + ["funnel"], "default": "bar",
+                       "description": ("bar | pie | table; MULTI_DIMENSIONAL: bar | table; funnel (lead/deal, "
+                                       "ONE_DIMENSIONAL, needs a pipeline equal filter). HIERARCHY and goal reports "
+                                       "set their chart themselves.")},
+        "funnel_color": {"type": "string", "enum": list(_FUNNEL_THEME_COLORS), "description": "Funnel only; default #1F99DA."},
+        "goal_id": {"type": "integer", "description": "GOALS_VS_ACHIEVEMENT only — from goal.lookup."},
+        "prorated": {"type": "boolean", "description": "GOALS_VS_ACHIEVEMENT only; default true (turned off when not allowed)."},
         "group_by": {
             "description": ("ONE_DIMENSIONAL: one {field, format?}. MULTI_DIMENSIONAL: a list of 1-3 "
                             "{field, format?} in grouping order (outer level first)."),
@@ -508,6 +537,14 @@ def get_report_config_instructions_logic(
         "activities) must come after its parent (pipeline / campaignActivities) if both are dimensions;",
         "its required parent filter is not needed when the parent is an earlier dimension."
         + (" Task reports: only one associated-entity dimension." if entity == "task" else ""),
+        "HIERARCHY = one USER dimension (owner, created by, ...), up to 3 metrics, chart set automatically;"
+        " results roll up the reporting hierarchy (self / reportees / total).",
+        *([f"FUNNEL (chart_type 'funnel', ONE_DIMENSIONAL): group_by and metrics are fixed (pipelineStage, COUNT id) —"
+           " leave them out; REQUIRES filter {field: pipeline, operator: equal, value: <one pipeline id>};"
+           f" optional funnel_color: {', '.join(_FUNNEL_THEME_COLORS)}."] if entity in _FUNNEL_ENTITIES else []),
+        *(["GOALS_VS_ACHIEVEMENT: pass goal_id (goal.lookup / goal.details). Dimension, metric and the goal's own"
+           " filters come from the goal (leave group_by/metrics out); chart is donut; date_range defaults to the goal"
+           " frequency (you may change it); extra filters allowed; prorated defaults to true."] if entity in _GOAL_ENTITIES else []),
         "",
         "DIMENSIONS (group_by[].field):",
     ]
@@ -805,6 +842,7 @@ def build_report_body(
     config: Dict[str, Any],
     timezone: str,
     tenant_currency: Optional[str] = None,
+    goal: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """Validate the short report.create payload against the live config and expand it into the
     full POST /v3/reports body. Returns (body, notes). Raises ValueError with a model-actionable message."""
@@ -821,9 +859,51 @@ def build_report_body(
     _require(isinstance(description, str) and len(description) <= 255, "description must be text of at most 255 characters.")
     category = (payload.get("category") or "ONE_DIMENSIONAL").upper()
     _require(category in _SUPPORTED_CATEGORIES,
-             f"category must be one of {', '.join(_SUPPORTED_CATEGORIES)} — funnel, hierarchy and goal reports "
-             f"aren't supported yet.")
+             f"category must be one of {', '.join(_SUPPORTED_CATEGORIES)} (funnel = chart_type \"funnel\").")
     multi = category == "MULTI_DIMENSIONAL"
+    hierarchy = category == "HIERARCHY"
+    goal_report = category == "GOALS_VS_ACHIEVEMENT"
+    goal_filter_rules: List[Dict[str, Any]] = []
+    if goal_report:
+        _require(entity in _GOAL_ENTITIES, f"Goal reports are available for {', '.join(_GOAL_ENTITIES)} only.")
+        _require(isinstance(goal, dict) and goal.get("id") is not None,
+                 "GOALS_VS_ACHIEVEMENT needs goal_id — find it with goal.lookup.")
+        _require(str(goal.get("entityType") or "").lower() == entity,
+                 f"Goal {goal.get('id')} is on {str(goal.get('entityType') or '?').lower()}, not {entity} — use that entity.")
+        _require(goal.get("active") is not False, f"Goal {goal.get('id')} is inactive; reports on it can't run.")
+        goal_dim, goal_metric = goal.get("dimension") or {}, goal.get("metric") or {}
+        frequency = (goal.get("frequency") or {}).get("type")
+        if payload.get("group_by") or payload.get("metrics"):
+            notes.append("group_by and metrics come from the goal; the values you sent were ignored.")
+        overrides = {
+            "group_by": [{"field": goal_dim.get("field"), "format": goal_dim.get("format")}],
+            "metrics": [{"type": goal_metric.get("type"), "field": goal_metric.get("field")}],
+        }
+        if not payload.get("date_range"):
+            default_op = _GOAL_FREQUENCY_OPERATOR.get(frequency)
+            _require(default_op is not None, f"Goal {goal.get('id')} has frequency {frequency!r}; pass an explicit date_range.")
+            overrides["date_range"] = {"field": (goal.get("dateRange") or {}).get("field") or "createdAt", "operator": default_op}
+        payload = dict(payload, **overrides)
+        # Goal filters are locked into the report (FilterItem.tsx disableGoalFilters).
+        for gf in goal.get("filters") or []:
+            ftype = gf.get("fieldType")
+            rule = {"operator": gf.get("operator"), "id": gf.get("field"), "field": gf.get("field"),
+                    "fieldInputType": ftype, "type": gf.get("type"), "value": gf.get("value"),
+                    "from": None, "to": None, "property": gf.get("property"), "primaryField": gf.get("primaryField")}
+            if ftype == "DATETIME_PICKER" and gf.get("operator") not in _NO_TIME_DATE_OPERATORS:
+                rule.update({"from": "00:00", "to": "23:59"})
+            goal_filter_rules.append(rule)
+    requested_chart = str(payload.get("chart_type") or "").strip().lower()
+    funnel = requested_chart == "funnel"
+    if funnel:
+        _require(entity in _FUNNEL_ENTITIES, f"Funnel reports are available for {' and '.join(_FUNNEL_ENTITIES)} only.")
+        _require(category == "ONE_DIMENSIONAL", "Funnel reports must be ONE_DIMENSIONAL.")
+        # The web app fixes the dimension and metric of a funnel (applyFunnelDefaults).
+        given = payload.get("group_by")
+        given_ids = [g.get("field") if isinstance(g, dict) else g for g in (given if isinstance(given, list) else [given])] if given else []
+        _require(all(g == "pipelineStage" for g in given_ids),
+                 "Funnel reports always group by 'pipelineStage' — leave group_by out or set it to pipelineStage.")
+        payload = dict(payload, group_by=[{"field": "pipelineStage"}], metrics=[{"type": "COUNT", "field": "id"}])
 
     # --- Dimensions: exactly one (ONE_DIMENSIONAL) or 1-3 in order (MULTI_DIMENSIONAL) ---
     raw_group_by = payload.get("group_by")
@@ -835,8 +915,8 @@ def build_report_body(
         _require(len(raw_group_by) <= _MAX_DIMENSIONS,
                  f"MULTI_DIMENSIONAL reports take at most {_MAX_DIMENSIONS} group_by dimensions.")
     else:
-        _require(len(raw_group_by) == 1, "ONE_DIMENSIONAL reports take exactly one group_by dimension — "
-                 "use category MULTI_DIMENSIONAL to group by 2-3 fields.")
+        _require(len(raw_group_by) == 1, f"{category} reports take exactly one group_by dimension"
+                 f"{' — use category MULTI_DIMENSIONAL to group by 2-3 fields' if category == 'ONE_DIMENSIONAL' else ''}.")
     group_dimensions: List[Dict[str, Any]] = []
     group_by_bodies: List[Dict[str, Any]] = []
     for i, gb in enumerate(raw_group_by):
@@ -847,6 +927,11 @@ def build_report_body(
         dimension = _find(dimensions, gb["field"])
         _require(dimension is not None, f"{label}.field '{gb['field']}' is not a dimension of {entity}. "
                  f"Valid: {', '.join(d.get('id') for d in dimensions)}.")
+        if hierarchy:
+            # Form.tsx getDimensionOptions: HIERARCHY only offers USER lookups.
+            user_dims = [d["id"] for d in dimensions if _is_user_dimension(d)]
+            _require(_is_user_dimension(dimension),
+                     f"HIERARCHY reports group by a user field; '{dimension['id']}' isn't one. Valid: {', '.join(user_dims)}.")
         _require(all(d["id"] != dimension["id"] for d in group_dimensions),
                  f"{label}: '{dimension['id']}' is already a dimension — each field can be used once.")
         fmt = gb.get("format")
@@ -881,7 +966,12 @@ def build_report_body(
     # --- Metrics ---
     raw_metrics = payload.get("metrics")
     _require(isinstance(raw_metrics, list) and raw_metrics, "metrics is required: a list like [{\"type\": \"COUNT\", \"field\": \"id\"}].")
-    available = metrics_for_dimension(dimension)
+    if goal_report:
+        # The goal's own metric, as-is (the web app copies it without checking the dimension's list).
+        available = [{"type": str(m.get("type") or "").upper(), "field": m.get("field")} for m in raw_metrics]
+    else:
+        available = None
+    available = available if available is not None else metrics_for_dimension(dimension)
     valid_metrics = ", ".join("%s %s" % (a.get("type"), a.get("field")) for a in available)
     metrics_body = []
     for i, m in enumerate(raw_metrics):
@@ -894,13 +984,31 @@ def build_report_body(
         metrics_body.append({"type": mtype, "field": match["field"]})
 
     # --- Chart type ---
-    chart_type = str(payload.get("chart_type") or "bar").lower()
-    allowed_charts = _MULTI_DIMENSIONAL_CHART_TYPES if multi else _CHART_TYPES
-    _require(chart_type in allowed_charts, f"chart_type must be one of: {', '.join(allowed_charts)}"
-             f"{' for MULTI_DIMENSIONAL reports' if multi else ''}.")
-    if len(metrics_body) > 1 and chart_type != "table":
-        notes.append(f"chart_type changed from '{chart_type}' to 'table' — reports with more than one metric can only be tables.")
-        chart_type = "table"
+    funnel_color = None
+    if goal_report:
+        if requested_chart and requested_chart != "donut":
+            notes.append(f"chart_type '{requested_chart}' replaced by 'donut' — goal reports always use it.")
+        chart_type = "donut"
+    elif hierarchy:
+        _require(len(metrics_body) <= _HIERARCHY_MAX_METRICS,
+                 f"HIERARCHY reports take at most {_HIERARCHY_MAX_METRICS} metrics.")
+        if requested_chart and requested_chart != "hierarchy":
+            notes.append(f"chart_type '{requested_chart}' replaced by 'hierarchy' — HIERARCHY reports always use it.")
+        chart_type = "hierarchy"
+    elif funnel:
+        chart_type = "funnel"
+        color = str(payload.get("funnel_color") or _FUNNEL_THEME_COLORS[0]).strip().upper()
+        _require(color in _FUNNEL_THEME_COLORS, f"funnel_color must be one of: {', '.join(_FUNNEL_THEME_COLORS)}.")
+        funnel_color = color
+    else:
+        chart_type = requested_chart or "bar"
+        allowed_charts = _MULTI_DIMENSIONAL_CHART_TYPES if multi else _CHART_TYPES
+        _require(chart_type in allowed_charts, f"chart_type must be one of: {', '.join(allowed_charts)}"
+                 f"{' for MULTI_DIMENSIONAL reports' if multi else ''}"
+                 f"{' (funnel too, for lead and deal)' if not multi and entity in _FUNNEL_ENTITIES else ''}.")
+        if len(metrics_body) > 1 and chart_type != "table":
+            notes.append(f"chart_type changed from '{chart_type}' to 'table' — reports with more than one metric can only be tables.")
+            chart_type = "table"
 
     # --- Date range ---
     date_range = payload.get("date_range")
@@ -933,6 +1041,8 @@ def build_report_body(
         flt = _find(filters, spec["field"])
         _require(flt is not None, f"{label}: '{spec['field']}' is not a filter of {entity}.")
         label = f"{label} ('{flt['id']}')"
+        _require(all(g["id"] != flt["id"] for g in goal_filter_rules),
+                 f"{label}: this filter is set by the goal and can't be changed.")
         _require(flt["id"] != date_field["id"], f"{label}: this field is already the date_range field; it cannot also be a filter.")
         _require(flt["id"] not in used, f"{label}: each field can be filtered only once.")
         used.add(flt["id"])
@@ -958,6 +1068,10 @@ def build_report_body(
             "property": "teams" if flt.get("fieldType") == "ENTITY_FIELDS" else None,
             "primaryField": flt.get("primaryField") or None,
         })
+
+    if goal_filter_rules:
+        rules = goal_filter_rules + rules
+        used.update(g["id"] for g in goal_filter_rules)
 
     # --- Team ("…Fields") filters: their user field must be "is set" (ReportFilters.tsx:183-216) ---
     for rule in [r for r in rules if r["fieldInputType"] == "ENTITY_FIELDS"]:
@@ -1018,23 +1132,52 @@ def build_report_body(
         associated = [r["id"] for r in rules if r["id"] in _TASK_ASSOCIATED_FILTERS]
         _require(len(associated) <= 1,
                  f"Task reports allow only one associated-entity filter at a time; got {', '.join(associated)}.")
+    if funnel:
+        # sd-report validatePipelineFilterForFunnelReport: one pipeline, operator equal.
+        _require(pipeline_rule is not None and pipeline_rule["operator"] == "equal" and not isinstance(pipeline_rule["value"], list),
+                 "Funnel reports need exactly one pipeline: add filter {field: pipeline, operator: equal, value: <pipeline id>} "
+                 "(resolve it with pipeline.lookup).")
+
+    prorated = False
+    if goal_report:
+        prorated = payload.get("prorated", True) is not False
+        if prorated:
+            # Form.tsx isProratedOptionDisabled
+            frequency_days = _GOAL_FREQUENCY_DAYS.get((goal.get("frequency") or {}).get("type"))
+            range_days = _RANGE_DAYS.get(dr_operator)
+            if dr_operator == "between" and isinstance(date_range_body.get("value"), list):
+                start_dt, end_dt = (dateutil_parser.isoparse(v) for v in date_range_body["value"])
+                range_days = (end_dt - start_dt).days
+            if dr_operator in ("before_current_date_and_time", "after_current_date_and_time"):
+                prorated = False
+                notes.append("prorated turned off — not available for before/after current date ranges.")
+            elif frequency_days and range_days and range_days > frequency_days:
+                prorated = False
+                notes.append("prorated turned off — the date range is longer than the goal's frequency.")
 
     body = {
         "name": name.strip(),
         "description": description,
-        "prorated": False,
-        "goal": None,
+        "prorated": prorated,
+        "goal": {"id": goal["id"], "name": goal.get("name")} if goal_report else None,
         "config": {
             "groupBy": group_by_bodies,
             "metrics": metrics_body,
             "dateRange": date_range_body,
             "rules": rules,
+            **({"colorCodes": [dict(b) for b in _GOAL_COLOR_BANDS]} if goal_report else {}),
         },
         "reportType": entity,
         "chartType": chart_type,
         "category": category,
     }
+    if funnel_color:
+        body["funnelColor"] = funnel_color  # top level, not config.colorCodes (service.ts saveReport)
     return body, notes
+
+
+def _is_user_dimension(dimension: Dict[str, Any]) -> bool:
+    return dimension.get("fieldType") == "LOOK_UP" and ((dimension.get("lookup") or {}).get("entity") or "").upper() == "USER"
 
 
 # ---------------------------------------------------------------------------
@@ -1095,7 +1238,8 @@ async def create_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     user_timezone = (user or {}).get("timezone")
     timezone = user_timezone or DEFAULT_TIMEZONE
 
-    body, notes = build_report_body(payload, config, timezone, tenant_currency)
+    goal = await _goal_for_payload(payload)
+    body, notes = build_report_body(payload, config, timezone, tenant_currency, goal)
     if not user_timezone:
         notes.append(f"Your profile has no timezone, so date ranges were interpreted in {DEFAULT_TIMEZONE}.")
 
@@ -1238,6 +1382,148 @@ def format_preview_rows(
     return result
 
 
+async def _goal_for_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """GOALS_VS_ACHIEVEMENT: fetch the goal named by goal_id (GET /v1/reports/goals/{id})."""
+    if str((payload or {}).get("category") or "").upper() != "GOALS_VS_ACHIEVEMENT":
+        return None
+    goal_id = (payload or {}).get("goal_id")
+    _require(goal_id is not None and str(goal_id).strip().isdigit(),
+             "GOALS_VS_ACHIEVEMENT needs goal_id (a number) — find it with goal.lookup.")
+    return await get_goal_details_raw(int(goal_id))
+
+
+def _goal_band(percentage: float) -> str:
+    """Which default colour band a % falls in (Donut.tsx colour rules)."""
+    if percentage < 25:
+        return "below 25% (red)"
+    if percentage < 50:
+        return "25-50% (orange)"
+    if percentage < 75:
+        return "50-75% (yellow)"
+    return "75%+ (green)"
+
+
+def format_goal_rows(body: Dict[str, Any], goal: Dict[str, Any], data: Any,
+                     group_dimensions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Goal run result {result:[{id,name,value:[{achieved,goal,percentage}]}], goalSummary} -> table."""
+    data = data if isinstance(data, dict) else {}
+    group_label = ((group_dimensions or [{}])[0] or {}).get("header") or (goal.get("dimension") or {}).get("header") or "Group"
+    rows = []
+    for item in data.get("result") or []:
+        v = (item.get("value") or [{}])[0] or {}
+        pct = _clean_number(round(float(v.get("percentage") or 0), 2))
+        rows.append({group_label: item.get("name") or "Not Available",
+                     "Achieved": _clean_number(v.get("achieved")), "Goal": _clean_number(v.get("goal")),
+                     "% achieved": f"{pct}%", "Band": _goal_band(float(pct))})
+    summary = data.get("goalSummary") or {}
+    total_pct = _clean_number(round(float(summary.get("percentage") or 0), 2))
+    return {
+        "goal": {"id": goal.get("id"), "name": goal.get("name"),
+                 "frequency": (goal.get("frequency") or {}).get("header"), "prorated": body["prorated"]},
+        "columns": [group_label, "Achieved", "Goal", "% achieved", "Band"],
+        "rows": rows[:_PREVIEW_MAX_ROWS],
+        "total_groups": len(rows),
+        "totals": {"Achieved": _clean_number(summary.get("achieved")), "Goal": _clean_number(summary.get("goal")),
+                   "% achieved": f"{total_pct}%", "Band": _goal_band(float(total_pct))},
+        "how_to_read": ("Achieved vs goal per row; % achieved = achieved / goal. With prorated on, goals are "
+                        "scaled down to the part of the goal period covered by the date range."),
+    }
+
+
+_FUNNEL_OUTCOMES = {"OPEN": "Open", "CLOSED_WON": "Won", "CLOSED_LOST": "Lost", "CLOSED_UNQUALIFIED": "Unqualified"}
+
+
+def format_funnel_rows(entity: str, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Funnel run result [{name, values:[visited, skipped], recordDetails.forecastingType}] -> stage table
+    (FunnelChart.tsx): open stages show visited/skipped; closed stages (won/lost/unqualified) show their
+    count (visited + skipped) as a % of everything that entered the first stage."""
+    label = _REPORT_ENTITY_PLURAL[entity].capitalize()
+    entered = 0
+    if records:
+        first = records[0].get("values") or [0, 0]
+        entered = (first[0] or 0) + ((first[1] if len(first) > 1 else 0) or 0)
+    rows = []
+    for record in records or []:
+        values = record.get("values") or [0, 0]
+        visited = _clean_number(values[0] if values else 0) or 0
+        skipped = _clean_number(values[1] if len(values) > 1 else 0) or 0
+        outcome = _FUNNEL_OUTCOMES.get(((record.get("recordDetails") or {}).get("forecastingType") or "OPEN"), "Open")
+        row = {"Stage": record.get("name") or "Not Available", "Outcome": outcome,
+               f"{label} visited": visited, f"{label} skipped": skipped}
+        if outcome != "Open":
+            row["% of entered"] = f"{round(100 * (visited + skipped) / entered, 1)}%" if entered else "0%"
+        rows.append(row)
+    return {
+        "columns": ["Stage", "Outcome", f"{label} visited", f"{label} skipped", "% of entered"],
+        "rows": rows,
+        "total_groups": len(rows),
+        "totals": {f"{label} entering the funnel": entered},
+        "how_to_read": ("Stages are in pipeline order. 'visited' = records that reached the stage; 'skipped' = "
+                        "records that jumped past it. Closed stages show their share of everything that entered."),
+    }
+
+
+def format_hierarchy_rows(entity: str, body: Dict[str, Any], dimension: Dict[str, Any],
+                          records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Hierarchy run result (flat users with reportingManagers + values) -> per-user Self / Reportees /
+    Total, rolled up through the reporting tree like HierarchyChart (calculateHierarchyReportValues)."""
+    metrics = body["config"]["metrics"]
+    metric_labels = [_metric_label(entity, m, dimension or {}) for m in metrics]
+    users = {r.get("id"): r for r in records or [] if r.get("id") is not None}
+    children: Dict[Any, set] = {uid: set() for uid in users}
+    for uid, user in users.items():
+        for manager in user.get("reportingManagers") or []:
+            if manager.get("id") in children:
+                children[manager["id"]].add(uid)
+
+    def own(uid):
+        values = users[uid].get("values") or []
+        return [(_clean_number(values[i]) if i < len(values) else 0) or 0 for i in range(len(metrics))]
+
+    def descendants(uid, seen=None):
+        seen = set() if seen is None else seen
+        for child in children.get(uid, ()):
+            if child not in seen:
+                seen.add(child)
+                descendants(child, seen)
+        return seen
+
+    rows = []
+    for uid, user in users.items():
+        self_values = own(uid)
+        team = descendants(uid) - {uid}
+        reportee_values = [sum(own(d)[i] for d in team) for i in range(len(metrics))]
+        row = {"User": user.get("name") or str(uid),
+               "Reports to": ", ".join(m.get("name") or str(m.get("id")) for m in user.get("reportingManagers") or []) or "—"}
+        if user.get("active") is False:
+            row["User"] += " (inactive)"
+        for i, label in enumerate(metric_labels):
+            row[f"{label} (self)"] = _clean_number(self_values[i])
+            row[f"{label} (reportees)"] = _clean_number(reportee_values[i])
+            row[f"{label} (total)"] = _clean_number(self_values[i] + reportee_values[i])
+        rows.append(row)
+    rows.sort(key=lambda r: (r["Reports to"] != "—", r["User"]))
+    columns = ["User", "Reports to"] + [f"{l} ({k})" for l in metric_labels for k in ("self", "reportees", "total")]
+    summable = [l for m, l in zip(metrics, metric_labels) if m["type"] in ("COUNT", "SUM")]
+    totals = {l: _clean_number(sum(r[f"{l} (self)"] or 0 for r in rows)) for l in summable}
+    return {
+        "columns": columns,
+        "rows": rows[:_PREVIEW_MAX_ROWS],
+        "total_groups": len(rows),
+        "totals": totals,
+        "how_to_read": ("One row per user in the reporting hierarchy. 'self' = the user's own records, "
+                        "'reportees' = everyone who reports to them (directly or indirectly), 'total' = both."),
+    }
+
+
+def _format_preview(entity, body, group_dimensions, records, tenant_currency):
+    if body["chartType"] == "funnel":
+        return format_funnel_rows(entity, records)
+    if body["category"] == "HIERARCHY":
+        return format_hierarchy_rows(entity, body, (group_dimensions or [{}])[0], records)
+    return format_preview_rows(entity, body, group_dimensions, records, tenant_currency)
+
+
 async def preview_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     """report.preview: validate + expand the same short payload as report.create, run it with
     POST /v3/reports/{entityPlural} (nothing is saved) and return a labelled table."""
@@ -1256,7 +1542,8 @@ async def preview_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     user_timezone = (user or {}).get("timezone")
     timezone = user_timezone or DEFAULT_TIMEZONE
 
-    body, notes = build_report_body(payload, config, timezone, tenant_currency)
+    goal = await _goal_for_payload(payload)
+    body, notes = build_report_body(payload, config, timezone, tenant_currency, goal)
     if not user_timezone:
         notes.append(f"Your profile has no timezone, so date ranges were interpreted in {DEFAULT_TIMEZONE}.")
 
@@ -1269,9 +1556,20 @@ async def preview_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
             _require(entity != "company", "Could not resolve the tenant's base currency, which company reports need.")
 
     run_body = dict(body["config"], category=body["category"])
-    async with get_client() as client:
-        response = await client.post(f"/v3/reports/{_REPORT_ENTITY_PLURAL[entity]}", params=params, json=run_body)
-        records = await handle_api_response(response, "Preview report")
+    if body["chartType"] == "funnel":
+        run_body["chartType"] = "FUNNEL"
+    if goal:
+        # Goal runs: POST /v1/reports/{entity}/goals/{id}?timezone&prorated (service.ts generateReport goal branch);
+        # sd-report ignores baseCurrencyId there.
+        goal_params = {"timezone": timezone, "prorated": str(body["prorated"]).lower()}
+        async with get_client() as client:
+            response = await client.post(f"/v1/reports/{_REPORT_ENTITY_PLURAL[entity]}/goals/{goal['id']}",
+                                         params=goal_params, json=run_body)
+            records = await handle_api_response(response, "Preview goal report")
+    else:
+        async with get_client() as client:
+            response = await client.post(f"/v3/reports/{_REPORT_ENTITY_PLURAL[entity]}", params=params, json=run_body)
+            records = await handle_api_response(response, "Preview report")
 
     usable_dimensions = [d for d in config.get("dimensions") or [] if _usable(d)]
     group_dimensions = [_find(usable_dimensions, gb["name"]) or {} for gb in body["config"]["groupBy"]]
@@ -1283,7 +1581,8 @@ async def preview_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
         "chart_type": body["chartType"],
         "date_range": {k: body["config"]["dateRange"].get(k) for k in ("field", "operator", "value") if body["config"]["dateRange"].get(k) is not None},
         "filters_applied": len(body["config"]["rules"]),
-        **format_preview_rows(entity, body, group_dimensions, records if isinstance(records, list) else [], tenant_currency),
+        **(format_goal_rows(body, goal, records, group_dimensions) if goal else
+           _format_preview(entity, body, group_dimensions, records if isinstance(records, list) else [], tenant_currency)),
     }
     if notes:
         result["notes"] = notes
