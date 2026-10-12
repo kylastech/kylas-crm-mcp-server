@@ -1162,8 +1162,19 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
                 fetched_live = True
             except ValueError as e:
                 return json.dumps({"ok": False, "error": str(e)}, indent=2)
+            except KylasAPIError as e:
+                # Without the live config there is no usable reference, so fail
+                # outright instead of returning a schema the model can't build from.
+                return json.dumps({
+                    "ok": False,
+                    "error": f"Could not load the report config for '{entity}': {e.message}. Retry build_payload.",
+                }, indent=2)
             except Exception as e:
-                live_fetch_error = str(e)
+                logger.exception("build_payload(%s) report reference", id)
+                return json.dumps({
+                    "ok": False,
+                    "error": f"Could not load the report config for '{entity}': {e}",
+                }, indent=2)
         else:
             fetch_fields_fn = _BUCKET_FIELD_FETCHERS.get(entry["bucket"])
             if fetch_fields_fn is None:

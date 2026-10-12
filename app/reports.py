@@ -929,9 +929,12 @@ async def create_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     config = await _fetch_report_config(entity)
     tenant_currency = await _fetch_tenant_currency()
     user = await _fetch_current_user()
-    timezone = user.get("timezone") or DEFAULT_TIMEZONE
+    user_timezone = (user or {}).get("timezone")
+    timezone = user_timezone or DEFAULT_TIMEZONE
 
     body, notes = build_report_body(payload, config, timezone, tenant_currency)
+    if not user_timezone:
+        notes.append(f"Your profile has no timezone, so date ranges were interpreted in {DEFAULT_TIMEZONE}.")
 
     async with get_client() as client:
         response = await client.post("/v3/reports", json=body)
