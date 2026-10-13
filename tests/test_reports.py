@@ -127,7 +127,8 @@ def test_reference_requested_picklist_is_inlined():
 def test_reference_hides_unusable_and_marks_phase2_filters():
     text = get_report_config_instructions_logic("lead", _config(), set(), "INR")
     assert "cfCountry" not in text and "cfCompanyDescription" not in text and "cfCompanySize" not in text
-    assert "'campaignActivities' Campaign Activities [CAMPAIGN] — NOT SUPPORTED YET" in text
+    assert "campaign id(s)" not in text  # generic hint wording
+    assert "resolve_via: campaign.lookup" in text
     assert "resolve_via: user.lookup" in text
     assert "resolve_via: pipeline.lookup with entity_type=LEAD" in text
     # funnel-only metrics never offered
@@ -273,8 +274,11 @@ def test_duplicate_and_unsupported_filters_rejected():
     with pytest.raises(ValueError, match="only once"):
         _build(_payload(filters=[{"field": "firstName", "operator": "contains", "value": "a"},
                                  {"field": "firstName", "operator": "contains", "value": "b"}]))
-    with pytest.raises(ValueError, match="not supported yet"):
-        _build(_payload(filters=[{"field": "campaignActivities", "operator": "equal", "value": 1}]))
+    cfg = _config()
+    cfg["filters"].append(_flt("addressCoordinate", "Address Coordinate", "GPS_COORDINATES"))
+    with pytest.raises(ValueError, match="not supported"):
+        build_report_body(_payload(filters=[{"field": "addressCoordinate", "operator": "range_within", "value": 1}]),
+                          cfg, "Asia/Kolkata", "INR")
 
 
 def test_operator_validation_uses_field_type():
@@ -449,3 +453,181 @@ async def test_execute_request_bad_payload_never_posts():
         result = json.loads(await execute_request("report.create", _payload(group_by={"field": "nope"})))
     assert result["ok"] is False and "not a dimension" in result["error"]["message"]
     assert posted == []
+
+
+# ---------------------------------------------------------------------------
+# Lookup-backed filters (teams, stages, campaigns, activities, meeting
+# participants, linked records, quotation status/approval state)
+# ---------------------------------------------------------------------------
+
+def _lookup_config():
+    cfg = _config()
+    cfg["filters"] += [
+        _flt("ownerFields", "Owner Fields", "ENTITY_FIELDS", requiredFilters=["ownerId"], primaryField="ownerId",
+             property="teams", lookup={"entity": "USER", "lookupUrl": ""}),
+        _flt("pipelineStage", "Pipeline Stage", "PIPELINE_STAGE", requiredFilters=["pipeline"],
+             lookup={"entity": "PIPELINE_STAGE", "lookupUrl": ""}),
+        _flt("activities", "Activities", "ACTIVITY", requiredFilters=["campaignActivities"],
+             lookup={"entity": "ACTIVITY", "lookupUrl": ""}),
+    ]
+    return cfg
+
+
+def _build_cfg(cfg, payload, entity="lead"):
+    return build_report_body(dict(payload, entity=entity), cfg, "Asia/Kolkata", "INR")
+
+
+def test_reference_names_each_lookup():
+    text = get_report_config_instructions_logic("lead", _lookup_config(), set(), "INR")
+    assert "team id(s) — resolve_via: team.lookup" in text and "'ownerId is_not_null' automatically" in text
+    assert "stage id(s) — resolve_via: pipeline.details" in text
+    assert "activity id(s) — resolve_via: campaign.activities" in text
+    assert "resolve_via: campaign.lookup" in text
+    assert "NOT SUPPORTED" not in text
+
+
+def test_team_filter_sets_property_and_primary_is_set():
+    body, notes = _build_cfg(_lookup_config(), _payload(filters=[{"field": "ownerFields", "operator": "in", "value": [11, "12"]}]))
+    team, primary = body["config"]["rules"]
+    assert team == {"operator": "in", "id": "ownerFields", "field": "ownerFields", "fieldInputType": "ENTITY_FIELDS",
+                    "type": "long", "value": [11, 12], "from": None, "to": None, "property": "teams", "primaryField": "ownerId"}
+    assert primary["id"] == "ownerId" and primary["operator"] == "is_not_null" and primary["value"] is None
+    assert any("ownerId is_not_null" in n for n in notes)
+
+
+def test_team_filter_forces_existing_primary_to_is_set():
+    body, notes = _build_cfg(_lookup_config(), _payload(filters=[
+        {"field": "ownerId", "operator": "equal", "value": 5},
+        {"field": "ownerFields", "operator": "equal", "value": 11},
+    ]))
+    owner = body["config"]["rules"][0]
+    assert owner["operator"] == "is_not_null" and owner["value"] is None
+    assert any("changed to is_not_null" in n for n in notes)
+
+
+def test_pipeline_stage_filter_needs_pipeline():
+    with pytest.raises(ValueError, match="requires a 'pipeline' filter"):
+        _build_cfg(_lookup_config(), _payload(filters=[{"field": "pipelineStage", "operator": "in", "value": [1, 2]}]))
+    body, _ = _build_cfg(_lookup_config(), _payload(filters=[
+        {"field": "pipeline", "operator": "equal", "value": 7875},
+        {"field": "pipelineStage", "operator": "in", "value": ["101", 102]},
+    ]))
+    stage = body["config"]["rules"][1]
+    assert stage["value"] == [101, 102] and stage["type"] == "long" and stage["fieldInputType"] == "PIPELINE_STAGE"
+
+
+def test_campaign_and_activities():
+    body, _ = _build_cfg(_lookup_config(), _payload(filters=[
+        {"field": "campaignActivities", "operator": "equal", "value": 9},
+        {"field": "activities", "operator": "in", "value": [31, 32]},
+    ]))
+    campaign, activities = body["config"]["rules"]
+    assert campaign["value"] == 9 and campaign["type"] == "long"
+    assert activities["value"] == [31, 32] and activities["type"] == "long"
+    with pytest.raises(ValueError, match="must use 'equal'"):
+        _build_cfg(_lookup_config(), _payload(filters=[
+            {"field": "campaignActivities", "operator": "in", "value": [9]},
+            {"field": "activities", "operator": "equal", "value": 31},
+        ]))
+
+
+MEETING_CONFIG = {
+    "entity": "meeting",
+    "dimensions": [_dim("owner", "Owner", "LOOK_UP", lookup=USER_LOOKUP)],
+    "filters": [
+        _flt("from", "From", "DATETIME_PICKER", is_internal=True),
+        _flt("participants", "Participants", "MEETING_INVITEES"),
+        _flt("organizer", "Organizer", "MEETING_ORGANIZER"),
+    ],
+}
+
+
+def test_meeting_participants_use_objects():
+    payload = _payload(group_by={"field": "owner"}, date_range={"field": "from", "operator": "current_month"}, filters=[
+        {"field": "participants", "operator": "in", "value": [{"id": "7", "entity": "Lead", "name": "Ravi", "emails": []}]},
+        {"field": "organizer", "operator": "equal", "value": {"id": 3, "entity": "user"}},
+    ])
+    body, _ = _build_cfg(copy.deepcopy(MEETING_CONFIG), payload, entity="meeting")
+    participants, organizer = body["config"]["rules"]
+    assert participants["value"] == [{"id": 7, "entity": "lead", "name": "Ravi"}]
+    assert participants["type"] == "participants_lookup"
+    assert organizer["value"] == {"id": 3, "entity": "user"} and organizer["type"] == "organizer_lookup"
+    with pytest.raises(ValueError, match="needs an object"):
+        _build_cfg(copy.deepcopy(MEETING_CONFIG), dict(payload, filters=[
+            {"field": "organizer", "operator": "equal", "value": 3}]), entity="meeting")
+    text = get_report_config_instructions_logic("meeting", copy.deepcopy(MEETING_CONFIG), set(), "INR")
+    assert 'meeting.lookup_related with entity_type="invitee"' in text
+
+
+def _record_lookup(entity):
+    return {"entity": entity, "lookupUrl": f"/search/{entity.lower()}/lookup?q=name:"}
+
+
+TASK_CONFIG = {
+    "entity": "task",
+    "dimensions": [_dim("ownerId", "Owner", "LOOK_UP", lookup=USER_LOOKUP)],
+    "filters": [
+        _flt("createdAt", "Created At", "DATETIME_PICKER", is_internal=True),
+        _flt("associatedLeads", "Leads", "LOOK_UP", lookup=_record_lookup("LEAD")),
+        _flt("associatedDeals", "Deals", "LOOK_UP", lookup=_record_lookup("DEAL")),
+    ],
+}
+
+
+def test_task_linked_records_use_search_by_term_and_one_at_a_time():
+    text = get_report_config_instructions_logic("task", copy.deepcopy(TASK_CONFIG), set(), "INR")
+    assert "record id(s) — resolve_via: lead.search_by_term" in text
+    assert "resolve_via: deal.search_by_term" in text and "only ONE of associatedLeads" in text
+    base = _payload(group_by={"field": "ownerId"})
+    body, _ = _build_cfg(copy.deepcopy(TASK_CONFIG), dict(base, filters=[
+        {"field": "associatedLeads", "operator": "in", "value": [5, 6]}]), entity="task")
+    assert body["config"]["rules"][0]["value"] == [5, 6]
+    with pytest.raises(ValueError, match="only one associated-entity filter"):
+        _build_cfg(copy.deepcopy(TASK_CONFIG), dict(base, filters=[
+            {"field": "associatedLeads", "operator": "equal", "value": 5},
+            {"field": "associatedDeals", "operator": "equal", "value": 8}]), entity="task")
+
+
+def test_quotation_approval_state_picklist_and_email_sender_unsupported():
+    # On live tenants quotation status/approvalState are inline picklists; approvalState sends the id as long.
+    quotation_cfg = {"entity": "quotation", "dimensions": [_dim("owner", "Owner", "LOOK_UP", lookup=USER_LOOKUP)], "filters": [
+        _flt("createdAt", "Created At", "DATETIME_PICKER", is_internal=True),
+        _flt("approvalState", "Approval State", "PICK_LIST", [{"id": 2, "name": "APPROVED", "displayName": "Approved"}],
+             is_internal=True),
+    ]}
+    body, _ = _build_cfg(quotation_cfg, _payload(group_by={"field": "owner"},
+                                                filters=[{"field": "approvalState", "operator": "equal", "value": "Approved"}]), entity="quotation")
+    assert body["config"]["rules"][0]["type"] == "long" and body["config"]["rules"][0]["value"] == 2
+
+    email_cfg = {"entity": "email", "dimensions": [_dim("user", "User", "LOOK_UP", lookup=USER_LOOKUP)], "filters": [
+        _flt("createdAt", "Created At", "DATETIME_PICKER", is_internal=True),
+        _flt("sentBy", "Sent By", "LOOK_UP", lookup=USER_LOOKUP),
+    ]}
+    email_cfg["filters"].append(_flt("receivedBy", "Received By", "LOOK_UP", lookup=USER_LOOKUP))
+    text = get_report_config_instructions_logic("email", email_cfg, set(), "INR")
+    assert "'receivedBy' Received By [LOOK_UP] — NOT SUPPORTED" in text
+    # sentBy: bare user id(s) via user.lookup, operators limited to equal/in for email
+    assert "'sentBy' Sent By [LOOK_UP] — operators: equal, in" in text and "resolve_via: user.lookup" in text
+    body, _ = _build_cfg(email_cfg, _payload(group_by={"field": "user"}, filters=[
+        {"field": "sentBy", "operator": "in", "value": [31800, "42"]}]), entity="email")
+    rule = body["config"]["rules"][0]
+    assert rule["value"] == [31800, 42] and rule["type"] == "long" and rule["property"] is None
+    with pytest.raises(ValueError, match="not allowed"):
+        _build_cfg(email_cfg, _payload(group_by={"field": "user"}, filters=[
+            {"field": "sentBy", "operator": "not_equal", "value": 31800}]), entity="email")
+
+
+@pytest.mark.asyncio
+async def test_new_lookup_ids_route_through_execute_request():
+    routes = {
+        "/v1/teams/lookup": {"content": [{"id": 11, "name": "Sales"}], "totalElements": 1, "totalPages": 1},
+        "/v1/campaigns/9": {"id": 9, "name": "Summer", "activities": [{"id": 31, "name": "Email blast"}]},
+        "/v1/campaigns/lookup": {"content": [{"id": 9, "name": "Summer"}, {"id": 10, "name": "Summer Sale"}]},
+    }
+    with patch("app.entities.get_client", _mock_client(routes, [])):
+        team = json.loads(await execute_request("team.lookup", {"query": "Sales"}))
+        activities = json.loads(await execute_request("campaign.activities", {"campaign_id": 9}))
+        campaigns = json.loads(await execute_request("campaign.lookup", {"query": "Summer"}))
+    assert team["ok"] and "ID: 11" in team["data"] and "Sales" in team["data"]
+    assert activities["ok"] and "ID: 31" in activities["data"] and "Email blast" in activities["data"]
+    assert campaigns["ok"] and "ID: 10" in campaigns["data"] and "More than one" in campaigns["data"]
