@@ -180,7 +180,8 @@ dimensional, hierarchy) tell the user it isn't supported yet.
 ## What's registered right now (call list_tool to confirm, don't assume)
 Buckets: lead, contact, meeting, call_log, deal, task, company, quotation, report,
 plus a bucket-less "_meta" group for shared lookups (user.lookup,
-product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc).
+product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
+team.lookup, campaign.lookup, campaign.activities).
 Not every bucket has every intent:
   - lead, deal, company: get, search, search_by_term, search_idle, create, update (all 6)
   - contact, meeting: get, search, search_by_term, create, update (no search_idle)
@@ -189,7 +190,8 @@ Not every bucket has every intent:
   - meeting also has lookup (meeting.lookup_related), beyond the get/search/search_by_term/create/update above
   - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
   - report: create only (report.create — one-dimensional reports; build_payload needs entity="<entity>")
-  - _meta: lookup only (user.lookup, product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc)
+  - _meta: lookup only (user.lookup, product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
+    team.lookup, campaign.lookup, campaign.activities)
 Always call list_tool(bucket=...) to see exactly which ids exist for a
 bucket before assuming one does.
 
