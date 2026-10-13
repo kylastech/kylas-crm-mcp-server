@@ -118,13 +118,24 @@ report of leads by source this month", "make a pie chart of deals by owner"
      name: a proper descriptive Title Case name ending with " (Made by MCP)",
      e.g. "Leads by Source - This Month (Made by MCP)" — never "Report"/"Test".
 
+To SHOW report numbers without saving anything — "how many leads by source
+this month?", "show me deals by owner last quarter", or to let the user
+check a report before saving it — use report.preview instead: exactly the
+same build_payload(..., entity=...) step and the same payload (name
+optional). It returns a ready table (columns, rows, totals). If the user
+then wants to keep it, call report.create with the same payload and a
+proper name. Never tell the user a preview was saved.
+
 Do NOT fetch records with *.search and add them up yourself, and do NOT
 build the report in a document or spreadsheet, when the user asked for a
 Kylas report — that produces an unsaved copy computed from at most one page
 of records. Only do that if the user explicitly asks for an export or a
-one-off summary in chat. Currently only ONE_DIMENSIONAL reports (one
-group-by field) are supported; for anything else (funnel, goal, multi-
-dimensional, hierarchy) tell the user it isn't supported yet.
+one-off summary in chat. Supported report types (details in report.create's
+usage_notes): ONE_DIMENSIONAL (one group-by field), MULTI_DIMENSIONAL (2-3
+fields, e.g. "leads by owner and source"), HIERARCHY (by user, rolled up the
+reporting hierarchy), funnel (chart_type "funnel", lead/deal pipeline
+stages) and GOALS_VS_ACHIEVEMENT (progress against a goal — find it with
+goal.lookup / goal.details).
 
 ## The 3-step flow
 
@@ -181,7 +192,8 @@ dimensional, hierarchy) tell the user it isn't supported yet.
 Buckets: lead, contact, meeting, call_log, deal, task, company, quotation, report,
 plus a bucket-less "_meta" group for shared lookups (user.lookup,
 product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
-team.lookup, campaign.lookup, campaign.activities).
+team.lookup, campaign.lookup, campaign.activities,
+    goal.lookup, goal.details).
 Not every bucket has every intent:
   - lead, deal, company: get, search, search_by_term, search_idle, create, update (all 6)
   - contact, meeting: get, search, search_by_term, create, update (no search_idle)
@@ -189,9 +201,10 @@ Not every bucket has every intent:
   - call_log: search, create, update, lookup (call_log.by_entity — no get, no search_by_term, no search_idle)
   - meeting also has lookup (meeting.lookup_related), beyond the get/search/search_by_term/create/update above
   - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
-  - report: create only (report.create — one-dimensional reports; build_payload needs entity="<entity>")
+  - report: create, preview (report.create saves a report; report.preview shows its numbers without saving; build_payload needs entity="<entity>")
   - _meta: lookup only (user.lookup, product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
-    team.lookup, campaign.lookup, campaign.activities)
+    team.lookup, campaign.lookup, campaign.activities,
+    goal.lookup, goal.details)
 Always call list_tool(bucket=...) to see exactly which ids exist for a
 bucket before assuming one does.
 

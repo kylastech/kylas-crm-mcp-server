@@ -463,6 +463,79 @@ async def get_campaign_activities(campaign_id: int) -> str:
 
 
 
+_GOAL_ENTITY_TYPES = ("LEAD", "DEAL", "MEETING", "CALL")
+
+
+async def lookup_goals_logic(entity_type: str = "") -> str:
+    """GET /v1/reports/goals[?entityType=] — active goals the user can read, as "ID | Name" rows."""
+    params = {}
+    if entity_type:
+        et = str(entity_type).strip().upper()
+        if et not in _GOAL_ENTITY_TYPES:
+            return f"Error: goals exist only for {', '.join(_GOAL_ENTITY_TYPES)} — got '{entity_type}'."
+        params["entityType"] = et
+    async with get_client() as client:
+        response = await client.get("/v1/reports/goals", params=params)
+        data = await handle_api_response(response, "Goal lookup")
+    goals = data if isinstance(data, list) else (data or {}).get("content", [])
+    if not goals:
+        return "No active goals found" + (f" for {params['entityType']}." if params else ".")
+    lines = [f"Found {len(goals)} goal(s)" + (f" for {params['entityType']}" if params else ""), "-" * 50]
+    for g in goals:
+        lines.append(f"  • ID: {g.get('id', '?')}  |  Name: {g.get('name', '—')}")
+    lines.append("-" * 50)
+    lines.append("Call goal.details with the chosen ID to see its entity, metric, owners and frequency.")
+    return "\n".join(lines)
+
+
+async def get_goal_details_raw(goal_id: int) -> Dict[str, Any]:
+    """GET /v1/reports/goals/{id} — the full goal (entityType, dimension, metric, frequency, dateRange, filters, ...)."""
+    async with get_client() as client:
+        response = await client.get(f"/v1/reports/goals/{int(goal_id)}")
+        return await handle_api_response(response, "Fetch goal details")
+
+
+async def get_goal_details_logic(goal_id: int) -> str:
+    g = await get_goal_details_raw(goal_id)
+    dim, metric, freq = g.get("dimension") or {}, g.get("metric") or {}, g.get("frequency") or {}
+    dr = g.get("dateRange") or {}
+    lines = [
+        f"Goal {g.get('id')}: {g.get('name')}  ({'active' if g.get('active') else 'INACTIVE — reports on it fail'})",
+        f"  Entity: {str(g.get('entityType') or '').lower()}   Target (total): {g.get('value')}",
+        f"  Metric: {metric.get('type')} {metric.get('field')} ({metric.get('header')})",
+        f"  Grouped by: {dim.get('field')} ({dim.get('header')})",
+        f"  Frequency: {freq.get('header') or freq.get('type')}",
+        f"  Date field: {dr.get('field')} ({dr.get('header')}), default range {dr.get('operator')}",
+        f"  Goal filters (locked): {len(g.get('filters') or [])}",
+    ]
+    targets = g.get("fieldValues") or []
+    if targets:
+        lines.append("  Targets:")
+        for t in targets:
+            lines.append(f"    • {t.get('fieldValueName')} (ID {t.get('fieldValueId')}): {t.get('value')}")
+    lines.append("Use report.create / report.preview with category GOALS_VS_ACHIEVEMENT and goal_id "
+                 f"{g.get('id')} (entity {str(g.get('entityType') or '').lower()}).")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def lookup_goals(entity_type: str = "") -> str:
+    """
+    List active goals (for Goal vs Achievement reports).
+    entity_type: optional — LEAD, DEAL, MEETING or CALL to list only goals on that entity.
+    """
+    return await _run_lookup("lookup_goals", lookup_goals_logic(entity_type))
+
+
+@mcp.tool()
+async def get_goal_details(goal_id: int) -> str:
+    """
+    Show one goal: entity, metric, grouping, frequency, date field, targets per person.
+    goal_id: the goal's ID from goal.lookup.
+    """
+    return await _run_lookup("get_goal_details", get_goal_details_logic(goal_id))
+
+
 # ---------------------------------------------------------------------------
 # Tool 3c: Lookup Pipelines (for pipeline + stage filters on leads)
 # ---------------------------------------------------------------------------
