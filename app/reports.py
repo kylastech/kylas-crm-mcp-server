@@ -1,0 +1,1589 @@
+"""Report creation (report.create) — phase 1: ONE_DIMENSIONAL reports only.
+
+Mirrors the sd-ui report builder (src/components/page/Reports/) so a report
+created through MCP is byte-for-byte the shape the web app would save:
+
+  - Field discovery: GET /v1/reports/config/{entityPlural} (sd-report builds
+    it from the entity's list layout). Picklist options live ONLY under
+    filters[].picklist.picklistValues; dimensions never carry options. Large
+    picklists (timezone, country, ...) are trimmed exactly like the
+    layout-based cheat sheets, with the same build_payload(fields=[...]) opt-in.
+  - The model sends a SHORT payload (entity, name, chart_type, group_by,
+    metrics, date_range, filters). build_report_body() expands it into the
+    full Kylas body the same way sd-ui's getConfig/getDateRangeFilter/
+    getAllFilters do (service.ts), after validating every choice against the
+    live config — sd-report itself barely validates at save time (unknown
+    fields/operators only fail later, when the report is run).
+  - Save: POST /v3/reports.
+
+Lookup-backed filters with no registry resolver yet (teams/ENTITY_FIELDS,
+campaign, activities, pipeline stages, meeting invitees/organizer, record
+lookups, ...) are reported as "not supported yet" and rejected; they arrive
+as separate lookup ids in phase 2.
+"""
+
+import re
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from dateutil import parser as dateutil_parser
+
+from app.config import DEFAULT_TIMEZONE, logger
+from app.client import KylasAPIError, _reset_api_call_count, get_client, handle_api_response
+from app.helpers import _convert_date_value_to_utc
+from app.entities import _LARGE_COMPANY_PICKLISTS, _fetch_current_user, get_goal_details_raw
+
+# ---------------------------------------------------------------------------
+# Entities and endpoints
+# ---------------------------------------------------------------------------
+
+# Order matches sd-ui's entity dropdown (Form.tsx getEntityOptions).
+REPORT_ENTITIES: Tuple[str, ...] = (
+    "lead", "deal", "contact", "company", "task", "meeting", "call", "email", "quotation",
+)
+_REPORT_ENTITY_PLURAL: Dict[str, str] = {
+    "lead": "leads", "deal": "deals", "contact": "contacts", "company": "companies",
+    "task": "tasks", "meeting": "meetings", "call": "calls", "email": "emails",
+    "quotation": "quotations",
+}
+# sd-ui offers meeting regardless of the meeting READ permission (Form.tsx:1043).
+_ALWAYS_REPORTABLE_ENTITIES = {"meeting"}
+
+
+# ---------------------------------------------------------------------------
+# Large picklists — same named list as the layout cheat sheets, plus deal/
+# quotation "currency". Matched case-insensitively against filter ids.
+# ---------------------------------------------------------------------------
+
+_REPORT_LARGE_PICKLISTS = {"timezone", "requirementcurrency", "currency"} | _LARGE_COMPANY_PICKLISTS
+
+# ---------------------------------------------------------------------------
+# UI constants (sd-ui: Reports/constants.ts, utils/constants.ts, dataUtils.ts)
+# ---------------------------------------------------------------------------
+
+_CHART_TYPES = ("bar", "pie", "table")
+_MULTI_DIMENSIONAL_CHART_TYPES = ("bar", "table")  # ReportForm.ts MULTIDIMENSIONAL_CHART_TYPES
+_SUPPORTED_CATEGORIES = ("ONE_DIMENSIONAL", "MULTI_DIMENSIONAL", "HIERARCHY", "GOALS_VS_ACHIEVEMENT")
+# Goal vs Achievement (sd-ui Form.tsx updateReportWithGoalData; sd-report GoalController).
+_GOAL_ENTITIES = ("lead", "deal", "meeting", "call")
+_GOAL_FREQUENCY_OPERATOR = {"DAILY": "today", "WEEKLY": "current_week", "MONTHLY": "current_month",
+                            "QUARTERLY": "current_quarter", "ANNUALLY": "current_year"}
+_GOAL_FREQUENCY_DAYS = {"DAILY": 1, "WEEKLY": 7, "MONTHLY": 30, "QUARTERLY": 120, "ANNUALLY": 365}
+# ReportForm.ts getNumberOfDaysInDateRange (other operators: unknown -> prorating stays allowed)
+_RANGE_DAYS = {"today": 1, "current_week": 7, "last_week": 7, "next_week": 7,
+               "current_month": 30, "last_month": 30, "next_month": 30,
+               "current_quarter": 120, "last_quarter": 120, "next_quarter": 120,
+               "current_year": 365, "last_year": 365, "next_year": 365}
+# models/Report.ts INITIAL_GOAL_REPORT_COLOR_CONFIG
+_GOAL_COLOR_BANDS = [
+    {"hexCode": "#DB2E20", "operator": "less", "from": 0, "to": 25, "value": 25},
+    {"hexCode": "#FF9300", "operator": "between", "from": 25, "to": 50, "value": 50},
+    {"hexCode": "#FFD10F", "operator": "between", "from": 50, "to": 75, "value": 75},
+    {"hexCode": "#52A351", "operator": "greater_or_equal", "from": 75, "to": 100, "value": 75},
+]
+_HIERARCHY_MAX_METRICS = 3  # ReportMetrics.tsx: "Add New" hidden at 3 for HIERARCHY
+# Funnel (chart_type "funnel"): lead/deal, ONE_DIMENSIONAL, grouped by pipelineStage, COUNT id,
+# one pipeline (equal) — sd-ui applyFunnelDefaults + sd-report validateFunnelReportRequest.
+_FUNNEL_ENTITIES = ("lead", "deal")
+_FUNNEL_THEME_COLORS = ("#1F99DA", "#7824FF", "#DA1F99", "#F3A53B", "#52A351",
+                        "#DA2D1F", "#351FDA", "#FFD10F", "#005F00", "#FF9300")
+_MAX_DIMENSIONS = 3  # ReportDimensions.tsx: "Add New" hidden at 3
+_DATE_FIELD_TYPES = {"DATE_PICKER", "DATETIME_PICKER"}
+
+_DIMENSION_FORMATS = ("YEARLY", "QUARTERLY", "FINANCIAL_YEARLY", "FINANCIAL_QUARTERLY", "MONTHLY", "WEEKLY", "DAILY")
+_FINANCIAL_FORMATS = {"FINANCIAL_YEARLY", "FINANCIAL_QUARTERLY"}
+
+# DATE_RANGES, in UI order: (operator, is_future_date)
+_DATE_RANGES: Tuple[Tuple[str, bool], ...] = (
+    ("today", False), ("yesterday", False), ("tomorrow", True),
+    ("last_n_days", False), ("next_n_days", True),
+    ("last_seven_days", False), ("next_seven_days", True),
+    ("last_fifteen_days", False), ("next_fifteen_days", True),
+    ("last_thirty_days", False), ("next_thirty_days", True),
+    ("week_to_date", False), ("current_week", False), ("last_week", False), ("next_week", True),
+    ("month_to_date", False), ("current_month", False), ("last_month", False), ("next_month", True),
+    ("quarter_to_date", False), ("current_quarter", False), ("last_quarter", False), ("next_quarter", True),
+    ("current_financial_quarter", False), ("last_financial_quarter", False), ("next_financial_quarter", True),
+    ("year_to_date", False), ("current_year", False), ("last_year", False), ("next_year", True),
+    ("current_financial_year", False), ("last_financial_year", False), ("next_financial_year", True),
+    ("before_current_date_and_time", False), ("after_current_date_and_time", False),
+    ("between", False),
+)
+# dateRangeWith90DaysSupport — email uses it (past ranges only) for every date dropdown.
+_EMAIL_DATE_RANGES: Tuple[str, ...] = (
+    "today", "yesterday", "last_seven_days", "last_fifteen_days", "last_thirty_days",
+    "week_to_date", "current_week", "last_week", "month_to_date", "current_month", "last_month",
+    "quarter_to_date", "current_quarter", "last_quarter",
+    "current_financial_quarter", "last_financial_quarter", "between",
+)
+_RELATIVE_FOR_REPORT = {
+    "last_n_days", "next_n_days", "last_seven_days", "next_seven_days", "last_fifteen_days",
+    "next_fifteen_days", "last_thirty_days", "next_thirty_days", "week_to_date", "month_to_date",
+    "quarter_to_date", "year_to_date", "last_financial_quarter", "current_financial_quarter",
+    "next_financial_quarter", "next_financial_year", "current_financial_year", "last_financial_year",
+}
+_FINANCIAL_OPERATORS = {
+    "last_financial_quarter", "current_financial_quarter", "next_financial_quarter",
+    "last_financial_year", "current_financial_year", "next_financial_year",
+}
+# entitiesWithRelativeDateTimeOperators (singular form)
+_ENTITIES_WITH_RELATIVE_DATES = {"lead", "deal", "contact", "company", "email", "task"}
+
+_N_DAYS_OPERATORS = {"last_n_days", "next_n_days"}
+# Date operators that carry no from/to time-of-day (DateFilter.tsx / FilterItem.tsx).
+_NO_TIME_DATE_OPERATORS = {"between", "before_current_date_and_time", "after_current_date_and_time"}
+_NO_INPUT_OPERATORS = {"is_null", "is_not_null", "is_empty", "is_not_empty"}
+_MULTI_VALUE_OPERATORS = {"in", "not_in"}
+_RANGE_OPERATORS = {"between", "not_between"}
+
+_MAX_CUSTOM_RANGE_DAYS = 1825  # sd-report report.date-range.max-custom-range-in-days
+_EMAIL_MAX_CUSTOM_RANGE_DAYS = 90  # sd-ui EMAIL_MAX_DATE_RANGE
+
+_LOOKUP_OPS = ["equal", "not_equal", "is_not_null", "is_null", "in", "not_in"]
+_TEXT_OPS = ["equal", "not_equal", "contains", "not_contains", "in", "not_in", "is_empty", "is_not_empty", "begins_with"]
+_NUMBER_OPS = ["equal", "not_equal", "greater", "greater_or_equal", "less", "less_or_equal",
+               "between", "not_between", "in", "not_in", "is_null", "is_not_null"]
+# getFilterOperatorsByFieldType + the in/not_in extras FilterItem adds for
+# LOOK_UP/PICK_LIST/MULTI_PICKLIST and the related-field types.
+_OPERATORS_BY_FIELD_TYPE: Dict[str, List[str]] = {
+    "LOOK_UP": _LOOKUP_OPS,
+    "PICK_LIST": _LOOKUP_OPS,
+    "MULTI_PICKLIST": _LOOKUP_OPS,
+    "PIPELINE": _LOOKUP_OPS,
+    "CAMPAIGN": _LOOKUP_OPS,
+    # team ("…Fields") filters: operators of their teams property, a LOOK_UP (FilterItem.tsx:447)
+    "ENTITY_FIELDS": _LOOKUP_OPS,
+    "PIPELINE_STAGE": ["equal", "not_equal", "in", "not_in"],
+    "ACTIVITY": ["equal", "not_equal", "in", "not_in"],
+    "CALL_LOG_TYPE": ["equal", "not_equal", "in", "not_in"],
+    "MEETING_ORGANIZER": ["equal", "not_equal", "in", "not_in"],
+    "MEETING_INVITEES": ["equal", "not_equal", "in", "not_in"],
+    "FORECASTING_TYPE": ["equal", "not_equal", "in", "not_in", "is_empty", "is_not_empty"],
+    "URL": _TEXT_OPS, "EMAIL": _TEXT_OPS, "PHONE": _TEXT_OPS, "SINGLE_LINE_TEXT": _TEXT_OPS, "TEXT_FIELD": _TEXT_OPS,
+    "UUID": ["equal", "not_equal", "in", "not_in"],
+    "ID": ["equal", "not_equal", "in", "not_in"],
+    "PIPELINE_STAGE_REASON": ["equal", "not_equal", "contains", "not_contains", "is_empty", "is_not_empty", "begins_with"],
+    "PARAGRAPH_TEXT": ["contains", "not_contains", "is_empty", "is_not_empty"],
+    "RICH_TEXT": ["contains", "not_contains", "is_empty", "is_not_empty"],
+    "NUMBER": _NUMBER_OPS,
+    "MONEY": [op for op in _NUMBER_OPS if op not in ("is_null", "is_not_null")],
+    "AUTO_INCREMENT": [op for op in _NUMBER_OPS if op not in ("is_null", "is_not_null")],
+    "IMAGE": ["is_not_null", "is_null"], "FILE_PICKER": ["is_not_null", "is_null"],
+    "FILE": ["is_not_null", "is_null"], "PAYMENT": ["is_not_null", "is_null"],
+    "GPS_COORDINATES": ["range_within"],
+}
+_DEFAULT_OPERATORS = ["equal", "not_equal"]  # TOGGLE, CHECKBOX, RADIO_BUTTON, everything else
+
+# Field types FilterInput.tsx renders a value input for. Any other type (PARAGRAPH_TEXT,
+# TIME_PICKER, ID, UUID, AUTO_INCREMENT, ...) gets no input in the UI, so only the
+# value-less operators (is_null, is_empty, ...) are usable on it.
+_UI_VALUE_INPUT_TYPES = {
+    "NUMBER", "MONEY", "PHONE", "EMAIL", "TEXT_FIELD", "SINGLE_LINE_TEXT", "PIPELINE_STAGE_REASON", "URL",
+    "TOGGLE", "CHECKBOX", "PICK_LIST", "MULTI_PICKLIST", "PIPELINE_STAGE", "ACTIVITY",
+    "LOOK_UP", "PIPELINE", "CAMPAIGN", "MEETING_ORGANIZER", "MEETING_INVITEES", "ENTITY_FIELDS",
+    "DATE_PICKER", "DATETIME_PICKER", "GPS_COORDINATES", "FORECASTING_TYPE",
+}
+
+# supportedFilterOperatorsByEntity (non-date fields only; the UI never applies
+# it to date fields, which use the date-range list instead).
+_ENTITY_OPERATOR_RESTRICTIONS: Dict[str, Dict[str, List[str]]] = {
+    "deal": {"partPayments": ["is_not_null", "is_null"]},
+    "email": {
+        "subject": ["equal", "not_equal", "contains", "not_contains", "in", "not_in", "begins_with"],
+        "sentBy": ["equal", "in"], "receivedBy": ["equal", "in"], "user": ["equal", "in"],
+        "associatedLeads": ["equal", "is_null", "is_not_null", "in"],
+        "associatedDeals": ["equal", "is_null", "is_not_null", "in"],
+        "associatedContacts": ["equal", "is_null", "is_not_null", "in"],
+    },
+}
+
+# FilterInput.tsx forecastingTypeOptions (value sent = option id)
+_FORECASTING_TYPES = ("OPEN", "CLOSED_WON", "CLOSED_LOST", "CLOSED_UNQUALIFIED")
+
+# ReportConfig.ts EXCLUDED_METRIC_FIELDS — funnel-only internals.
+_EXCLUDED_METRIC_FIELDS = {"pipelineStageCompleted", "pipelineStageSkipped"}
+_METRIC_TYPES = ("COUNT", "SUM", "AVERAGE")
+
+# RELATED_FIELDS: child filter -> parent filter that must be present.
+_RELATED_FIELD_PARENT = {"pipelineStage": "pipeline", "pipelineStageReason": "pipeline", "activities": "campaignActivities"}
+
+# LOOK_UP filter lookup.entity -> registry id that resolves its ids.
+_LOOKUP_RESOLVERS = {
+    "USER": "user.lookup",
+    "PRODUCT": "product.lookup",
+    "PIPELINE": "pipeline.lookup",
+    "TEAM": "team.lookup",
+    "LEAD": "lead.search_by_term",
+    "CONTACT": "contact.search_by_term",
+    "DEAL": "deal.search_by_term",
+    "COMPANY": "company.search_by_term",
+}
+# Filter field types resolved through a registry id regardless of their lookup block.
+_FIELD_TYPE_RESOLVERS = {
+    "PIPELINE": "pipeline.lookup",
+    "PIPELINE_STAGE": "pipeline.details",
+    "CAMPAIGN": "campaign.lookup",
+    "ACTIVITY": "campaign.activities",
+    "MEETING_INVITEES": "meeting.lookup_related",
+    "MEETING_ORGANIZER": "meeting.lookup_related",
+    "ENTITY_FIELDS": "team.lookup",
+}
+# Email sentBy IS supported, as a bare user id: verified on QA (2026-10-12) that sd-report runs
+# sentBy equal <id> / in [<ids>] correctly, while the {id,name,entity} object sd-ui sends fails
+# with a 500. receivedBy/user have no plain filter in sd-report, and team filters keyed on those
+# fields are dropped (no mapping), so they stay out. GPS "within" needs geocoding.
+_UNSUPPORTED_FILTER_IDS_BY_ENTITY = {"email": {"receivedBy", "user", "userFields", "sentByFields", "receivedByFields"}}
+_UNSUPPORTED_FILTER_TYPES = {"GPS_COORDINATES"}
+# Task reports allow one associated-entity filter at a time (sd-ui restrictMultipleAssociatedEntitiesFilter).
+_TASK_ASSOCIATED_FILTERS = {"associatedLeads", "associatedDeals", "associatedContacts", "associatedCompanies"}
+_MEETING_LOOKUP_ENTITIES = {"user", "lead", "contact", "external"}
+
+_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+# The SHORT payload execute_request("report.create", payload) takes. The server
+# expands it into the full POST /v3/reports body (see build_report_body).
+REPORT_CREATE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "$defs": {
+        "groupBy": {
+            "type": "object",
+            "required": ["field"],
+            "properties": {
+                "field": {"type": "string", "description": "A dimension id from tenant_fields_reference."},
+                "format": {"type": "string", "description": "Required for date dimensions (YEARLY, MONTHLY, ...)."},
+            },
+        },
+    },
+    "required": ["entity", "name", "date_range"],
+    "properties": {
+        "entity": {"type": "string", "enum": list(REPORT_ENTITIES),
+                   "description": "Same entity you passed to build_payload."},
+        "name": {"type": "string", "minLength": 3, "maxLength": 255},
+        "description": {"type": "string", "maxLength": 255},
+        "category": {"type": "string", "enum": list(_SUPPORTED_CATEGORIES), "default": "ONE_DIMENSIONAL",
+                     "description": ("MULTI_DIMENSIONAL: group by 2-3 fields. HIERARCHY: one user field, rolled up "
+                                     "the reporting hierarchy. GOALS_VS_ACHIEVEMENT: progress against goal_id.")},
+        "chart_type": {"type": "string", "enum": list(_CHART_TYPES) + ["funnel"], "default": "bar",
+                       "description": ("bar | pie | table; MULTI_DIMENSIONAL: bar | table; funnel (lead/deal, "
+                                       "ONE_DIMENSIONAL, needs a pipeline equal filter). HIERARCHY and goal reports "
+                                       "set their chart themselves.")},
+        "funnel_color": {"type": "string", "enum": list(_FUNNEL_THEME_COLORS), "description": "Funnel only; default #1F99DA."},
+        "goal_id": {"type": "integer", "description": "GOALS_VS_ACHIEVEMENT only — from goal.lookup."},
+        "prorated": {"type": "boolean", "description": "GOALS_VS_ACHIEVEMENT only; default true (turned off when not allowed)."},
+        "group_by": {
+            "description": ("ONE_DIMENSIONAL: one {field, format?}. MULTI_DIMENSIONAL: a list of 1-3 "
+                            "{field, format?} in grouping order (outer level first)."),
+            "oneOf": [
+                {"$ref": "#/$defs/groupBy"},
+                {"type": "array", "minItems": 1, "maxItems": _MAX_DIMENSIONS, "items": {"$ref": "#/$defs/groupBy"}},
+            ],
+        },
+        "metrics": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["type", "field"],
+                "properties": {"type": {"type": "string", "enum": list(_METRIC_TYPES)}, "field": {"type": "string"}},
+            },
+        },
+        "date_range": {
+            "type": "object",
+            "required": ["field", "operator"],
+            "properties": {
+                "field": {"type": "string"},
+                "operator": {"type": "string"},
+                "value": {"description": "between -> [start, end] (user's local time); last_n_days/next_n_days -> N."},
+                "from": {"type": "string", "description": "Optional HH:mm, DATETIME fields only (default 00:00)."},
+                "to": {"type": "string", "description": "Optional HH:mm, DATETIME fields only (default 23:59)."},
+            },
+        },
+        "filters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["field", "operator"],
+                "properties": {
+                    "field": {"type": "string"},
+                    "operator": {"type": "string"},
+                    "value": {"description": "Omit for is_null/is_not_null/is_empty/is_not_empty; a list for in/not_in."},
+                },
+            },
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Fetchers
+# ---------------------------------------------------------------------------
+
+def normalize_report_entity(entity: Any) -> str:
+    """Return the singular report entity ("lead", ...) or raise ValueError."""
+    value = (entity or "").strip().lower() if isinstance(entity, str) else ""
+    # Accept plurals too ("leads", "companies", "calls") — models use both.
+    for singular, plural in _REPORT_ENTITY_PLURAL.items():
+        if value in (singular, plural):
+            return singular
+    raise ValueError(
+        f"Unknown report entity '{entity}'. Use one of: {', '.join(REPORT_ENTITIES)} "
+        f"(the STANDARD type — call get_entity_labels() if the user used a renamed entity)."
+    )
+
+
+async def _fetch_report_config(entity: str) -> Dict[str, Any]:
+    """GET /reports/config/{plural}. Drops organizerFields like sd-ui's filterReportConfig."""
+    async with get_client() as client:
+        response = await client.get(f"/v1/reports/config/{_REPORT_ENTITY_PLURAL[entity]}")
+        data = await handle_api_response(response, f"Fetch report config for {entity}")
+    if isinstance(data, list):  # defensive: /reports/config (all entities) returns a list
+        data = next((c for c in data if c.get("entity") == entity), {}) if data else {}
+    data = data or {}
+    return {
+        **data,
+        "dimensions": [d for d in data.get("dimensions") or [] if d.get("id") != "organizerFields"],
+        "filters": [f for f in data.get("filters") or [] if f.get("id") != "organizerFields"],
+    }
+
+
+async def _fetch_report_permissions() -> List[Dict[str, Any]]:
+    """GET /users/me/permissions — [{name, action: {read, readAll, write, ...}}] (sd-ui AppActions)."""
+    async with get_client() as client:
+        response = await client.get("/v1/users/me/permissions")
+        data = await handle_api_response(response, "Fetch user permissions")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("content") or []
+    return []
+
+
+async def _fetch_tenant_currency() -> Optional[str]:
+    """GET /tenants -> currency (e.g. "INR"); sd-ui reads genSettings.payload.currency from it.
+    Returns None on any failure — financial options are then hidden (safe default)."""
+    try:
+        async with get_client() as client:
+            response = await client.get("/v1/tenants")
+            data = await handle_api_response(response, "Fetch tenant settings")
+        return (data or {}).get("currency") if isinstance(data, dict) else None
+    except KylasAPIError as e:
+        logger.warning("Could not fetch tenant currency: %s", e.message)
+        return None
+
+
+def _permission_action(permissions: List[Dict[str, Any]], name: str) -> Dict[str, Any]:
+    entry = next((p for p in permissions or [] if isinstance(p, dict) and p.get("name") == name), None)
+    return (entry or {}).get("action") or {}
+
+
+def readable_report_entities(permissions: List[Dict[str, Any]]) -> List[str]:
+    """Entities the user may report on: READ or READ_ALL, meeting always (sd-ui getEntityOptions)."""
+    result = []
+    for entity in REPORT_ENTITIES:
+        action = _permission_action(permissions, entity)
+        if entity in _ALWAYS_REPORTABLE_ENTITIES or action.get("read") is True or action.get("readAll") is True:
+            result.append(entity)
+    return result
+
+
+def can_create_report(permissions: List[Dict[str, Any]]) -> bool:
+    """WRITE on "report" (sd-ui canCreateEntitySelector(entities.REPORTS))."""
+    return _permission_action(permissions, "report").get("write") is True
+
+
+# ---------------------------------------------------------------------------
+# Config interpretation (shared by the cheat sheet and the payload builder)
+# ---------------------------------------------------------------------------
+
+def _usable(item: Dict[str, Any]) -> bool:
+    return bool(item.get("active")) and bool(item.get("filterable"))
+
+
+def _is_financial_tenant(tenant_currency: Optional[str]) -> bool:
+    return (tenant_currency or "").upper() == "INR"
+
+
+def date_operators_for(entity: str, tenant_currency: Optional[str]) -> List[str]:
+    """getDateOperatorsForFieldId(fieldId, reportType, true, tenantCurrency)."""
+    if entity == "email":
+        return list(_EMAIL_DATE_RANGES)
+    ops = [op for op, _future in _DATE_RANGES]
+    if entity in _ENTITIES_WITH_RELATIVE_DATES:
+        if not _is_financial_tenant(tenant_currency):
+            ops = [op for op in ops if op not in _FINANCIAL_OPERATORS]
+        return ops
+    return [op for op in ops if op not in _RELATIVE_FOR_REPORT]
+
+
+def dimension_formats_for(tenant_currency: Optional[str]) -> List[str]:
+    if _is_financial_tenant(tenant_currency):
+        return list(_DIMENSION_FORMATS)
+    return [f for f in _DIMENSION_FORMATS if f not in _FINANCIAL_FORMATS]
+
+
+def filter_operators_for(entity: str, flt: Dict[str, Any], tenant_currency: Optional[str]) -> List[str]:
+    field_type = flt.get("fieldType") or ""
+    if field_type in _DATE_FIELD_TYPES:
+        return date_operators_for(entity, tenant_currency)
+    ops = _OPERATORS_BY_FIELD_TYPE.get(field_type, _DEFAULT_OPERATORS)
+    restricted = _ENTITY_OPERATOR_RESTRICTIONS.get(entity, {}).get(flt.get("id"))
+    if restricted:
+        ops = [op for op in ops if op in restricted]
+    if field_type not in _UI_VALUE_INPUT_TYPES:
+        ops = [op for op in ops if op in _NO_INPUT_OPERATORS]
+    return list(ops)
+
+
+def rule_type_for(flt: Dict[str, Any]) -> str:
+    """getDataTypeByFieldType(fieldType, isInternal), with approvalState forced to long (service.ts:87)."""
+    if flt.get("id") == "approvalState":
+        return "long"
+    field_type = flt.get("fieldType") or ""
+    if field_type == "PICK_LIST":
+        return "string" if flt.get("isInternal") else "long"
+    if field_type in ("MULTI_PICKLIST", "LOOK_UP", "PIPELINE", "PIPELINE_STAGE", "CAMPAIGN", "ACTIVITY", "ENTITY_FIELDS"):
+        return "long"
+    if field_type in ("NUMBER", "MONEY"):
+        return "double"
+    if field_type in ("DATE_PICKER", "TIME_PICKER", "DATETIME_PICKER"):
+        return "date"
+    if field_type == "TOGGLE":
+        return "boolean"
+    if field_type == "GPS_COORDINATES":
+        return "GpsCoordinates"
+    if field_type == "MEETING_INVITEES":
+        return "participants_lookup"
+    if field_type == "MEETING_ORGANIZER":
+        return "organizer_lookup"
+    if field_type == "UUID":
+        return "uuid"
+    return "string"
+
+
+def filter_support(flt: Dict[str, Any], entity: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+    """(supported, resolve_via registry id or None)."""
+    field_type = flt.get("fieldType") or ""
+    if field_type in _UNSUPPORTED_FILTER_TYPES or flt.get("id") in _UNSUPPORTED_FILTER_IDS_BY_ENTITY.get(entity or "", set()):
+        return False, None
+    if field_type == "ENTITY_FIELDS":
+        # Applied by sd-report only with property "teams" + a primaryField; anything else is dropped.
+        ok = bool(flt.get("primaryField")) and (flt.get("property") in (None, "teams"))
+        return ok, ("team.lookup" if ok else None)
+    if field_type in _FIELD_TYPE_RESOLVERS:
+        return True, _FIELD_TYPE_RESOLVERS[field_type]
+    if field_type == "LOOK_UP":
+        resolver = _LOOKUP_RESOLVERS.get(((flt.get("lookup") or {}).get("entity") or "").upper())
+        return (resolver is not None), resolver
+    # e.g. a TOGGLE-like type with no input and no value-less operator: nothing usable.
+    if not filter_operators_for("", flt, None):
+        return False, None
+    return True, None
+
+
+def metrics_for_dimension(dimension: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """ReportConfig.getMetricsFor — the SELECTED dimension's supportedMetrics, minus funnel internals, de-duplicated."""
+    seen = set()
+    result = []
+    for m in dimension.get("supportedMetrics") or []:
+        key = (m.get("type"), m.get("field"))
+        if m.get("field") in _EXCLUDED_METRIC_FIELDS or key in seen:
+            continue
+        seen.add(key)
+        result.append(m)
+    return result
+
+
+def _picklist_values(flt: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if flt.get("fieldType") in ("TOGGLE", "CHECKBOX") and not flt.get("picklist"):
+        return [{"id": True, "name": None, "displayName": "Yes"}, {"id": False, "name": None, "displayName": "No"}]
+    return [v for v in ((flt.get("picklist") or {}).get("picklistValues") or []) if isinstance(v, dict)]
+
+
+def _uses_option_name(flt: Dict[str, Any]) -> bool:
+    """FilterInput outPutId: name when isInternal (except TOGGLE and approvalState), otherwise id."""
+    return bool(flt.get("isInternal")) and flt.get("fieldType") != "TOGGLE" and flt.get("id") != "approvalState"
+
+
+# ---------------------------------------------------------------------------
+# Cheat sheet (build_payload's tenant_fields_reference for report.create)
+# ---------------------------------------------------------------------------
+
+def get_report_config_instructions_logic(
+    entity: str,
+    config: Dict[str, Any],
+    requested_picklists: Optional[set] = None,
+    tenant_currency: Optional[str] = None,
+) -> str:
+    requested = {n.strip().lower() for n in (requested_picklists or set()) if isinstance(n, str)}
+    dimensions = [d for d in config.get("dimensions") or [] if _usable(d)]
+    filters = [f for f in config.get("filters") or [] if _usable(f)]
+    date_fields = [f for f in filters if f.get("fieldType") in _DATE_FIELD_TYPES]
+    financial = _is_financial_tenant(tenant_currency)
+
+    lines = [
+        "=" * 60,
+        f"KYLAS REPORT BUILDER — {entity.upper()} (categories ONE_DIMENSIONAL, MULTI_DIMENSIONAL)",
+        "=" * 60,
+        f"Tenant currency: {tenant_currency or 'unknown'} — financial year/quarter options "
+        f"{'AVAILABLE' if financial else 'NOT available'}.",
+        "",
+        "CHART TYPES (chart_type): bar, pie, table (MULTI_DIMENSIONAL: bar, table). With more than one",
+        "metric only 'table' is allowed — the server switches to table automatically and says so.",
+        "",
+        "CATEGORY: ONE_DIMENSIONAL (default) = group_by is ONE dimension. MULTI_DIMENSIONAL = group_by is a",
+        f"list of 1-{_MAX_DIMENSIONS} dimensions in grouping order (outer first), no field twice, e.g. 'leads by owner",
+        "and source' -> [{field: ownerId}, {field: source}]. Every date dimension needs its own format.",
+        "Metrics are those of the FIRST dimension. A child field (pipelineStage, pipelineStageReason,",
+        "activities) must come after its parent (pipeline / campaignActivities) if both are dimensions;",
+        "its required parent filter is not needed when the parent is an earlier dimension."
+        + (" Task reports: only one associated-entity dimension." if entity == "task" else ""),
+        "HIERARCHY = one USER dimension (owner, created by, ...), up to 3 metrics, chart set automatically;"
+        " results roll up the reporting hierarchy (self / reportees / total).",
+        *([f"FUNNEL (chart_type 'funnel', ONE_DIMENSIONAL): group_by and metrics are fixed (pipelineStage, COUNT id) —"
+           " leave them out; REQUIRES filter {field: pipeline, operator: equal, value: <one pipeline id>};"
+           f" optional funnel_color: {', '.join(_FUNNEL_THEME_COLORS)}."] if entity in _FUNNEL_ENTITIES else []),
+        *(["GOALS_VS_ACHIEVEMENT: pass goal_id (goal.lookup / goal.details). Dimension, metric and the goal's own"
+           " filters come from the goal (leave group_by/metrics out); chart is donut; date_range defaults to the goal"
+           " frequency (you may change it); extra filters allowed; prorated defaults to true."] if entity in _GOAL_ENTITIES else []),
+        "",
+        "DIMENSIONS (group_by[].field):",
+    ]
+    formats = ", ".join(dimension_formats_for(tenant_currency))
+    for d in dimensions:
+        extra = ""
+        if d.get("fieldType") in _DATE_FIELD_TYPES:
+            extra = f" — group_by.format REQUIRED: {formats}"
+        elif d.get("fieldType") == "ENTITY_FIELDS":
+            extra = (f" — groups by the {d.get('primaryField')} user's TEAM (property 'teams' is set "
+                     f"automatically; a '{d.get('primaryField')} is_not_null' filter is added if you don't give one)")
+        required = [r for r in d.get("requiredFilters") or [] if d.get("fieldType") != "ENTITY_FIELDS"]
+        if required:
+            extra += f" — REQUIRES filter(s): {', '.join(required)}"
+        lines.append(f"  • '{d.get('id')}' {d.get('header')} [{d.get('fieldType') or 'n/a'}]{extra}")
+
+    # Metrics are per dimension; print once when every dimension shares the same list.
+    metric_sets = {}
+    for d in dimensions:
+        key = tuple((m.get("type"), m.get("field")) for m in metrics_for_dimension(d))
+        metric_sets.setdefault(key, []).append(d)
+    lines.extend(["", "METRICS (metrics[] = {type, field}) — at least one, no duplicates:"])
+    for key, dims in metric_sets.items():
+        if len(metric_sets) > 1:
+            lines.append(f"  For dimension(s): {', '.join(d.get('id') for d in dims)}")
+        for m in metrics_for_dimension(dims[0]):
+            label = "Number of records" if (m.get("type"), m.get("field")) == ("COUNT", "id") else m.get("header")
+            lines.append(f"  • {m.get('type')} {m.get('field')}  ({label})")
+
+    lines.extend(["", "DATE RANGE (date_range) — required; field must be one of:"])
+    for f in date_fields:
+        lines.append(f"  • '{f.get('id')}' {f.get('header')} [{f.get('fieldType')}]")
+    lines.append(f"  operators: {', '.join(date_operators_for(entity, tenant_currency))}")
+    lines.append("  value: 'between' -> [start, end] in the user's local time (date or datetime; "
+                 "converted to UTC by the server); 'last_n_days'/'next_n_days' -> N (1-364); others -> omit.")
+    if entity == "email":
+        lines.append("  Email: past ranges only; a custom 'between' range may span at most 90 days.")
+    else:
+        lines.append(f"  A custom 'between' range may span at most {_MAX_CUSTOM_RANGE_DAYS} days (about 5 years); "
+                     "the same limit applies to 'between' on date filters.")
+    lines.append("  The date-range field can NOT also be used in filters.")
+
+    lines.extend(["", "FILTERS (filters[] = {field, operator, value}) — optional, each field at most once:"])
+    for f in filters:
+        lines.extend(_format_report_filter(entity, f, requested, tenant_currency))
+    lines.append("")
+    lines.append("Operators is_null/is_not_null/is_empty/is_not_empty take no value. "
+                 "in/not_in take a list. between/not_between (numbers) take [from, to].")
+    return "\n".join(lines)
+
+
+def _format_report_filter(entity: str, f: Dict[str, Any], requested: set, tenant_currency: Optional[str]) -> List[str]:
+    fid = f.get("id") or ""
+    field_type = f.get("fieldType") or ""
+    supported, resolver = filter_support(f, entity)
+    head = f"  • '{fid}' {f.get('header')} [{field_type}]"
+    if not supported:
+        return [f"{head} — NOT SUPPORTED (can't be used in reports created here)"]
+    ops = ", ".join(filter_operators_for(entity, f, tenant_currency))
+    lines = [f"{head} — operators: {ops}"]
+    parent = _RELATED_FIELD_PARENT.get(fid)
+    required = list(f.get("requiredFilters") or []) + ([parent] if parent and parent not in (f.get("requiredFilters") or []) else [])
+    if required:
+        lines.append(f"     requires filter(s): {', '.join(required)}")
+    if parent == "pipeline":
+        lines.append("     the 'pipeline' filter must then use operator 'equal' or 'in'.")
+    if parent == "campaignActivities":
+        lines.append("     the 'campaignActivities' filter must then use operator 'equal' (one campaign).")
+    if entity == "task" and fid in _TASK_ASSOCIATED_FILTERS:
+        lines.append("     only ONE of associatedLeads/associatedDeals/associatedContacts/associatedCompanies per report.")
+    if resolver:
+        lines.append(f"     value: {_resolver_hint(entity, f, resolver)} Never guess ids.")
+    elif field_type in _DATE_FIELD_TYPES:
+        lines.append("     value: same rules as date_range")
+    elif field_type == "FORECASTING_TYPE":
+        lines.append(f"     value: one of {', '.join(_FORECASTING_TYPES)}")
+    elif field_type in ("PICK_LIST", "MULTI_PICKLIST", "TOGGLE", "CHECKBOX"):
+        values = _picklist_values(f)
+        send = "the option NAME (string)" if _uses_option_name(f) and field_type in ("PICK_LIST", "MULTI_PICKLIST") else "the option ID"
+        if field_type in ("TOGGLE", "CHECKBOX"):
+            send = "true / false"
+        if fid.strip().lower() in _REPORT_LARGE_PICKLISTS and fid.strip().lower() not in requested:
+            lines.append(f"     value: {send}. {len(values)} options omitted to keep this reference compact.")
+            lines.append(f'     Call build_payload("report.create", entity="{entity}", fields=["{fid}"]) to get them. '
+                         "Do NOT guess an option id or name.")
+        elif field_type not in ("TOGGLE", "CHECKBOX"):
+            lines.append(f"     value: {send}. Options:")
+            for v in values:
+                lines.append(f"       - {v.get('displayName')} (id: {v.get('id')}, name: '{v.get('name')}')")
+        else:
+            lines.append(f"     value: {send}")
+    elif field_type in ("NUMBER", "MONEY", "AUTO_INCREMENT"):
+        lines.append("     value: number")
+    else:
+        lines.append("     value: text")
+    return lines
+
+
+def _resolver_hint(entity: str, f: Dict[str, Any], resolver: str) -> str:
+    """How to obtain this filter's value — one line per lookup kind."""
+    if resolver == "pipeline.lookup":
+        # The UI calls the filter's own lookupUrl (e.g. /pipelines/lookup?entityType=LEAD&q=name:).
+        match = re.search(r"entityType=(\w+)", (f.get("lookup") or {}).get("lookupUrl") or "")
+        return f"pipeline id(s) — resolve_via: pipeline.lookup with entity_type={match.group(1) if match else entity.upper()}."
+    if resolver == "pipeline.details":
+        return ("stage id(s) — resolve_via: pipeline.details with pipeline_id = the pipeline in your "
+                "'pipeline' filter; use its 'Stage ID' values.")
+    if resolver == "campaign.activities":
+        return "activity id(s) — resolve_via: campaign.activities with the campaign_id of your campaignActivities filter."
+    if resolver == "meeting.lookup_related":
+        return ("an OBJECT {id, entity, name} (a list of them for in/not_in) — resolve_via: meeting.lookup_related "
+                "with entity_type=\"invitee\"; copy id, entity and name from the chosen row. A bare id is rejected.")
+    if (f.get("fieldType") or "") == "ENTITY_FIELDS":
+        return (f"team id(s) — resolve_via: team.lookup. The server sets property 'teams' and adds "
+                f"'{f.get('primaryField')} is_not_null' automatically.")
+    if resolver.endswith(".search_by_term"):
+        return f"record id(s) — resolve_via: {resolver} (use the ID from its results)."
+    return f"numeric id(s) — resolve_via: {resolver}."
+
+
+# ---------------------------------------------------------------------------
+# Short payload -> full Kylas body (port of sd-ui service.ts saveReport/getConfig)
+# ---------------------------------------------------------------------------
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def _time_or_default(value: Any, default: str, label: str) -> str:
+    if value in (None, ""):
+        return default
+    _require(isinstance(value, str) and bool(_HHMM.match(value)), f"{label} must be a 24h 'HH:mm' time, got {value!r}.")
+    return value
+
+
+def _to_utc_range(value: Any, timezone: str, label: str, max_days: int) -> List[str]:
+    """[start, end] in the user's local time -> UTC ISO, date-only values expanded to start/end of day
+    (sd-ui DateSelect START_OF_DAY / END_OF_DAY)."""
+    _require(isinstance(value, (list, tuple)) and len(value) == 2 and all(isinstance(v, str) and v.strip() for v in value),
+             f"{label}: 'between' needs value [start, end] as two date/datetime strings.")
+    start, end = (v.strip() for v in value)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", start):
+        start += "T00:00:00"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", end):
+        end += "T23:59:59.999"
+    converted = _convert_date_value_to_utc([start, end], timezone)
+    try:
+        start_dt, end_dt = (dateutil_parser.isoparse(v) for v in converted)
+    except (ValueError, TypeError):
+        raise ValueError(f"{label}: could not parse dates {value!r}; use ISO format like '2026-01-31' or '2026-01-31T18:30'.")
+    _require(start_dt <= end_dt, f"{label}: start date is after end date.")
+    _require((end_dt - start_dt).days <= max_days, f"{label}: a custom date range may span at most {max_days} days.")
+    return list(converted)
+
+
+def _n_days(value: Any, label: str) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}: last_n_days/next_n_days need value N (a whole number 1-364).")
+    _require(str(value).strip().lstrip("-").isdigit() and 0 < number < 365,
+             f"{label}: N must be a whole number between 1 and 364, got {value!r}.")
+    return number
+
+
+def _date_rule_parts(
+    entity: str, flt: Dict[str, Any], operator: str, value: Any, spec: Dict[str, Any],
+    timezone: str, tenant_currency: Optional[str], label: str,
+) -> Dict[str, Any]:
+    allowed = date_operators_for(entity, tenant_currency)
+    _require(operator in allowed, f"{label}: operator '{operator}' is not allowed for date fields here. Allowed: {', '.join(allowed)}.")
+    parts: Dict[str, Any] = {"value": None}
+    if operator == "between":
+        max_days = _EMAIL_MAX_CUSTOM_RANGE_DAYS if entity == "email" else _MAX_CUSTOM_RANGE_DAYS
+        parts["value"] = _to_utc_range(value, timezone, label, max_days)
+    elif operator in _N_DAYS_OPERATORS:
+        parts["value"] = _n_days(value, label)
+    if flt.get("fieldType") == "DATETIME_PICKER" and operator not in _NO_TIME_DATE_OPERATORS:
+        parts["from"] = _time_or_default(spec.get("from"), "00:00", f"{label} 'from'")
+        parts["to"] = _time_or_default(spec.get("to"), "23:59", f"{label} 'to'")
+    return parts
+
+
+def _resolve_option(flt: Dict[str, Any], raw: Any, label: str) -> Any:
+    """Accept an option's id, internal name or display name; return what sd-ui would send."""
+    values = _picklist_values(flt)
+    # FilterInput's outPutId applies to PICK_LIST and MULTI_PICKLIST alike (rule type stays long
+    # for MULTI_PICKLIST — that's what sd-ui sends).
+    use_name = _uses_option_name(flt) and flt.get("fieldType") in ("PICK_LIST", "MULTI_PICKLIST")
+    for v in values:
+        candidates = [v.get("id"), v.get("name"), v.get("displayName")]
+        if any(c is not None and (c == raw or str(c).strip().lower() == str(raw).strip().lower()) for c in candidates):
+            return v.get("name") if use_name else v.get("id")
+    hint = f'build_payload("report.create", entity=..., fields=["{flt.get("id")}"])' if values else "the config"
+    raise ValueError(f"{label}: {raw!r} is not an option of '{flt.get('id')}'. Check the options via {hint}.")
+
+
+def _as_list(value: Any) -> List[Any]:
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, str) and "," in value:
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return [value]
+
+
+def _to_int(value: Any, label: str) -> int:
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}: expected a numeric id, got {value!r}. Resolve it with the lookup named in the reference.")
+    return number
+
+
+def _to_number(value: Any, label: str) -> float:
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}: expected a number, got {value!r}.")
+    return int(number) if number.is_integer() else number
+
+
+def _meeting_lookup_value(value: Any, label: str) -> Dict[str, Any]:
+    """Meeting participants/organizer values are {id, entity, name} objects (sd-report MeetingLookup)."""
+    _require(isinstance(value, dict) and value.get("id") is not None and value.get("entity"),
+             f"{label}: needs an object {{id, entity, name}} from meeting.lookup_related (entity_type=\"invitee\"); "
+             f"got {value!r}.")
+    entity = str(value["entity"]).strip().lower()
+    _require(entity in _MEETING_LOOKUP_ENTITIES,
+             f"{label}: entity must be one of {', '.join(sorted(_MEETING_LOOKUP_ENTITIES))}, got {value['entity']!r}.")
+    result = {"id": _to_int(value["id"], label), "entity": entity}
+    if value.get("name"):
+        result["name"] = str(value["name"])
+    return result
+
+
+def _rule_value(entity: str, flt: Dict[str, Any], operator: str, value: Any, label: str) -> Any:
+    """getFilterValue (service.ts:44) for non-date fields."""
+    if operator in _NO_INPUT_OPERATORS:
+        return None
+    _require(value is not None and value != "" and value != [], f"{label}: operator '{operator}' needs a value.")
+    field_type = flt.get("fieldType") or ""
+    multi = operator in _MULTI_VALUE_OPERATORS
+
+    if field_type in ("LOOK_UP", "PIPELINE", "PIPELINE_STAGE", "CAMPAIGN", "ACTIVITY", "ENTITY_FIELDS"):
+        return [_to_int(v, label) for v in _as_list(value)] if multi else _to_int(value, label)
+    if field_type in ("MEETING_INVITEES", "MEETING_ORGANIZER"):
+        if multi:
+            items = value if isinstance(value, list) else [value]
+            return [_meeting_lookup_value(v, label) for v in items]
+        _require(not isinstance(value, list), f"{label}: '{operator}' takes ONE object {{id, entity, name}}; use 'in' for several.")
+        return _meeting_lookup_value(value, label)
+    if field_type in ("PICK_LIST", "MULTI_PICKLIST"):
+        return [_resolve_option(flt, v, label) for v in _as_list(value)] if multi else _resolve_option(flt, value, label)
+    if field_type in ("TOGGLE", "CHECKBOX"):
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            _require(lowered in ("true", "false", "yes", "no"), f"{label}: expected true/false, got {value!r}.")
+            return lowered in ("true", "yes")
+        _require(isinstance(value, bool), f"{label}: expected true/false, got {value!r}.")
+        return value
+    if field_type == "FORECASTING_TYPE":
+        items = _as_list(value) if multi else [value]
+        resolved = []
+        for item in items:
+            key = str(item).strip().upper().replace(" ", "_")
+            key = {"WON": "CLOSED_WON", "LOST": "CLOSED_LOST", "UNQUALIFIED": "CLOSED_UNQUALIFIED"}.get(key, key)
+            _require(key in _FORECASTING_TYPES, f"{label}: {item!r} must be one of {', '.join(_FORECASTING_TYPES)}.")
+            resolved.append(key)
+        return resolved if multi else resolved[0]
+    if field_type in ("NUMBER", "MONEY", "AUTO_INCREMENT"):
+        if operator in _RANGE_OPERATORS:
+            _require(isinstance(value, (list, tuple)) and len(value) == 2, f"{label}: '{operator}' needs value [from, to].")
+            return [_to_number(v, label) for v in value]
+        if multi:
+            # FreeTextTagsInput commits tags as one comma-separated string.
+            return ",".join(str(_to_number(v, label)) for v in _as_list(value))
+        return _to_number(value, label)
+    # Text-like fields: trimmed (service.ts:200-205); in/not_in as a comma-separated string (FreeTextTagsInput).
+    if multi:
+        return ",".join(str(v).strip() for v in _as_list(value) if str(v).strip())
+    return str(value).strip()
+
+
+def _find(items: List[Dict[str, Any]], item_id: Any) -> Optional[Dict[str, Any]]:
+    return next((i for i in items if i.get("id") == item_id), None)
+
+
+def build_report_body(
+    payload: Dict[str, Any],
+    config: Dict[str, Any],
+    timezone: str,
+    tenant_currency: Optional[str] = None,
+    goal: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Validate the short report.create payload against the live config and expand it into the
+    full POST /v3/reports body. Returns (body, notes). Raises ValueError with a model-actionable message."""
+    _require(isinstance(payload, dict), "payload must be an object.")
+    entity = normalize_report_entity(payload.get("entity"))
+    notes: List[str] = []
+    dimensions = [d for d in config.get("dimensions") or [] if _usable(d)]
+    filters = [f for f in config.get("filters") or [] if _usable(f)]
+
+    # --- Basic information ---
+    name = payload.get("name")
+    _require(isinstance(name, str) and 3 <= len(name.strip()) <= 255, "name is required (3-255 characters).")
+    description = payload.get("description") or ""
+    _require(isinstance(description, str) and len(description) <= 255, "description must be text of at most 255 characters.")
+    category = (payload.get("category") or "ONE_DIMENSIONAL").upper()
+    _require(category in _SUPPORTED_CATEGORIES,
+             f"category must be one of {', '.join(_SUPPORTED_CATEGORIES)} (funnel = chart_type \"funnel\").")
+    multi = category == "MULTI_DIMENSIONAL"
+    hierarchy = category == "HIERARCHY"
+    goal_report = category == "GOALS_VS_ACHIEVEMENT"
+    goal_filter_rules: List[Dict[str, Any]] = []
+    if goal_report:
+        _require(entity in _GOAL_ENTITIES, f"Goal reports are available for {', '.join(_GOAL_ENTITIES)} only.")
+        _require(isinstance(goal, dict) and goal.get("id") is not None,
+                 "GOALS_VS_ACHIEVEMENT needs goal_id — find it with goal.lookup.")
+        _require(str(goal.get("entityType") or "").lower() == entity,
+                 f"Goal {goal.get('id')} is on {str(goal.get('entityType') or '?').lower()}, not {entity} — use that entity.")
+        _require(goal.get("active") is not False, f"Goal {goal.get('id')} is inactive; reports on it can't run.")
+        goal_dim, goal_metric = goal.get("dimension") or {}, goal.get("metric") or {}
+        frequency = (goal.get("frequency") or {}).get("type")
+        if payload.get("group_by") or payload.get("metrics"):
+            notes.append("group_by and metrics come from the goal; the values you sent were ignored.")
+        overrides = {
+            "group_by": [{"field": goal_dim.get("field"), "format": goal_dim.get("format")}],
+            "metrics": [{"type": goal_metric.get("type"), "field": goal_metric.get("field")}],
+        }
+        if not payload.get("date_range"):
+            default_op = _GOAL_FREQUENCY_OPERATOR.get(frequency)
+            _require(default_op is not None, f"Goal {goal.get('id')} has frequency {frequency!r}; pass an explicit date_range.")
+            overrides["date_range"] = {"field": (goal.get("dateRange") or {}).get("field") or "createdAt", "operator": default_op}
+        payload = dict(payload, **overrides)
+        # Goal filters are locked into the report (FilterItem.tsx disableGoalFilters).
+        for gf in goal.get("filters") or []:
+            ftype = gf.get("fieldType")
+            rule = {"operator": gf.get("operator"), "id": gf.get("field"), "field": gf.get("field"),
+                    "fieldInputType": ftype, "type": gf.get("type"), "value": gf.get("value"),
+                    "from": None, "to": None, "property": gf.get("property"), "primaryField": gf.get("primaryField")}
+            if ftype == "DATETIME_PICKER" and gf.get("operator") not in _NO_TIME_DATE_OPERATORS:
+                rule.update({"from": "00:00", "to": "23:59"})
+            goal_filter_rules.append(rule)
+    requested_chart = str(payload.get("chart_type") or "").strip().lower()
+    funnel = requested_chart == "funnel"
+    if funnel:
+        _require(entity in _FUNNEL_ENTITIES, f"Funnel reports are available for {' and '.join(_FUNNEL_ENTITIES)} only.")
+        _require(category == "ONE_DIMENSIONAL", "Funnel reports must be ONE_DIMENSIONAL.")
+        # The web app fixes the dimension and metric of a funnel (applyFunnelDefaults).
+        given = payload.get("group_by")
+        given_ids = [g.get("field") if isinstance(g, dict) else g for g in (given if isinstance(given, list) else [given])] if given else []
+        _require(all(g == "pipelineStage" for g in given_ids),
+                 "Funnel reports always group by 'pipelineStage' — leave group_by out or set it to pipelineStage.")
+        payload = dict(payload, group_by=[{"field": "pipelineStage"}], metrics=[{"type": "COUNT", "field": "id"}])
+
+    # --- Dimensions: exactly one (ONE_DIMENSIONAL) or 1-3 in order (MULTI_DIMENSIONAL) ---
+    raw_group_by = payload.get("group_by")
+    if isinstance(raw_group_by, (dict, str)):
+        raw_group_by = [raw_group_by]
+    _require(isinstance(raw_group_by, list) and raw_group_by,
+             "group_by is required: {\"field\": \"<dimension>\"} (a list of 1-3 for MULTI_DIMENSIONAL).")
+    if multi:
+        _require(len(raw_group_by) <= _MAX_DIMENSIONS,
+                 f"MULTI_DIMENSIONAL reports take at most {_MAX_DIMENSIONS} group_by dimensions.")
+    else:
+        _require(len(raw_group_by) == 1, f"{category} reports take exactly one group_by dimension"
+                 f"{' — use category MULTI_DIMENSIONAL to group by 2-3 fields' if category == 'ONE_DIMENSIONAL' else ''}.")
+    group_dimensions: List[Dict[str, Any]] = []
+    group_by_bodies: List[Dict[str, Any]] = []
+    for i, gb in enumerate(raw_group_by):
+        label = f"group_by[{i}]" if multi else "group_by"
+        if isinstance(gb, str):
+            gb = {"field": gb}
+        _require(isinstance(gb, dict) and gb.get("field"), f"{label}.field is required.")
+        dimension = _find(dimensions, gb["field"])
+        _require(dimension is not None, f"{label}.field '{gb['field']}' is not a dimension of {entity}. "
+                 f"Valid: {', '.join(d.get('id') for d in dimensions)}.")
+        if hierarchy:
+            # Form.tsx getDimensionOptions: HIERARCHY only offers USER lookups.
+            user_dims = [d["id"] for d in dimensions if _is_user_dimension(d)]
+            _require(_is_user_dimension(dimension),
+                     f"HIERARCHY reports group by a user field; '{dimension['id']}' isn't one. Valid: {', '.join(user_dims)}.")
+        _require(all(d["id"] != dimension["id"] for d in group_dimensions),
+                 f"{label}: '{dimension['id']}' is already a dimension — each field can be used once.")
+        fmt = gb.get("format")
+        if dimension.get("fieldType") in _DATE_FIELD_TYPES:
+            allowed_formats = dimension_formats_for(tenant_currency)
+            _require(isinstance(fmt, str) and fmt.upper() in allowed_formats,
+                     f"{label}.format is required for date dimension '{dimension['id']}'. Use one of: {', '.join(allowed_formats)}.")
+            fmt = fmt.upper()
+        else:
+            fmt = None
+        group_dimensions.append(dimension)
+        group_by_bodies.append({
+            "name": dimension["id"],
+            "format": fmt,
+            "primaryField": dimension.get("primaryField") or None,
+            "property": "teams" if dimension.get("fieldType") == "ENTITY_FIELDS" else None,
+        })
+    dimension = group_dimensions[0]  # metrics come from the first dimension (Form.tsx getMetricsFor)
+    dimension_ids = [d["id"] for d in group_dimensions]
+    # A child field (pipelineStage, activities, ...) may not come before its parent (ReportDimensions.tsx
+    # isDimensionOptionDisabled / handleChange).
+    for i, dim_id in enumerate(dimension_ids):
+        parent = _RELATED_FIELD_PARENT.get(dim_id)
+        if parent in dimension_ids:
+            _require(dimension_ids.index(parent) < i,
+                     f"'{parent}' must come before '{dim_id}' in group_by (parent before child).")
+    if entity == "task":
+        associated = [d for d in dimension_ids if d in _TASK_ASSOCIATED_FILTERS]
+        _require(len(associated) <= 1,
+                 f"Task reports allow only one associated-entity dimension at a time; got {', '.join(associated)}.")
+
+    # --- Metrics ---
+    raw_metrics = payload.get("metrics")
+    _require(isinstance(raw_metrics, list) and raw_metrics, "metrics is required: a list like [{\"type\": \"COUNT\", \"field\": \"id\"}].")
+    if goal_report:
+        # The goal's own metric, as-is (the web app copies it without checking the dimension's list).
+        available = [{"type": str(m.get("type") or "").upper(), "field": m.get("field")} for m in raw_metrics]
+    else:
+        available = None
+    available = available if available is not None else metrics_for_dimension(dimension)
+    valid_metrics = ", ".join("%s %s" % (a.get("type"), a.get("field")) for a in available)
+    metrics_body = []
+    for i, m in enumerate(raw_metrics):
+        _require(isinstance(m, dict), f"metrics[{i}] must be an object {{type, field}}.")
+        mtype = str(m.get("type") or "").upper()
+        match = next((a for a in available if a.get("type") == mtype and a.get("field") == m.get("field")), None)
+        _require(match is not None, f"metrics[{i}] {mtype} {m.get('field')} is not available for dimension "
+                 f"'{dimension['id']}'. Valid: {valid_metrics}.")
+        _require({"type": mtype, "field": match["field"]} not in metrics_body, f"metrics[{i}] is a duplicate.")
+        metrics_body.append({"type": mtype, "field": match["field"]})
+
+    # --- Chart type ---
+    funnel_color = None
+    if goal_report:
+        if requested_chart and requested_chart != "donut":
+            notes.append(f"chart_type '{requested_chart}' replaced by 'donut' — goal reports always use it.")
+        chart_type = "donut"
+    elif hierarchy:
+        _require(len(metrics_body) <= _HIERARCHY_MAX_METRICS,
+                 f"HIERARCHY reports take at most {_HIERARCHY_MAX_METRICS} metrics.")
+        if requested_chart and requested_chart != "hierarchy":
+            notes.append(f"chart_type '{requested_chart}' replaced by 'hierarchy' — HIERARCHY reports always use it.")
+        chart_type = "hierarchy"
+    elif funnel:
+        chart_type = "funnel"
+        color = str(payload.get("funnel_color") or _FUNNEL_THEME_COLORS[0]).strip().upper()
+        _require(color in _FUNNEL_THEME_COLORS, f"funnel_color must be one of: {', '.join(_FUNNEL_THEME_COLORS)}.")
+        funnel_color = color
+    else:
+        chart_type = requested_chart or "bar"
+        allowed_charts = _MULTI_DIMENSIONAL_CHART_TYPES if multi else _CHART_TYPES
+        _require(chart_type in allowed_charts, f"chart_type must be one of: {', '.join(allowed_charts)}"
+                 f"{' for MULTI_DIMENSIONAL reports' if multi else ''}"
+                 f"{' (funnel too, for lead and deal)' if not multi and entity in _FUNNEL_ENTITIES else ''}.")
+        if len(metrics_body) > 1 and chart_type != "table":
+            notes.append(f"chart_type changed from '{chart_type}' to 'table' — reports with more than one metric can only be tables.")
+            chart_type = "table"
+
+    # --- Date range ---
+    date_range = payload.get("date_range")
+    _require(isinstance(date_range, dict) and date_range.get("field") and date_range.get("operator"),
+             "date_range {field, operator} is required, e.g. {\"field\": \"createdAt\", \"operator\": \"current_month\"}.")
+    date_field = _find(filters, date_range["field"])
+    _require(date_field is not None and date_field.get("fieldType") in _DATE_FIELD_TYPES,
+             f"date_range.field '{date_range['field']}' is not a date field of {entity}. Valid: "
+             f"{', '.join(f.get('id') for f in filters if f.get('fieldType') in _DATE_FIELD_TYPES)}.")
+    dr_operator = str(date_range["operator"]).strip().lower()
+    dr_parts = _date_rule_parts(entity, date_field, dr_operator, date_range.get("value"), date_range,
+                                timezone, tenant_currency, "date_range")
+    date_range_body = {
+        "id": date_field["id"],
+        "field": date_field["id"],
+        "operator": dr_operator,
+        "type": "date",
+        "fieldInputType": date_field.get("fieldType"),
+        **dr_parts,
+    }
+
+    # --- Filters ---
+    raw_filters = payload.get("filters") or []
+    _require(isinstance(raw_filters, list), "filters must be a list of {field, operator, value}.")
+    rules = []
+    used = set()
+    for i, spec in enumerate(raw_filters):
+        label = f"filters[{i}]"
+        _require(isinstance(spec, dict) and spec.get("field") and spec.get("operator"), f"{label} needs field and operator.")
+        flt = _find(filters, spec["field"])
+        _require(flt is not None, f"{label}: '{spec['field']}' is not a filter of {entity}.")
+        label = f"{label} ('{flt['id']}')"
+        _require(all(g["id"] != flt["id"] for g in goal_filter_rules),
+                 f"{label}: this filter is set by the goal and can't be changed.")
+        _require(flt["id"] != date_field["id"], f"{label}: this field is already the date_range field; it cannot also be a filter.")
+        _require(flt["id"] not in used, f"{label}: each field can be filtered only once.")
+        used.add(flt["id"])
+        supported, _resolver = filter_support(flt, entity)
+        _require(supported, f"{label}: filtering on this field is not supported for reports created here.")
+        operator = str(spec["operator"]).strip().lower()
+        if flt.get("fieldType") in _DATE_FIELD_TYPES:
+            parts = _date_rule_parts(entity, flt, operator, spec.get("value"), spec, timezone, tenant_currency, label)
+        else:
+            allowed = filter_operators_for(entity, flt, tenant_currency)
+            _require(operator in allowed, f"{label}: operator '{operator}' not allowed. Allowed: {', '.join(allowed)}.")
+            parts = {"value": _rule_value(entity, flt, operator, spec.get("value"), label)}
+        rules.append({
+            "operator": operator,
+            "id": flt["id"],
+            "field": flt["id"],
+            "fieldInputType": flt.get("fieldType"),
+            "type": rule_type_for(flt),
+            "value": parts.get("value"),
+            "from": parts.get("from"),
+            "to": parts.get("to"),
+            # sd-report applies a team filter only with property "teams" + its primaryField.
+            "property": "teams" if flt.get("fieldType") == "ENTITY_FIELDS" else None,
+            "primaryField": flt.get("primaryField") or None,
+        })
+
+    if goal_filter_rules:
+        rules = goal_filter_rules + rules
+        used.update(g["id"] for g in goal_filter_rules)
+
+    # --- Team ("…Fields") filters: their user field must be "is set" (ReportFilters.tsx:183-216) ---
+    for rule in [r for r in rules if r["fieldInputType"] == "ENTITY_FIELDS"]:
+        primary = rule["primaryField"]
+        existing = next((r for r in rules if r["id"] == primary), None)
+        if existing is None:
+            primary_filter = _find(filters, primary)
+            _require(primary_filter is not None, f"Filter '{rule['id']}' needs filter '{primary}', which is not available.")
+            rules.append({
+                "operator": "is_not_null", "id": primary, "field": primary,
+                "fieldInputType": primary_filter.get("fieldType"), "type": rule_type_for(primary_filter),
+                "value": None, "from": None, "to": None, "property": None,
+                "primaryField": primary_filter.get("primaryField") or None,
+            })
+            used.add(primary)
+            notes.append(f"Added filter '{primary} is_not_null', required by the team filter '{rule['id']}'.")
+        elif existing["operator"] != "is_not_null":
+            existing.update({"operator": "is_not_null", "value": None})
+            notes.append(f"Filter '{primary}' changed to is_not_null — the web app forces this when the "
+                         f"team filter '{rule['id']}' is used.")
+
+    # --- Required filters (dimension + filter dependencies) ---
+    for position, dim in enumerate(group_dimensions):
+        if dim.get("fieldType") == "ENTITY_FIELDS":
+            primary = (dim.get("requiredFilters") or [dim.get("primaryField")])[0]
+            if primary and primary not in used:
+                primary_filter = _find(filters, primary)
+                _require(primary_filter is not None, f"Dimension '{dim['id']}' needs filter '{primary}', which is not available.")
+                rules.append({
+                    "operator": "is_not_null", "id": primary, "field": primary,
+                    "fieldInputType": primary_filter.get("fieldType"), "type": rule_type_for(primary_filter),
+                    "value": None, "from": None, "to": None, "property": None,
+                    "primaryField": primary_filter.get("primaryField") or None,
+                })
+                used.add(primary)
+                notes.append(f"Added filter '{primary} is_not_null', required when grouping by '{dim['id']}'.")
+            continue
+        for req in dim.get("requiredFilters") or []:
+            # No filter needed when the parent is an EARLIER dimension (ReportDimensions.tsx handleChange).
+            if req in dimension_ids[:position]:
+                continue
+            _require(req in used, f"Grouping by '{dim['id']}' requires a '{req}' filter — add it to filters"
+                     f"{' (or group by ' + repr(req) + ' before it)' if multi else ''}.")
+    for rule in list(rules):
+        flt = _find(filters, rule["id"])
+        parent = _RELATED_FIELD_PARENT.get(rule["id"])
+        for req in list((flt or {}).get("requiredFilters") or []) + ([parent] if parent else []):
+            _require(req in used, f"Filter '{rule['id']}' requires a '{req}' filter — add it to filters.")
+    pipeline_rule = next((r for r in rules if r["id"] == "pipeline"), None)
+    if pipeline_rule and any(_RELATED_FIELD_PARENT.get(r["id"]) == "pipeline" for r in rules):
+        _require(pipeline_rule["operator"] in ("equal", "in"),
+                 "When filtering on a pipeline stage/reason, the 'pipeline' filter must use 'equal' or 'in'.")
+    campaign_rule = next((r for r in rules if r["id"] == "campaignActivities"), None)
+    if campaign_rule and any(r["id"] == "activities" for r in rules):
+        _require(campaign_rule["operator"] == "equal",
+                 "When filtering on campaign activities, the 'campaignActivities' filter must use 'equal' (one campaign).")
+    if entity == "task":
+        associated = [r["id"] for r in rules if r["id"] in _TASK_ASSOCIATED_FILTERS]
+        _require(len(associated) <= 1,
+                 f"Task reports allow only one associated-entity filter at a time; got {', '.join(associated)}.")
+    if funnel:
+        # sd-report validatePipelineFilterForFunnelReport: one pipeline, operator equal.
+        _require(pipeline_rule is not None and pipeline_rule["operator"] == "equal" and not isinstance(pipeline_rule["value"], list),
+                 "Funnel reports need exactly one pipeline: add filter {field: pipeline, operator: equal, value: <pipeline id>} "
+                 "(resolve it with pipeline.lookup).")
+
+    prorated = False
+    if goal_report:
+        prorated = payload.get("prorated", True) is not False
+        if prorated:
+            # Form.tsx isProratedOptionDisabled
+            frequency_days = _GOAL_FREQUENCY_DAYS.get((goal.get("frequency") or {}).get("type"))
+            range_days = _RANGE_DAYS.get(dr_operator)
+            if dr_operator == "between" and isinstance(date_range_body.get("value"), list):
+                start_dt, end_dt = (dateutil_parser.isoparse(v) for v in date_range_body["value"])
+                range_days = (end_dt - start_dt).days
+            if dr_operator in ("before_current_date_and_time", "after_current_date_and_time"):
+                prorated = False
+                notes.append("prorated turned off — not available for before/after current date ranges.")
+            elif frequency_days and range_days and range_days > frequency_days:
+                prorated = False
+                notes.append("prorated turned off — the date range is longer than the goal's frequency.")
+
+    body = {
+        "name": name.strip(),
+        "description": description,
+        "prorated": prorated,
+        "goal": {"id": goal["id"], "name": goal.get("name")} if goal_report else None,
+        "config": {
+            "groupBy": group_by_bodies,
+            "metrics": metrics_body,
+            "dateRange": date_range_body,
+            "rules": rules,
+            **({"colorCodes": [dict(b) for b in _GOAL_COLOR_BANDS]} if goal_report else {}),
+        },
+        "reportType": entity,
+        "chartType": chart_type,
+        "category": category,
+    }
+    if funnel_color:
+        body["funnelColor"] = funnel_color  # top level, not config.colorCodes (service.ts saveReport)
+    return body, notes
+
+
+def _is_user_dimension(dimension: Dict[str, Any]) -> bool:
+    return dimension.get("fieldType") == "LOOK_UP" and ((dimension.get("lookup") or {}).get("entity") or "").upper() == "USER"
+
+
+# ---------------------------------------------------------------------------
+# Entry points used by build_payload / execute_request
+# ---------------------------------------------------------------------------
+
+async def _check_entity_permission(entity: str) -> Optional[str]:
+    """Return an error message when the user cannot report on `entity`; None when allowed
+    or when permissions could not be fetched (Kylas then enforces it on save)."""
+    try:
+        permissions = await _fetch_report_permissions()
+    except KylasAPIError as e:
+        logger.warning("Could not fetch permissions for report checks: %s", e.message)
+        return None
+    readable = readable_report_entities(permissions)
+    if entity not in readable:
+        return (f"You don't have permission to report on '{entity}'. "
+                f"Entities you can report on: {', '.join(readable) or 'none'}.")
+    return None
+
+
+async def build_report_reference(entity: Any, requested_picklists: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Live part of build_payload("report.create", entity=...): permission check + config cheat sheet."""
+    _reset_api_call_count()
+    entity = normalize_report_entity(entity)
+    denied = await _check_entity_permission(entity)
+    if denied:
+        raise ValueError(denied)
+    config = await _fetch_report_config(entity)
+    tenant_currency = await _fetch_tenant_currency()
+    requested = {n.strip().lower() for n in (requested_picklists or []) if isinstance(n, str)}
+    return {
+        "entity": entity,
+        "tenant_currency": tenant_currency,
+        "tenant_fields_reference": get_report_config_instructions_logic(entity, config, requested, tenant_currency),
+    }
+
+
+async def create_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """report.create: validate + expand the short payload, then POST /v3/reports."""
+    _reset_api_call_count()
+    entity = normalize_report_entity((payload or {}).get("entity"))
+
+    try:
+        permissions = await _fetch_report_permissions()
+    except KylasAPIError as e:
+        logger.warning("Could not fetch permissions for report create: %s", e.message)
+        permissions = None
+    if permissions is not None:
+        _require(can_create_report(permissions), "You don't have permission to create reports.")
+        readable = readable_report_entities(permissions)
+        _require(entity in readable, f"You don't have permission to report on '{entity}'. "
+                 f"Entities you can report on: {', '.join(readable) or 'none'}.")
+
+    config = await _fetch_report_config(entity)
+    tenant_currency = await _fetch_tenant_currency()
+    user = await _fetch_current_user()
+    user_timezone = (user or {}).get("timezone")
+    timezone = user_timezone or DEFAULT_TIMEZONE
+
+    goal = await _goal_for_payload(payload)
+    body, notes = build_report_body(payload, config, timezone, tenant_currency, goal)
+    if not user_timezone:
+        notes.append(f"Your profile has no timezone, so date ranges were interpreted in {DEFAULT_TIMEZONE}.")
+
+    async with get_client() as client:
+        response = await client.post("/v3/reports", json=body)
+        created = await handle_api_response(response, "Create report")
+
+    result = {
+        "id": (created or {}).get("id"),
+        "name": body["name"],
+        "reportType": body["reportType"],
+        "chartType": body["chartType"],
+        "category": body["category"],
+    }
+    if notes:
+        result["notes"] = notes
+    return result
+
+
+# ---------------------------------------------------------------------------
+# report.preview — run the report WITHOUT saving it (sd-ui "Generate Preview")
+# ---------------------------------------------------------------------------
+
+# sd-ui models/Report.ts MONEY_FIELDS — metrics shown in the tenant currency.
+_MONEY_FIELDS = {"actualValue", "estimatedValue", "annualRevenue", "requirementBudget",
+                 "companyAnnualRevenue", "price", "grandTotal", "subTotal"}
+_METRIC_LABEL_PREFIX = {"COUNT": "Number", "SUM": "Sum", "AVERAGE": "Average"}
+# ReportBuilder.tsx:170 — the builder preview sends baseCurrencyId for these entities only
+# (sd-report's /companies run endpoint requires it).
+_BASE_CURRENCY_ENTITIES = {"deal", "company"}
+_PREVIEW_MAX_ROWS = 200
+_PREVIEW_PLACEHOLDER_NAME = "Report preview"
+
+# Same short payload as report.create; name is optional because nothing is saved.
+REPORT_PREVIEW_SCHEMA: Dict[str, Any] = {
+    **REPORT_CREATE_SCHEMA,
+    "required": [k for k in REPORT_CREATE_SCHEMA["required"] if k != "name"],
+}
+
+
+async def _fetch_base_currency_id(tenant_currency: Optional[str]) -> Optional[int]:
+    """GET /v1/picklists/standard -> CURRENCY entry whose name is the tenant currency
+    (sd-ui baseCurrencyIdSelector). None when it can't be resolved."""
+    if not tenant_currency:
+        return None
+    try:
+        async with get_client() as client:
+            response = await client.get("/v1/picklists/standard")
+            data = await handle_api_response(response, "Fetch standard picklists")
+    except KylasAPIError as e:
+        logger.warning("Could not fetch standard picklists for base currency: %s", e.message)
+        return None
+    match = next((c for c in (data or {}).get("CURRENCY") or [] if c.get("name") == tenant_currency), None)
+    return match.get("id") if match else None
+
+
+def _metric_label(entity: str, metric: Dict[str, Any], dimension: Dict[str, Any]) -> str:
+    """sd-ui getMetricLabelByFieldAndType: "Number of Leads", "Sum of Budget", ..."""
+    if (metric["type"], metric["field"]) == ("COUNT", "id"):
+        return f"Number of {_REPORT_ENTITY_PLURAL[entity].capitalize()}"
+    header = next((m.get("header") for m in dimension.get("supportedMetrics") or []
+                   if m.get("type") == metric["type"] and m.get("field") == metric["field"]), None)
+    return f"{_METRIC_LABEL_PREFIX.get(metric['type'], metric['type'].title())} of {header or metric['field']}"
+
+
+def _group_label(dimension: Dict[str, Any], group_by: Dict[str, Any]) -> str:
+    label = dimension.get("header") or dimension.get("id")
+    if group_by.get("format"):
+        label += f" ({group_by['format'].replace('_', ' ').title()})"
+    if group_by.get("property"):
+        label += f" ({group_by['property'].title()})"
+    return label
+
+
+def _clean_number(value: Any) -> Any:
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else round(value, 2)
+    return value
+
+
+def _flatten_records(records: List[Dict[str, Any]], depth: int) -> List[Tuple[List[Any], List[Any]]]:
+    """Nested AggregateRecords (parents carry empty values, leaves the numbers — sd-report
+    MULTI_DIMENSIONAL shape) -> [(group names per level, leaf values)]."""
+    flat: List[Tuple[List[Any], List[Any]]] = []
+    for record in records or []:
+        name = record.get("name") if record.get("name") is not None else "Not Available"
+        children = record.get("dimensions") or []
+        if depth > 1 and children:
+            for names, values in _flatten_records(children, depth - 1):
+                flat.append(([name] + names, values))
+        else:
+            flat.append(([name] + ["Not Available"] * (depth - 1), record.get("values") or []))
+    return flat
+
+
+def format_preview_rows(
+    entity: str, body: Dict[str, Any], dimensions: Any, records: List[Dict[str, Any]],
+    tenant_currency: Optional[str] = None,
+) -> Dict[str, Any]:
+    """AggregateRecord list -> labelled table, like the web app's preview (ReportDataProcessing.ts):
+    one column per group-by level, the empty group reads "Not Available", money metrics carry the
+    tenant currency. Multi-dimensional results are flattened, with subtotals per first-level group."""
+    config = body["config"]
+    metrics = config["metrics"]
+    dims = dimensions if isinstance(dimensions, list) else [dimensions]
+    dims = dims + [{} for _ in range(len(config["groupBy"]) - len(dims))]
+    group_labels = [_group_label(d or {"header": gb["name"]}, gb) for d, gb in zip(dims, config["groupBy"])]
+    metric_labels = [_metric_label(entity, m, dims[0] or {}) for m in metrics]
+    multi = len(group_labels) > 1
+
+    rows = []
+    for names, values in _flatten_records(records, len(group_labels)):
+        row = dict(zip(group_labels, names))
+        for i, label in enumerate(metric_labels):
+            row[label] = _clean_number(values[i]) if i < len(values) else None
+        rows.append(row)
+
+    summable = [(m, label) for m, label in zip(metrics, metric_labels) if m["type"] in ("COUNT", "SUM")]
+    totals = {label: _clean_number(sum(r[label] or 0 for r in rows)) for _m, label in summable}
+
+    result: Dict[str, Any] = {"columns": group_labels + metric_labels}
+    first = metric_labels[0] if metrics and metrics[0]["type"] in ("COUNT", "SUM") else None
+    if not multi and first and totals.get(first):
+        for r in rows:
+            r["Share of total"] = f"{round(100 * (r[first] or 0) / totals[first], 1)}%"
+        result["columns"].append("Share of total")
+    result.update({"rows": rows[:_PREVIEW_MAX_ROWS], "total_groups": len(rows), "totals": totals})
+    if multi and summable:
+        subtotals: Dict[Any, Dict[str, Any]] = {}
+        for r in rows:
+            entry = subtotals.setdefault(r[group_labels[0]], {group_labels[0]: r[group_labels[0]]})
+            for _m, label in summable:
+                entry[label] = _clean_number((entry.get(label) or 0) + (r[label] or 0))
+        result["subtotals"] = list(subtotals.values())
+    money = [label for m, label in zip(metrics, metric_labels) if m["field"] in _MONEY_FIELDS]
+    if money and tenant_currency:
+        result["currency"] = f"{', '.join(money)} in {tenant_currency}"
+    if len(rows) > _PREVIEW_MAX_ROWS:
+        result["truncated"] = f"Showing the first {_PREVIEW_MAX_ROWS} of {len(rows)} rows."
+    return result
+
+
+async def _goal_for_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """GOALS_VS_ACHIEVEMENT: fetch the goal named by goal_id (GET /v1/reports/goals/{id})."""
+    if str((payload or {}).get("category") or "").upper() != "GOALS_VS_ACHIEVEMENT":
+        return None
+    goal_id = (payload or {}).get("goal_id")
+    _require(goal_id is not None and str(goal_id).strip().isdigit(),
+             "GOALS_VS_ACHIEVEMENT needs goal_id (a number) — find it with goal.lookup.")
+    return await get_goal_details_raw(int(goal_id))
+
+
+def _goal_band(percentage: float) -> str:
+    """Which default colour band a % falls in (Donut.tsx colour rules)."""
+    if percentage < 25:
+        return "below 25% (red)"
+    if percentage < 50:
+        return "25-50% (orange)"
+    if percentage < 75:
+        return "50-75% (yellow)"
+    return "75%+ (green)"
+
+
+def format_goal_rows(body: Dict[str, Any], goal: Dict[str, Any], data: Any,
+                     group_dimensions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Goal run result {result:[{id,name,value:[{achieved,goal,percentage}]}], goalSummary} -> table."""
+    data = data if isinstance(data, dict) else {}
+    group_label = ((group_dimensions or [{}])[0] or {}).get("header") or (goal.get("dimension") or {}).get("header") or "Group"
+    rows = []
+    for item in data.get("result") or []:
+        v = (item.get("value") or [{}])[0] or {}
+        pct = _clean_number(round(float(v.get("percentage") or 0), 2))
+        rows.append({group_label: item.get("name") or "Not Available",
+                     "Achieved": _clean_number(v.get("achieved")), "Goal": _clean_number(v.get("goal")),
+                     "% achieved": f"{pct}%", "Band": _goal_band(float(pct))})
+    summary = data.get("goalSummary") or {}
+    total_pct = _clean_number(round(float(summary.get("percentage") or 0), 2))
+    return {
+        "goal": {"id": goal.get("id"), "name": goal.get("name"),
+                 "frequency": (goal.get("frequency") or {}).get("header"), "prorated": body["prorated"]},
+        "columns": [group_label, "Achieved", "Goal", "% achieved", "Band"],
+        "rows": rows[:_PREVIEW_MAX_ROWS],
+        "total_groups": len(rows),
+        "totals": {"Achieved": _clean_number(summary.get("achieved")), "Goal": _clean_number(summary.get("goal")),
+                   "% achieved": f"{total_pct}%", "Band": _goal_band(float(total_pct))},
+        "how_to_read": ("Achieved vs goal per row; % achieved = achieved / goal. With prorated on, goals are "
+                        "scaled down to the part of the goal period covered by the date range."),
+    }
+
+
+_FUNNEL_OUTCOMES = {"OPEN": "Open", "CLOSED_WON": "Won", "CLOSED_LOST": "Lost", "CLOSED_UNQUALIFIED": "Unqualified"}
+
+
+def format_funnel_rows(entity: str, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Funnel run result [{name, values:[visited, skipped], recordDetails.forecastingType}] -> stage table
+    (FunnelChart.tsx): open stages show visited/skipped; closed stages (won/lost/unqualified) show their
+    count (visited + skipped) as a % of everything that entered the first stage."""
+    label = _REPORT_ENTITY_PLURAL[entity].capitalize()
+    entered = 0
+    if records:
+        first = records[0].get("values") or [0, 0]
+        entered = (first[0] or 0) + ((first[1] if len(first) > 1 else 0) or 0)
+    rows = []
+    for record in records or []:
+        values = record.get("values") or [0, 0]
+        visited = _clean_number(values[0] if values else 0) or 0
+        skipped = _clean_number(values[1] if len(values) > 1 else 0) or 0
+        outcome = _FUNNEL_OUTCOMES.get(((record.get("recordDetails") or {}).get("forecastingType") or "OPEN"), "Open")
+        row = {"Stage": record.get("name") or "Not Available", "Outcome": outcome,
+               f"{label} visited": visited, f"{label} skipped": skipped}
+        if outcome != "Open":
+            row["% of entered"] = f"{round(100 * (visited + skipped) / entered, 1)}%" if entered else "0%"
+        rows.append(row)
+    return {
+        "columns": ["Stage", "Outcome", f"{label} visited", f"{label} skipped", "% of entered"],
+        "rows": rows,
+        "total_groups": len(rows),
+        "totals": {f"{label} entering the funnel": entered},
+        "how_to_read": ("Stages are in pipeline order. 'visited' = records that reached the stage; 'skipped' = "
+                        "records that jumped past it. Closed stages show their share of everything that entered."),
+    }
+
+
+def format_hierarchy_rows(entity: str, body: Dict[str, Any], dimension: Dict[str, Any],
+                          records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Hierarchy run result (flat users with reportingManagers + values) -> per-user Self / Reportees /
+    Total, rolled up through the reporting tree like HierarchyChart (calculateHierarchyReportValues)."""
+    metrics = body["config"]["metrics"]
+    metric_labels = [_metric_label(entity, m, dimension or {}) for m in metrics]
+    users = {r.get("id"): r for r in records or [] if r.get("id") is not None}
+    children: Dict[Any, set] = {uid: set() for uid in users}
+    for uid, user in users.items():
+        for manager in user.get("reportingManagers") or []:
+            if manager.get("id") in children:
+                children[manager["id"]].add(uid)
+
+    def own(uid):
+        values = users[uid].get("values") or []
+        return [(_clean_number(values[i]) if i < len(values) else 0) or 0 for i in range(len(metrics))]
+
+    def descendants(uid, seen=None):
+        seen = set() if seen is None else seen
+        for child in children.get(uid, ()):
+            if child not in seen:
+                seen.add(child)
+                descendants(child, seen)
+        return seen
+
+    rows = []
+    for uid, user in users.items():
+        self_values = own(uid)
+        team = descendants(uid) - {uid}
+        reportee_values = [sum(own(d)[i] for d in team) for i in range(len(metrics))]
+        row = {"User": user.get("name") or str(uid),
+               "Reports to": ", ".join(m.get("name") or str(m.get("id")) for m in user.get("reportingManagers") or []) or "—"}
+        if user.get("active") is False:
+            row["User"] += " (inactive)"
+        for i, label in enumerate(metric_labels):
+            row[f"{label} (self)"] = _clean_number(self_values[i])
+            row[f"{label} (reportees)"] = _clean_number(reportee_values[i])
+            row[f"{label} (total)"] = _clean_number(self_values[i] + reportee_values[i])
+        rows.append(row)
+    rows.sort(key=lambda r: (r["Reports to"] != "—", r["User"]))
+    columns = ["User", "Reports to"] + [f"{l} ({k})" for l in metric_labels for k in ("self", "reportees", "total")]
+    summable = [l for m, l in zip(metrics, metric_labels) if m["type"] in ("COUNT", "SUM")]
+    totals = {l: _clean_number(sum(r[f"{l} (self)"] or 0 for r in rows)) for l in summable}
+    return {
+        "columns": columns,
+        "rows": rows[:_PREVIEW_MAX_ROWS],
+        "total_groups": len(rows),
+        "totals": totals,
+        "how_to_read": ("One row per user in the reporting hierarchy. 'self' = the user's own records, "
+                        "'reportees' = everyone who reports to them (directly or indirectly), 'total' = both."),
+    }
+
+
+def _format_preview(entity, body, group_dimensions, records, tenant_currency):
+    if body["chartType"] == "funnel":
+        return format_funnel_rows(entity, records)
+    if body["category"] == "HIERARCHY":
+        return format_hierarchy_rows(entity, body, (group_dimensions or [{}])[0], records)
+    return format_preview_rows(entity, body, group_dimensions, records, tenant_currency)
+
+
+async def preview_report_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """report.preview: validate + expand the same short payload as report.create, run it with
+    POST /v3/reports/{entityPlural} (nothing is saved) and return a labelled table."""
+    _reset_api_call_count()
+    payload = dict(payload or {})
+    entity = normalize_report_entity(payload.get("entity"))
+    if not str(payload.get("name") or "").strip():
+        payload["name"] = _PREVIEW_PLACEHOLDER_NAME
+
+    denied = await _check_entity_permission(entity)
+    _require(denied is None, denied or "")
+
+    config = await _fetch_report_config(entity)
+    tenant_currency = await _fetch_tenant_currency()
+    user = await _fetch_current_user()
+    user_timezone = (user or {}).get("timezone")
+    timezone = user_timezone or DEFAULT_TIMEZONE
+
+    goal = await _goal_for_payload(payload)
+    body, notes = build_report_body(payload, config, timezone, tenant_currency, goal)
+    if not user_timezone:
+        notes.append(f"Your profile has no timezone, so date ranges were interpreted in {DEFAULT_TIMEZONE}.")
+
+    params: Dict[str, Any] = {"timezone": timezone}
+    if entity in _BASE_CURRENCY_ENTITIES:
+        base_currency_id = await _fetch_base_currency_id(tenant_currency)
+        if base_currency_id is not None:
+            params["baseCurrencyId"] = base_currency_id
+        else:
+            _require(entity != "company", "Could not resolve the tenant's base currency, which company reports need.")
+
+    run_body = dict(body["config"], category=body["category"])
+    if body["chartType"] == "funnel":
+        run_body["chartType"] = "FUNNEL"
+    if goal:
+        # Goal runs: POST /v1/reports/{entity}/goals/{id}?timezone&prorated (service.ts generateReport goal branch);
+        # sd-report ignores baseCurrencyId there.
+        goal_params = {"timezone": timezone, "prorated": str(body["prorated"]).lower()}
+        async with get_client() as client:
+            response = await client.post(f"/v1/reports/{_REPORT_ENTITY_PLURAL[entity]}/goals/{goal['id']}",
+                                         params=goal_params, json=run_body)
+            records = await handle_api_response(response, "Preview goal report")
+    else:
+        async with get_client() as client:
+            response = await client.post(f"/v3/reports/{_REPORT_ENTITY_PLURAL[entity]}", params=params, json=run_body)
+            records = await handle_api_response(response, "Preview report")
+
+    usable_dimensions = [d for d in config.get("dimensions") or [] if _usable(d)]
+    group_dimensions = [_find(usable_dimensions, gb["name"]) or {} for gb in body["config"]["groupBy"]]
+    result = {
+        "saved": False,
+        "message": ("Preview only — nothing was saved. To save it, call report.create with the same payload "
+                    "(and a proper name ending in \" (Made by MCP)\")."),
+        "entity": entity,
+        "chart_type": body["chartType"],
+        "date_range": {k: body["config"]["dateRange"].get(k) for k in ("field", "operator", "value") if body["config"]["dateRange"].get(k) is not None},
+        "filters_applied": len(body["config"]["rules"]),
+        **(format_goal_rows(body, goal, records, group_dimensions) if goal else
+           _format_preview(entity, body, group_dimensions, records if isinstance(records, list) else [], tenant_currency)),
+    }
+    if notes:
+        result["notes"] = notes
+    return result
