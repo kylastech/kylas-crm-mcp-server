@@ -1,0 +1,29 @@
+# registry/note.yaml
+#
+# Registry entries for the "note" bucket.
+#
+# ARCHITECTURE — what lives here vs. what lives in app/tools.py
+# ---------------------------------------------------------------------------
+# Each entry below is static operation metadata and LLM-facing guidance only:
+# id, bucket, intent, method, path, dynamic_fields, description, usage_notes,
+# example. There is deliberately no "schema:" block for the request/input
+# shape — that is resolved at runtime by build_payload from the original tool
+# parameter snapshots in _ORIGINAL_TOOL_PARAMETERS ("add_note").
+
+- id: note.create
+  bucket: note
+  intent: create
+  method: POST
+  path: /v1/notes/relation
+  dynamic_fields: false
+  description: "Add a note to a lead, contact, deal, company, meeting, call log, or task."
+  usage_notes: >
+    Add a note to an existing CRM record (lead, contact, deal, company, meeting, call log, or task).
+
+    entity_type: The target entity type to attach the note to ("lead", "contact", "deal", "company", "meeting", "call_log", or "task"). Case-insensitive.
+    entity_id: The integer ID of the target entity (e.g. lead ID, contact ID, deal ID, company ID, meeting ID, call log ID, task ID).
+    note_text: The note content to add (supports basic text or HTML formatting).
+  example:
+    entity_type: "lead"
+    entity_id: 12345
+    note_text: "Spoke with client regarding the renewal proposal."
