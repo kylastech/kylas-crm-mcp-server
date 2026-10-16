@@ -25,6 +25,7 @@ buckets:
   - company
   - quotation
   - report
+  - note
   - _meta
 
 intents:
@@ -36,3 +37,6 @@ intents:
   - update
   - lookup
   - preview
+  - cancel
+  - delete
+
