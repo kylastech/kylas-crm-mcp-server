@@ -202,7 +202,7 @@ Not every bucket has every intent:
   - call_log: search, create, update, lookup (call_log.by_entity — no get, no search_by_term, no search_idle)
   - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
   - report: create, preview (report.create saves a report; report.preview shows its numbers without saving; build_payload needs entity="<entity>")
-  - note: create (note.create — add notes to lead, contact, deal, company, meeting, call_log)
+  - note: create (note.create — add notes to lead, contact, deal, company, meeting, call_log, task)
   - _meta: lookup only (user.lookup, product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
     team.lookup, campaign.lookup, campaign.activities,
     goal.lookup, goal.details)

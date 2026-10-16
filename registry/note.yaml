@@ -16,12 +16,12 @@
   method: POST
   path: /v1/notes/relation
   dynamic_fields: false
-  description: "Add a note to a lead, contact, deal, company, meeting, or call log."
+  description: "Add a note to a lead, contact, deal, company, meeting, call log, or task."
   usage_notes: >
-    Add a note to an existing CRM record (lead, contact, deal, company, meeting, or call log).
+    Add a note to an existing CRM record (lead, contact, deal, company, meeting, call log, or task).
 
-    entity_type: The target entity type to attach the note to ("lead", "contact", "deal", "company", "meeting", or "call_log"). Case-insensitive.
-    entity_id: The integer ID of the target entity (e.g. lead ID, contact ID, deal ID, company ID, meeting ID, call log ID).
+    entity_type: The target entity type to attach the note to ("lead", "contact", "deal", "company", "meeting", "call_log", or "task"). Case-insensitive.
+    entity_id: The integer ID of the target entity (e.g. lead ID, contact ID, deal ID, company ID, meeting ID, call log ID, task ID).
     note_text: The note content to add (supports basic text or HTML formatting).
   example:
     entity_type: "lead"

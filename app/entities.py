@@ -4281,15 +4281,15 @@ async def search_call_logs_logic(
 
 async def create_note_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Add a note to a Lead, Contact, Deal, Company, Meeting, or Call Log.
+    Add a note to a Lead, Contact, Deal, Company, Meeting, Call Log, or Task.
     Expects field_values with:
-      - entity_type: str ("LEAD", "CONTACT", "DEAL", "COMPANY", "MEETING", "CALL_LOG")
+      - entity_type: str ("LEAD", "CONTACT", "DEAL", "COMPANY", "MEETING", "CALL_LOG", "TASK")
       - entity_id: int
       - note_text: str (or description)
     """
     raw_entity_type = field_values.get("entity_type")
     entity_type_upper = (raw_entity_type or "").strip().upper()
-    valid_types = ["LEAD", "CONTACT", "DEAL", "COMPANY", "MEETING", "CALL_LOG"]
+    valid_types = ["LEAD", "CONTACT", "DEAL", "COMPANY", "MEETING", "CALL_LOG", "TASK"]
     if entity_type_upper not in valid_types:
         raise ValueError(f"Invalid entity_type: '{raw_entity_type}'. Must be one of: {', '.join(valid_types)}")
 
@@ -4330,10 +4330,10 @@ async def create_note_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
 @mcp.tool()
 async def add_note(entity_type: str, entity_id: int, note_text: str) -> str:
     """
-    Add a note to a Lead, Contact, Deal, Company, Meeting, or Call Log.
+    Add a note to a Lead, Contact, Deal, Company, Meeting, Call Log, or Task.
 
-    entity_type: The entity type ("LEAD", "CONTACT", "DEAL", "COMPANY", "MEETING", or "CALL_LOG").
-    entity_id: The ID of the entity (e.g. lead ID, contact ID, deal ID, company ID, meeting ID, call log ID).
+    entity_type: The entity type ("LEAD", "CONTACT", "DEAL", "COMPANY", "MEETING", "CALL_LOG", or "TASK").
+    entity_id: The ID of the entity (e.g. lead ID, contact ID, deal ID, company ID, meeting ID, call log ID, task ID).
     note_text: The note text to add (supports basic HTML formatting).
 
     Returns the note details if successful.
