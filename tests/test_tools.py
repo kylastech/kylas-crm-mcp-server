@@ -2126,6 +2126,150 @@ async def test_search_quotations_sort_validation():
         assert "sort" not in call_args2.kwargs["params"]
 
 
+# ---------------------------------------------------------------------------
+# Note & Meeting Cancel/Delete Registry Tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_tool_note_and_meeting_actions():
+    """Verify note.create, meeting.cancel, and meeting.delete appear in list_tool."""
+    from app.tools import list_tool
+
+    # note bucket
+    res = json.loads(list_tool(bucket="note"))
+    ids = [r["id"] for r in res["results"]]
+    assert "note.create" in ids
+
+    # meeting cancel and delete
+    cancel_res = json.loads(list_tool(bucket="meeting", intent="cancel"))
+    assert any(r["id"] == "meeting.cancel" for r in cancel_res["results"])
+
+    delete_res = json.loads(list_tool(bucket="meeting", intent="delete"))
+    assert any(r["id"] == "meeting.delete" for r in delete_res["results"])
+
+
+@pytest.mark.asyncio
+async def test_build_payload_note_and_meeting_actions():
+    """Verify build_payload generates correct schemas for note.create, meeting.cancel, meeting.delete."""
+    from app.tools import build_payload
+
+    # note.create
+    note_payload = json.loads(await build_payload("note.create"))
+    assert note_payload["id"] == "note.create"
+    assert note_payload["method"] == "POST"
+    assert note_payload["schema"]["required"] == ["entity_type", "entity_id", "note_text"]
+
+    # meeting.cancel
+    cancel_payload = json.loads(await build_payload("meeting.cancel"))
+    assert cancel_payload["id"] == "meeting.cancel"
+    assert cancel_payload["method"] == "POST"
+    assert cancel_payload["schema"]["required"] == ["meeting_id"]
+
+    # meeting.delete
+    delete_payload = json.loads(await build_payload("meeting.delete"))
+    assert delete_payload["id"] == "meeting.delete"
+    assert delete_payload["method"] == "DELETE"
+    assert delete_payload["schema"]["required"] == ["meeting_id"]
+
+
+@pytest.mark.asyncio
+async def test_execute_request_note_create():
+    """Verify execute_request successfully creates a note."""
+    from app.tools import execute_request
+
+    mock_client = AsyncMock()
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"id": 1234, "description": "<div>Followup notes</div>"}
+    mock_resp.raise_for_status = MagicMock()
+    mock_client.post.return_value = mock_resp
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+
+    with patch("app.entities.get_client", return_value=mock_client):
+        res_str = await execute_request("note.create", {
+            "entity_type": "lead",
+            "entity_id": 999,
+            "note_text": "Followup notes",
+        })
+        res = json.loads(res_str)
+        assert res["ok"] is True
+        assert res["status"] == 200
+        assert res["data"]["id"] == 1234
+
+        mock_client.post.assert_called_once()
+        call_url = mock_client.post.call_args[0][0]
+        call_json = mock_client.post.call_args[1]["json"]
+        assert call_url == "/v1/notes/relation"
+        assert call_json["targetEntityType"] == "LEAD"
+        assert call_json["targetEntityId"] == "999"
+        assert call_json["sourceEntity"]["description"] == "<div>Followup notes</div>"
+
+
+@pytest.mark.asyncio
+async def test_execute_request_note_create_validation():
+    """Verify execute_request rejects invalid note parameters with a proper error envelope."""
+    from app.tools import execute_request
+
+    # Invalid entity type
+    res_str = await execute_request("note.create", {
+        "entity_type": "invalid_entity",
+        "entity_id": 999,
+        "note_text": "text",
+    })
+    res = json.loads(res_str)
+    assert res["ok"] is False
+    assert "Invalid entity_type" in res["error"]["message"]
+
+    # Missing note text
+    res_str = await execute_request("note.create", {
+        "entity_type": "lead",
+        "entity_id": 999,
+        "note_text": "   ",
+    })
+    res = json.loads(res_str)
+    assert res["ok"] is False
+    assert "note_text cannot be empty" in res["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_execute_request_meeting_cancel_and_delete():
+    """Verify execute_request handles meeting.cancel and meeting.delete."""
+    from app.tools import execute_request
+
+    mock_client = AsyncMock()
+    mock_get_resp = MagicMock()
+    mock_get_resp.json.return_value = {"id": 888, "title": "Team Sync"}
+    mock_get_resp.raise_for_status = MagicMock()
+    mock_client.get.return_value = mock_get_resp
+
+    mock_post_resp = MagicMock()
+    mock_post_resp.json.return_value = {"id": 888, "status": "cancelled"}
+    mock_post_resp.raise_for_status = MagicMock()
+    mock_client.post.return_value = mock_post_resp
+
+    mock_del_resp = MagicMock()
+    mock_del_resp.json.return_value = {"success": True}
+    mock_del_resp.raise_for_status = MagicMock()
+    mock_client.delete.return_value = mock_del_resp
+
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+
+    with patch("app.entities.get_client", return_value=mock_client):
+        # Cancel meeting
+        cancel_res = json.loads(await execute_request("meeting.cancel", {"meeting_id": 888}))
+        assert cancel_res["ok"] is True
+        assert "cancelled successfully" in cancel_res["data"]
+        mock_client.post.assert_called_once_with("/v1/meetings/888/cancel", json={"id": 888, "title": "Team Sync"})
+
+        # Delete meeting
+        delete_res = json.loads(await execute_request("meeting.delete", {"meeting_id": 888}))
+        assert delete_res["ok"] is True
+        assert "deleted successfully" in delete_res["data"]
+        mock_client.delete.assert_called_once_with("/v1/meetings/888")
+
+
 if __name__ == "__main__":
     asyncio.run(run_manual_tests())
+
 
