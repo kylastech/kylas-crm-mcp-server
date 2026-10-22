@@ -24,16 +24,13 @@ from app.entities import (
     _fetch_meeting_fields,
     _fetch_quotation_fields,
     _fetch_task_fields,
-    cancel_meeting,
     create_call_log_logic,
     create_company_logic,
     create_contact_logic,
     create_deal_logic,
     create_lead_logic,
     create_meeting_logic,
-    create_note_logic,
     create_task_logic,
-    delete_meeting,
     get_call_log_field_instructions_logic,
     get_call_logs,
     get_company_field_instructions_logic,
@@ -237,10 +234,6 @@ _ENTITY_CRUD_CONFIG: Dict[str, Dict[str, Any]] = {
     "report": {
         "create_fn": create_report_logic,
         "name_fn": lambda r: r.get("name", "Report"),
-    },
-    "note": {
-        "create_fn": create_note_logic,
-        "name_fn": lambda r: f"Note for {r.get('targetEntityType', '')} {r.get('targetEntityId', '')}",
     },
 }
 
@@ -770,17 +763,17 @@ def list_tool(
 
     Registry contents right now (this will grow — always confirm here rather than
     assuming an id exists, since not every bucket has every intent):
-      buckets: lead, contact, deal, task, company, meeting, call_log, quotation, report, note, _meta
-      intents: get, search, search_by_term, search_idle, create, update, lookup, preview, cancel, delete
+      buckets: lead, contact, deal, task, company, meeting, call_log, quotation, report, _meta
+      intents: get, search, search_by_term, search_idle, create, update, lookup, preview
       (lead/deal/company have all of get/search/search_by_term/search_idle/
-      create/update; contact has the same 5 minus search_idle; meeting has
-      the same 5 plus cancel, delete, and lookup (meeting.lookup_related);
+      create/update; contact/meeting have the same 5 minus search_idle;
       task has get/search/search_by_term/create/update plus lookup
       (task.lookup_entity, task.search_any_relation), no search_idle;
       call_log has only search/create/update plus lookup (call_log.by_entity)
-      — no get, no search_by_term, no search_idle; note has create (note.create);
-      quotation is READ-ONLY — get/search/search_by_term/search_idle only, no create/update;
-      report has create and preview (report.create — creates and SAVES a real Kylas
+      — no get, no search_by_term, no search_idle; meeting also has lookup
+      (meeting.lookup_related) on top of its other 4; quotation is READ-ONLY
+      — get/search/search_by_term/search_idle only, no create/update; report
+      has create and preview (report.create — creates and SAVES a real Kylas
       report / chart; report.preview — runs the same report and returns its
       numbers WITHOUT saving; both need entity="<entity>" in build_payload); _meta
       is bucket-less and has lookup entries only (user.lookup,
@@ -1147,15 +1140,10 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
     elif entry["intent"] == "search_idle":
         schema = _real_idle_schema()
     elif entry["intent"] == "create":
-        if entry["bucket"] == "note":
-            schema = _real_get_schema("add_note")
-        else:
-            schema = _real_create_schema()
+        schema = _real_create_schema()
     elif entry["intent"] == "update":
         schema = _real_update_schema()
     elif entry["intent"] == "lookup":
-        schema = _real_get_schema(_REGISTRY_ID_TO_META_TOOL.get(id, ""))
-    elif entry["intent"] in ("cancel", "delete"):
         schema = _real_get_schema(_REGISTRY_ID_TO_META_TOOL.get(id, ""))
     elif entry["intent"] == "preview":
         schema = json.loads(json.dumps(REPORT_PREVIEW_SCHEMA))
@@ -1361,7 +1349,7 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
             result = await update_entity_logic(bucket, entity_id, update_payload)
         elif intent == "preview" and bucket == "report":
             result = await preview_report_logic(payload)
-        elif intent in ("lookup", "cancel", "delete"):
+        elif intent == "lookup":
             router = _META_LOOKUP_ROUTERS.get(id)
             if not router:
                 return json.dumps({
@@ -1512,7 +1500,6 @@ for _name in (
     "parse_datetime_to_utc_iso_tool", "search_tasks_with_any_relation",
     "lookup_teams", "lookup_campaigns", "get_campaign_activities",
     "lookup_goals", "get_goal_details",
-    "add_note", "cancel_meeting", "delete_meeting",
 ):
     _snapshot_original_tool_parameters(_name)
 
@@ -1537,9 +1524,6 @@ _REGISTRY_ID_TO_META_TOOL: Dict[str, str] = {
     "campaign.activities": "get_campaign_activities",
     "goal.lookup": "lookup_goals",
     "goal.details": "get_goal_details",
-    "meeting.cancel": "cancel_meeting",
-    "meeting.delete": "delete_meeting",
-    "note.create": "add_note",
 }
 
 
@@ -1664,14 +1648,6 @@ async def _task_search_any_relation_router(payload: Dict[str, Any]) -> str:
     )
 
 
-async def _cancel_meeting_router(payload: Dict[str, Any]) -> str:
-    return await cancel_meeting(meeting_id=payload["meeting_id"])
-
-
-async def _delete_meeting_router(payload: Dict[str, Any]) -> str:
-    return await delete_meeting(meeting_id=payload["meeting_id"])
-
-
 # "_meta" entries (and the bucket-scoped lookups below) are NOT
 # entity-CRUD-shaped like lead/contact — each one is its own standalone old
 # tool with its own real signature, so (unlike get/search/create/update)
@@ -1698,8 +1674,6 @@ _META_LOOKUP_ROUTERS: Dict[str, Any] = {
     "campaign.activities": _campaign_activities_router,
     "goal.lookup": _goal_lookup_router,
     "goal.details": _goal_details_router,
-    "meeting.cancel": _cancel_meeting_router,
-    "meeting.delete": _delete_meeting_router,
 }
 
 

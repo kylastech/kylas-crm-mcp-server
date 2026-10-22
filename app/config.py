@@ -189,20 +189,19 @@ goal.lookup / goal.details).
    build_payload does no validation of its own, on purpose.
 
 ## What's registered right now (call list_tool to confirm, don't assume)
-Buckets: lead, contact, meeting, call_log, deal, task, company, quotation, report, note,
+Buckets: lead, contact, meeting, call_log, deal, task, company, quotation, report,
 plus a bucket-less "_meta" group for shared lookups (user.lookup,
 product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
 team.lookup, campaign.lookup, campaign.activities,
     goal.lookup, goal.details).
 Not every bucket has every intent:
   - lead, deal, company: get, search, search_by_term, search_idle, create, update (all 6)
-  - contact: get, search, search_by_term, create, update (no search_idle)
-  - meeting: get, search, search_by_term, create, update, cancel, delete, plus lookup (meeting.lookup_related)
+  - contact, meeting: get, search, search_by_term, create, update (no search_idle)
   - task: get, search, search_by_term, create, update, lookup (task.lookup_entity, task.search_any_relation — no search_idle)
   - call_log: search, create, update, lookup (call_log.by_entity — no get, no search_by_term, no search_idle)
+  - meeting also has lookup (meeting.lookup_related), beyond the get/search/search_by_term/create/update above
   - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
   - report: create, preview (report.create saves a report; report.preview shows its numbers without saving; build_payload needs entity="<entity>")
-  - note: create (note.create — add notes to lead, contact, deal, company, meeting, call_log, task)
   - _meta: lookup only (user.lookup, product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
     team.lookup, campaign.lookup, campaign.activities,
     goal.lookup, goal.details)

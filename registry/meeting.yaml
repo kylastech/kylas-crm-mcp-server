@@ -296,28 +296,3 @@
     or last name, not both together, and tell the user which token you
     actually searched.
   example: {entity_type: "invitee", query: "firstName:John"}
-
-- id: meeting.cancel
-  bucket: meeting
-  intent: cancel
-  method: POST
-  path: /v1/meetings/{meeting_id}/cancel
-  dynamic_fields: false
-  description: "Cancel a scheduled meeting."
-  usage_notes: >
-    Cancel a scheduled meeting by ID. Changes the meeting status to 'cancelled'.
-    The meeting_id must be a valid integer ID of an existing meeting.
-  example: {meeting_id: 12345}
-
-- id: meeting.delete
-  bucket: meeting
-  intent: delete
-  method: DELETE
-  path: /v1/meetings/{meeting_id}
-  dynamic_fields: false
-  description: "Permanently delete a meeting."
-  usage_notes: >
-    Permanently delete a meeting by ID. This action cannot be undone.
-    The meeting_id must be a valid integer ID of an existing meeting.
-  example: {meeting_id: 12345}
-
