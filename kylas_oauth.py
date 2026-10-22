@@ -35,7 +35,7 @@ _API_KEY_HEADER = "x-api-key"
 
 _OAUTH_AUTHORIZE_PATH = "/oauth/authorize"
 _OAUTH_TOKEN_PATH = "/oauth/token"
-_USERS_ME_PATH = "/v1/users/me"
+_USERS_ME_PATH = "/users/me"
 
 _KYLAS_OIDC_SCOPES = ["openid", "profile", "email", "offline_access"]
 

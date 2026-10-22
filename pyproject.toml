@@ -46,7 +46,3 @@ kylas-crm-mcp-server = "main:run"
 
 [tool.setuptools]
 py-modules = ["main"]
-packages = ["app"]
-
-[tool.pytest.ini_options]
-pythonpath = ["."]
