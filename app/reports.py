@@ -125,8 +125,6 @@ _OPERATORS_BY_FIELD_TYPE: Dict[str, List[str]] = {
     "MULTI_PICKLIST": _LOOKUP_OPS,
     "PIPELINE": _LOOKUP_OPS,
     "CAMPAIGN": _LOOKUP_OPS,
-    # team ("…Fields") filters: operators of their teams property, a LOOK_UP (FilterItem.tsx:447)
-    "ENTITY_FIELDS": _LOOKUP_OPS,
     "PIPELINE_STAGE": ["equal", "not_equal", "in", "not_in"],
     "ACTIVITY": ["equal", "not_equal", "in", "not_in"],
     "CALL_LOG_TYPE": ["equal", "not_equal", "in", "not_in"],
@@ -154,7 +152,7 @@ _DEFAULT_OPERATORS = ["equal", "not_equal"]  # TOGGLE, CHECKBOX, RADIO_BUTTON, e
 _UI_VALUE_INPUT_TYPES = {
     "NUMBER", "MONEY", "PHONE", "EMAIL", "TEXT_FIELD", "SINGLE_LINE_TEXT", "PIPELINE_STAGE_REASON", "URL",
     "TOGGLE", "CHECKBOX", "PICK_LIST", "MULTI_PICKLIST", "PIPELINE_STAGE", "ACTIVITY",
-    "LOOK_UP", "PIPELINE", "CAMPAIGN", "MEETING_ORGANIZER", "MEETING_INVITEES", "ENTITY_FIELDS",
+    "LOOK_UP", "PIPELINE", "CAMPAIGN", "MEETING_ORGANIZER", "MEETING_INVITEES",
     "DATE_PICKER", "DATETIME_PICKER", "GPS_COORDINATES", "FORECASTING_TYPE",
 }
 
@@ -181,36 +179,14 @@ _METRIC_TYPES = ("COUNT", "SUM", "AVERAGE")
 # RELATED_FIELDS: child filter -> parent filter that must be present.
 _RELATED_FIELD_PARENT = {"pipelineStage": "pipeline", "pipelineStageReason": "pipeline", "activities": "campaignActivities"}
 
-# LOOK_UP filter lookup.entity -> registry id that resolves its ids.
-_LOOKUP_RESOLVERS = {
-    "USER": "user.lookup",
-    "PRODUCT": "product.lookup",
-    "PIPELINE": "pipeline.lookup",
-    "TEAM": "team.lookup",
-    "LEAD": "lead.search_by_term",
-    "CONTACT": "contact.search_by_term",
-    "DEAL": "deal.search_by_term",
-    "COMPANY": "company.search_by_term",
+# Lookup filters resolvable through an existing registry id in phase 1.
+_LOOKUP_RESOLVERS = {"USER": "user.lookup", "PRODUCT": "product.lookup", "PIPELINE": "pipeline.lookup"}
+# Email sender/recipient filters use a different lookup (email-recipient) — phase 2.
+_PHASE2_FILTER_IDS = {"sentBy", "receivedBy"}
+_PHASE2_FILTER_TYPES = {
+    "ENTITY_FIELDS", "PIPELINE_STAGE", "ACTIVITY", "CAMPAIGN",
+    "MEETING_INVITEES", "MEETING_ORGANIZER", "GPS_COORDINATES",
 }
-# Filter field types resolved through a registry id regardless of their lookup block.
-_FIELD_TYPE_RESOLVERS = {
-    "PIPELINE": "pipeline.lookup",
-    "PIPELINE_STAGE": "pipeline.details",
-    "CAMPAIGN": "campaign.lookup",
-    "ACTIVITY": "campaign.activities",
-    "MEETING_INVITEES": "meeting.lookup_related",
-    "MEETING_ORGANIZER": "meeting.lookup_related",
-    "ENTITY_FIELDS": "team.lookup",
-}
-# Email sentBy IS supported, as a bare user id: verified on QA (2026-10-12) that sd-report runs
-# sentBy equal <id> / in [<ids>] correctly, while the {id,name,entity} object sd-ui sends fails
-# with a 500. receivedBy/user have no plain filter in sd-report, and team filters keyed on those
-# fields are dropped (no mapping), so they stay out. GPS "within" needs geocoding.
-_UNSUPPORTED_FILTER_IDS_BY_ENTITY = {"email": {"receivedBy", "user", "userFields", "sentByFields", "receivedByFields"}}
-_UNSUPPORTED_FILTER_TYPES = {"GPS_COORDINATES"}
-# Task reports allow one associated-entity filter at a time (sd-ui restrictMultipleAssociatedEntitiesFilter).
-_TASK_ASSOCIATED_FILTERS = {"associatedLeads", "associatedDeals", "associatedContacts", "associatedCompanies"}
-_MEETING_LOOKUP_ENTITIES = {"user", "lead", "contact", "external"}
 
 _HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
@@ -396,7 +372,7 @@ def rule_type_for(flt: Dict[str, Any]) -> str:
     field_type = flt.get("fieldType") or ""
     if field_type == "PICK_LIST":
         return "string" if flt.get("isInternal") else "long"
-    if field_type in ("MULTI_PICKLIST", "LOOK_UP", "PIPELINE", "PIPELINE_STAGE", "CAMPAIGN", "ACTIVITY", "ENTITY_FIELDS"):
+    if field_type in ("MULTI_PICKLIST", "LOOK_UP", "PIPELINE", "PIPELINE_STAGE", "CAMPAIGN", "ACTIVITY"):
         return "long"
     if field_type in ("NUMBER", "MONEY"):
         return "double"
@@ -415,17 +391,13 @@ def rule_type_for(flt: Dict[str, Any]) -> str:
     return "string"
 
 
-def filter_support(flt: Dict[str, Any], entity: Optional[str] = None) -> Tuple[bool, Optional[str]]:
-    """(supported, resolve_via registry id or None)."""
+def filter_support(flt: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """(supported_in_phase_1, resolve_via registry id or None)."""
     field_type = flt.get("fieldType") or ""
-    if field_type in _UNSUPPORTED_FILTER_TYPES or flt.get("id") in _UNSUPPORTED_FILTER_IDS_BY_ENTITY.get(entity or "", set()):
+    if flt.get("id") in _PHASE2_FILTER_IDS or field_type in _PHASE2_FILTER_TYPES:
         return False, None
-    if field_type == "ENTITY_FIELDS":
-        # Applied by sd-report only with property "teams" + a primaryField; anything else is dropped.
-        ok = bool(flt.get("primaryField")) and (flt.get("property") in (None, "teams"))
-        return ok, ("team.lookup" if ok else None)
-    if field_type in _FIELD_TYPE_RESOLVERS:
-        return True, _FIELD_TYPE_RESOLVERS[field_type]
+    if field_type == "PIPELINE":
+        return True, "pipeline.lookup"
     if field_type == "LOOK_UP":
         resolver = _LOOKUP_RESOLVERS.get(((flt.get("lookup") or {}).get("entity") or "").upper())
         return (resolver is not None), resolver
@@ -538,10 +510,10 @@ def get_report_config_instructions_logic(
 def _format_report_filter(entity: str, f: Dict[str, Any], requested: set, tenant_currency: Optional[str]) -> List[str]:
     fid = f.get("id") or ""
     field_type = f.get("fieldType") or ""
-    supported, resolver = filter_support(f, entity)
+    supported, resolver = filter_support(f)
     head = f"  • '{fid}' {f.get('header')} [{field_type}]"
     if not supported:
-        return [f"{head} — NOT SUPPORTED (can't be used in reports created here)"]
+        return [f"{head} — NOT SUPPORTED YET (needs a lookup not available in this version)"]
     ops = ", ".join(filter_operators_for(entity, f, tenant_currency))
     lines = [f"{head} — operators: {ops}"]
     parent = _RELATED_FIELD_PARENT.get(fid)
@@ -550,12 +522,13 @@ def _format_report_filter(entity: str, f: Dict[str, Any], requested: set, tenant
         lines.append(f"     requires filter(s): {', '.join(required)}")
     if parent == "pipeline":
         lines.append("     the 'pipeline' filter must then use operator 'equal' or 'in'.")
-    if parent == "campaignActivities":
-        lines.append("     the 'campaignActivities' filter must then use operator 'equal' (one campaign).")
-    if entity == "task" and fid in _TASK_ASSOCIATED_FILTERS:
-        lines.append("     only ONE of associatedLeads/associatedDeals/associatedContacts/associatedCompanies per report.")
     if resolver:
-        lines.append(f"     value: {_resolver_hint(entity, f, resolver)} Never guess ids.")
+        extra = ""
+        if resolver == "pipeline.lookup":
+            # The UI calls the filter's own lookupUrl (e.g. /pipelines/lookup?entityType=LEAD&q=name:).
+            match = re.search(r"entityType=(\w+)", (f.get("lookup") or {}).get("lookupUrl") or "")
+            extra = f" with entity_type={match.group(1) if match else entity.upper()}"
+        lines.append(f"     value: numeric id — resolve_via: {resolver}{extra}. Never guess ids.")
     elif field_type in _DATE_FIELD_TYPES:
         lines.append("     value: same rules as date_range")
     elif field_type == "FORECASTING_TYPE":
@@ -580,28 +553,6 @@ def _format_report_filter(entity: str, f: Dict[str, Any], requested: set, tenant
     else:
         lines.append("     value: text")
     return lines
-
-
-def _resolver_hint(entity: str, f: Dict[str, Any], resolver: str) -> str:
-    """How to obtain this filter's value — one line per lookup kind."""
-    if resolver == "pipeline.lookup":
-        # The UI calls the filter's own lookupUrl (e.g. /pipelines/lookup?entityType=LEAD&q=name:).
-        match = re.search(r"entityType=(\w+)", (f.get("lookup") or {}).get("lookupUrl") or "")
-        return f"pipeline id(s) — resolve_via: pipeline.lookup with entity_type={match.group(1) if match else entity.upper()}."
-    if resolver == "pipeline.details":
-        return ("stage id(s) — resolve_via: pipeline.details with pipeline_id = the pipeline in your "
-                "'pipeline' filter; use its 'Stage ID' values.")
-    if resolver == "campaign.activities":
-        return "activity id(s) — resolve_via: campaign.activities with the campaign_id of your campaignActivities filter."
-    if resolver == "meeting.lookup_related":
-        return ("an OBJECT {id, entity, name} (a list of them for in/not_in) — resolve_via: meeting.lookup_related "
-                "with entity_type=\"invitee\"; copy id, entity and name from the chosen row. A bare id is rejected.")
-    if (f.get("fieldType") or "") == "ENTITY_FIELDS":
-        return (f"team id(s) — resolve_via: team.lookup. The server sets property 'teams' and adds "
-                f"'{f.get('primaryField')} is_not_null' automatically.")
-    if resolver.endswith(".search_by_term"):
-        return f"record id(s) — resolve_via: {resolver} (use the ID from its results)."
-    return f"numeric id(s) — resolve_via: {resolver}."
 
 
 # ---------------------------------------------------------------------------
@@ -710,20 +661,6 @@ def _to_number(value: Any, label: str) -> float:
     return int(number) if number.is_integer() else number
 
 
-def _meeting_lookup_value(value: Any, label: str) -> Dict[str, Any]:
-    """Meeting participants/organizer values are {id, entity, name} objects (sd-report MeetingLookup)."""
-    _require(isinstance(value, dict) and value.get("id") is not None and value.get("entity"),
-             f"{label}: needs an object {{id, entity, name}} from meeting.lookup_related (entity_type=\"invitee\"); "
-             f"got {value!r}.")
-    entity = str(value["entity"]).strip().lower()
-    _require(entity in _MEETING_LOOKUP_ENTITIES,
-             f"{label}: entity must be one of {', '.join(sorted(_MEETING_LOOKUP_ENTITIES))}, got {value['entity']!r}.")
-    result = {"id": _to_int(value["id"], label), "entity": entity}
-    if value.get("name"):
-        result["name"] = str(value["name"])
-    return result
-
-
 def _rule_value(entity: str, flt: Dict[str, Any], operator: str, value: Any, label: str) -> Any:
     """getFilterValue (service.ts:44) for non-date fields."""
     if operator in _NO_INPUT_OPERATORS:
@@ -732,14 +669,8 @@ def _rule_value(entity: str, flt: Dict[str, Any], operator: str, value: Any, lab
     field_type = flt.get("fieldType") or ""
     multi = operator in _MULTI_VALUE_OPERATORS
 
-    if field_type in ("LOOK_UP", "PIPELINE", "PIPELINE_STAGE", "CAMPAIGN", "ACTIVITY", "ENTITY_FIELDS"):
+    if field_type in ("LOOK_UP", "PIPELINE"):
         return [_to_int(v, label) for v in _as_list(value)] if multi else _to_int(value, label)
-    if field_type in ("MEETING_INVITEES", "MEETING_ORGANIZER"):
-        if multi:
-            items = value if isinstance(value, list) else [value]
-            return [_meeting_lookup_value(v, label) for v in items]
-        _require(not isinstance(value, list), f"{label}: '{operator}' takes ONE object {{id, entity, name}}; use 'in' for several.")
-        return _meeting_lookup_value(value, label)
     if field_type in ("PICK_LIST", "MULTI_PICKLIST"):
         return [_resolve_option(flt, v, label) for v in _as_list(value)] if multi else _resolve_option(flt, value, label)
     if field_type in ("TOGGLE", "CHECKBOX"):
@@ -881,8 +812,8 @@ def build_report_body(
         _require(flt["id"] != date_field["id"], f"{label}: this field is already the date_range field; it cannot also be a filter.")
         _require(flt["id"] not in used, f"{label}: each field can be filtered only once.")
         used.add(flt["id"])
-        supported, _resolver = filter_support(flt, entity)
-        _require(supported, f"{label}: filtering on this field is not supported for reports created here.")
+        supported, _resolver = filter_support(flt)
+        _require(supported, f"{label}: filtering on this field is not supported yet in this version.")
         operator = str(spec["operator"]).strip().lower()
         if flt.get("fieldType") in _DATE_FIELD_TYPES:
             parts = _date_rule_parts(entity, flt, operator, spec.get("value"), spec, timezone, tenant_currency, label)
@@ -899,30 +830,9 @@ def build_report_body(
             "value": parts.get("value"),
             "from": parts.get("from"),
             "to": parts.get("to"),
-            # sd-report applies a team filter only with property "teams" + its primaryField.
-            "property": "teams" if flt.get("fieldType") == "ENTITY_FIELDS" else None,
+            "property": None,
             "primaryField": flt.get("primaryField") or None,
         })
-
-    # --- Team ("…Fields") filters: their user field must be "is set" (ReportFilters.tsx:183-216) ---
-    for rule in [r for r in rules if r["fieldInputType"] == "ENTITY_FIELDS"]:
-        primary = rule["primaryField"]
-        existing = next((r for r in rules if r["id"] == primary), None)
-        if existing is None:
-            primary_filter = _find(filters, primary)
-            _require(primary_filter is not None, f"Filter '{rule['id']}' needs filter '{primary}', which is not available.")
-            rules.append({
-                "operator": "is_not_null", "id": primary, "field": primary,
-                "fieldInputType": primary_filter.get("fieldType"), "type": rule_type_for(primary_filter),
-                "value": None, "from": None, "to": None, "property": None,
-                "primaryField": primary_filter.get("primaryField") or None,
-            })
-            used.add(primary)
-            notes.append(f"Added filter '{primary} is_not_null', required by the team filter '{rule['id']}'.")
-        elif existing["operator"] != "is_not_null":
-            existing.update({"operator": "is_not_null", "value": None})
-            notes.append(f"Filter '{primary}' changed to is_not_null — the web app forces this when the "
-                         f"team filter '{rule['id']}' is used.")
 
     # --- Required filters (dimension + filter dependencies) ---
     if is_entity_fields:
@@ -950,14 +860,6 @@ def build_report_body(
     if pipeline_rule and any(_RELATED_FIELD_PARENT.get(r["id"]) == "pipeline" for r in rules):
         _require(pipeline_rule["operator"] in ("equal", "in"),
                  "When filtering on a pipeline stage/reason, the 'pipeline' filter must use 'equal' or 'in'.")
-    campaign_rule = next((r for r in rules if r["id"] == "campaignActivities"), None)
-    if campaign_rule and any(r["id"] == "activities" for r in rules):
-        _require(campaign_rule["operator"] == "equal",
-                 "When filtering on campaign activities, the 'campaignActivities' filter must use 'equal' (one campaign).")
-    if entity == "task":
-        associated = [r["id"] for r in rules if r["id"] in _TASK_ASSOCIATED_FILTERS]
-        _require(len(associated) <= 1,
-                 f"Task reports allow only one associated-entity filter at a time; got {', '.join(associated)}.")
 
     body = {
         "name": name.strip(),
