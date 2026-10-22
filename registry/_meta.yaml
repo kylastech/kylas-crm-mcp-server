@@ -237,32 +237,3 @@
     filter also needs a campaignActivities filter on the SAME campaign
     with operator equal.
   example: {campaign_id: 12345}
-
-- id: goal.lookup
-  bucket: _meta
-  intent: lookup
-  method: GET
-  path: /v1/reports/goals
-  dynamic_fields: false
-  description: "List active goals — goal ids for Goal vs Achievement reports."
-  usage_notes: >
-    entity_type: optional, LEAD / DEAL / MEETING / CALL (goals exist only for
-    these) to list only that entity's goals. Returns "ID | Name" rows of the
-    active goals the user can read. Then call goal.details on the chosen ID,
-    and use it as goal_id in report.create / report.preview with category
-    GOALS_VS_ACHIEVEMENT. Never guess a goal ID; if several match, ask.
-  example: {entity_type: "LEAD"}
-
-- id: goal.details
-  bucket: _meta
-  intent: lookup
-  method: GET
-  path: /v1/reports/goals/{goal_id}
-  dynamic_fields: false
-  description: "Show one goal: entity, metric, grouping, frequency, date field and per-person targets."
-  usage_notes: >
-    goal_id: the goal's ID from goal.lookup. Tells you the goal's entity
-    (use it as report entity), whether it's active (inactive goals can't be
-    reported on), its frequency (the report's default date range) and the
-    per-person targets.
-  example: {goal_id: 548}
