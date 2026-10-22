@@ -10,7 +10,6 @@ from app.config import logger
 from app.server import mcp
 from app.client import KylasAPIError, _reset_api_call_count
 from app.helpers import OPERATOR_MAPPING, _build_search_json_rule
-from app.reports import create_report_logic
 from app.entities import (
     _build_call_log_search_json_rule,
     _build_company_search_json_rule,
@@ -225,10 +224,6 @@ _ENTITY_CRUD_CONFIG: Dict[str, Dict[str, Any]] = {
         "create_fn": create_call_log_logic,
         "update_fn": update_call_log_logic,
         "name_fn": lambda r: f"{r.get('callType', '')} / {r.get('outcome', '')}",
-    },
-    "report": {
-        "create_fn": create_report_logic,
-        "name_fn": lambda r: r.get("name", "Report"),
     },
 }
 
@@ -758,7 +753,7 @@ def list_tool(
 
     Registry contents right now (this will grow — always confirm here rather than
     assuming an id exists, since not every bucket has every intent):
-      buckets: lead, contact, deal, task, company, meeting, call_log, quotation, report, _meta
+      buckets: lead, contact, deal, task, company, meeting, call_log, quotation, _meta
       intents: get, search, search_by_term, search_idle, create, update, lookup
       (lead/deal/company have all of get/search/search_by_term/search_idle/
       create/update; contact/meeting have the same 5 minus search_idle;
@@ -767,9 +762,7 @@ def list_tool(
       call_log has only search/create/update plus lookup (call_log.by_entity)
       — no get, no search_by_term, no search_idle; meeting also has lookup
       (meeting.lookup_related) on top of its other 4; quotation is READ-ONLY
-      — get/search/search_by_term/search_idle only, no create/update; report
-      has only create (report.create — creates and SAVES a real Kylas report /
-      chart; its build_payload call REQUIRES entity="<entity>"); _meta
+      — get/search/search_by_term/search_idle only, no create/update; _meta
       is bucket-less and has lookup entries only (user.lookup,
       product.lookup, pipeline.lookup, pipeline.details,
       datetime.parse_to_utc). Call list_tool(bucket=...) to see exactly
@@ -777,7 +770,7 @@ def list_tool(
       across buckets.)
 
     bucket: restrict to one bucket (e.g. "lead", "contact", "deal", "task",
-      "company", "meeting", "call_log", "quotation", "report", "_meta"). Omit to search
+      "company", "meeting", "call_log", "quotation", "_meta"). Omit to search
       every bucket.
     intent: restrict to one intent — "get", "search", "search_by_term",
       "search_idle", "create", "update", or "lookup". Omit to match any.
@@ -961,7 +954,7 @@ async def _fold_field_metadata_into_schema(
 
 
 @mcp.tool()
-async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Optional[str] = None) -> str:
+async def build_payload(id: str, fields: Optional[List[str]] = None) -> str:
     """
     Step 2 of 3 in the generic CRM tool flow: get everything about the ONE
     endpoint you already picked via list_tool. Takes that id, plus an optional
@@ -969,13 +962,6 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
     picklist detail comes back — never the values you're about to send. This
     tool still never sees or checks those values; that only happens (if at
     all) in execute_request, described there.
-
-    REPORT ids (bucket "report", e.g. "report.create") ALSO REQUIRE the
-    "entity" argument — the CRM entity the report is about:
-      build_payload("report.create", entity="lead")
-    Valid entities: lead, deal, contact, company, task, meeting, call, email,
-    quotation (the STANDARD type). Calling a report id without entity returns
-    an error — just call again with entity set.
 
     Returns a JSON object with these fields:
       id             - the id you asked for, echoed back.
@@ -1101,16 +1087,6 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
       omitted" stub for a field you turn out to need, just call build_payload
       again naming that field. Re-calling is idempotent. NEVER guess a
       picklist option id or internal name to avoid the second call.
-
-    entity: REQUIRED for report ids (bucket "report"), ignored for every other
-      id. One of lead, deal, contact, company, task, meeting, call, email,
-      quotation — the STANDARD type (call get_entity_labels() if the user used
-      a renamed entity). The report reference (dimensions, metrics, date
-      fields, filters and their options) is fetched live for that entity, so a
-      report on a different entity needs a new build_payload call. "fields"
-      works here too: large picklist filters (country, timezone, ...) are
-      omitted unless named, e.g. build_payload("report.create", entity="lead",
-      fields=["country"]).
     """
     entry = _REGISTRY.get(id)
     if not entry:
@@ -1144,55 +1120,23 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
     fetched_live = False
     live_fetch_error = None
     if entry.get("dynamic_fields"):
-        if entry["bucket"] == "report":
-            if not entity:
-                return json.dumps({
-                    "ok": False,
-                    "error": (
-                        f"'{id}' needs the entity argument. Call again as "
-                        f"build_payload(\"{id}\", entity=\"<entity>\") — entity is the standard type of the "
-                        "records the report is about, one of: lead, deal, contact, company, task, meeting, "
-                        "call, email, quotation (e.g. \"leads by source\" -> entity=\"lead\")."
-                    ),
-                }, indent=2)
-            try:
-                from app.reports import build_report_reference
-                ref = await build_report_reference(entity, fields)
-                schema.update(ref)
-                fetched_live = True
-            except ValueError as e:
-                return json.dumps({"ok": False, "error": str(e)}, indent=2)
-            except KylasAPIError as e:
-                # Without the live config there is no usable reference, so fail
-                # outright instead of returning a schema the model can't build from.
-                return json.dumps({
-                    "ok": False,
-                    "error": f"Could not load the report config for '{entity}': {e.message}. Retry build_payload.",
-                }, indent=2)
-            except Exception as e:
-                logger.exception("build_payload(%s) report reference", id)
-                return json.dumps({
-                    "ok": False,
-                    "error": f"Could not load the report config for '{entity}': {e}",
-                }, indent=2)
+        fetch_fields_fn = _BUCKET_FIELD_FETCHERS.get(entry["bucket"])
+        if fetch_fields_fn is None:
+            live_fetch_error = f"No field-metadata fetcher wired for bucket '{entry['bucket']}' yet."
         else:
-            fetch_fields_fn = _BUCKET_FIELD_FETCHERS.get(entry["bucket"])
-            if fetch_fields_fn is None:
-                live_fetch_error = f"No field-metadata fetcher wired for bucket '{entry['bucket']}' yet."
-            else:
-                try:
-                    schema = await _fold_field_metadata_into_schema(
-                        schema, fetch_fields_fn,
-                        for_search=(entry["intent"] == "search"),
-                        requested_picklists=fields,
-                        bucket=entry["bucket"],
-                    )
-                    fetched_live = True
-                except KylasAPIError as e:
-                    # Don't fail the whole call for this — method/path/usage_notes/example
-                    # need no network access at all and are still genuinely useful on
-                    # their own; only the live tenant field/picklist enrichment is missing.
-                    live_fetch_error = e.message
+            try:
+                schema = await _fold_field_metadata_into_schema(
+                    schema, fetch_fields_fn,
+                    for_search=(entry["intent"] == "search"),
+                    requested_picklists=fields,
+                    bucket=entry["bucket"],
+                )
+                fetched_live = True
+            except KylasAPIError as e:
+                # Don't fail the whole call for this — method/path/usage_notes/example
+                # need no network access at all and are still genuinely useful on
+                # their own; only the live tenant field/picklist enrichment is missing.
+                live_fetch_error = e.message
 
     result = {
         "id": entry["id"],
