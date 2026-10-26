@@ -11,6 +11,7 @@ from app.server import mcp
 from app.client import KylasAPIError, _reset_api_call_count
 from app.helpers import OPERATOR_MAPPING, _build_search_json_rule
 from app.reports import REPORT_PREVIEW_SCHEMA, create_report_logic, preview_report_logic
+from app.campaigns import CAMPAIGN_BUCKETS, CAMPAIGN_ROUTERS, CAMPAIGN_SCHEMAS, unwired_campaign_ids
 from app.entities import (
     _build_call_log_search_json_rule,
     _build_company_search_json_rule,
@@ -746,6 +747,14 @@ def _load_registry(registry_dir: Path = _REGISTRY_DIR) -> Tuple[Dict[str, Any], 
 # Loaded once at import time — see docstring above for why this isn't lazy.
 _REGISTRY_INDEX, _REGISTRY = _load_registry()
 
+# Campaign ids take their schema and router from app/campaigns.py instead of a
+# tool snapshot — an entry without both must stop startup, same as a bad entry.
+_UNWIRED_CAMPAIGN_IDS = unwired_campaign_ids(_REGISTRY)
+if _UNWIRED_CAMPAIGN_IDS:
+    raise RegistryError(
+        f"Campaign registry id(s) {_UNWIRED_CAMPAIGN_IDS} have no schema or router in "
+        "app/campaigns.py (CAMPAIGN_SCHEMAS / CAMPAIGN_ROUTERS)."
+    )
 
 @mcp.tool()
 def list_tool(
@@ -1136,8 +1145,11 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
     # Schema comes from the REAL original tool's own inputSchema
     # (get_lead/get_contact/search_entity/create_entity), never a
     # hand-authored one — see _real_get_schema/_real_search_schema/
-    # _real_create_schema and the snapshot mechanism above.
-    if entry["intent"] == "get":
+    # _real_create_schema and the snapshot mechanism above. Campaign buckets are
+    # the exception: their schemas live in app/campaigns.py (CAMPAIGN_SCHEMAS).
+    if entry["bucket"] in CAMPAIGN_BUCKETS:
+        schema = json.loads(json.dumps(CAMPAIGN_SCHEMAS.get(id, {})))
+    elif entry["intent"] == "get":
         original_get_tool = _REGISTRY_BUCKET_TO_GET_TOOL.get(entry["bucket"])
         schema = _real_get_schema(original_get_tool) if original_get_tool else (entry.get("schema") or {})
     elif entry["intent"] == "search":
@@ -1321,7 +1333,17 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
     payload = payload or {}
 
     try:
-        if intent == "get":
+        if bucket in CAMPAIGN_BUCKETS:
+            # Campaign ids use sd-campaign endpoints, not the generic entity
+            # routers below (/v1/search/{entity}, _ENTITY_CONFIG).
+            router = CAMPAIGN_ROUTERS.get(id)
+            if not router:
+                return json.dumps({
+                    "ok": False,
+                    "error": {"code": "NOT_WIRED", "message": f"'{id}' has no execute_request router wired yet."},
+                }, indent=2)
+            result = await router(payload)
+        elif intent == "get":
             # The id-field name genuinely differs per bucket (lead_id vs
             # contact_id) — derived from the same real snapshot build_payload
             # already uses for this bucket's schema, not a second hardcoded map.
