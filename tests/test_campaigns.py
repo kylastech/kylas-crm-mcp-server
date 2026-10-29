@@ -719,3 +719,451 @@ async def test_get_still_works_when_currencies_time_out_or_look_wrong(failure):
     with patch("app.campaigns._campaign_call", api):
         result = await get_campaign_logic({"campaign_id": 433})
     assert result["estimated_budget"] == {"value": 100000.0, "currency": None, "currency_id": 431}
+
+
+# ---------------------------------------------------------------------------
+# Phase R2 — campaign_activity.search / get / analytics / recipients /
+# generated_records. Fixtures are trimmed copies of real QA responses:
+# WhatsApp activity 713 (tenant 3691) and CALL activity 685 (tenant 4377).
+# ---------------------------------------------------------------------------
+
+from app.campaigns import (  # noqa: E402
+    activity_analytics_logic,
+    activity_generated_records_logic,
+    activity_recipients_logic,
+    get_activity_logic,
+    search_activities_logic,
+)
+
+_SEARCH_ACTIVITIES = "/v1/campaigns/activities/search"
+
+_ACTIVITY_716 = {**_ACTIVITY_713, "id": 716, "name": "Abhinav Whatsapp Reply Rerun 3.0 (#713)", "status": "PROCESSED"}
+
+_ACTIVITY_685 = {
+    "id": 685, "name": "Testing", "status": "IN_PROGRESS", "type": "CALL", "entity": "LEAD",
+    "campaign": {"id": 399, "name": "Testing"},
+    "estimatedBudget": {"currencyId": 431, "value": 300.0}, "actualExpense": {"currencyId": 431, "value": 500.0},
+    "startDate": "2026-04-01T08:00:00.000Z", "endDate": None, "startedAt": "2026-05-11T08:59:00.000Z",
+    "payload": {"type": "CALL", "marketplaceApp": {"id": 246, "name": "Campaign Test Tata Tele"},
+                "didNumber": "+918065489741", "userAgents": [{"id": 11220, "name": "Aditya Tambe"}],
+                "sentTo": "PRIMARY_PHONE_NUMBER"},
+    "totalRecords": 4, "dialedCalls": 4, "connectedCalls": 2, "conversionRate": 0.0, "averageHandlingTime": 20.0,
+    "agentDialerMetrics": [{"id": 11220, "name": "Aditya Tambe", "totalRecordsAssigned": 4, "dialedCalls": 4,
+                            "connectedCalls": 2, "conversionRate": 0.0, "averageHandlingTime": 20.5,
+                            "callDialerStatus": "COMPLETED"}],
+    "totalEngagement": 4, "recordsGenerated": 0,
+}
+
+
+def _activity_rows(*activities):
+    return {"content": list(activities), "totalElements": len(activities), "last": True}
+
+
+# --- resolving the activity -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_activity_with_campaign_id_is_fetched_directly():
+    api = _FakeCampaignApi({"/v1/campaigns/433/activities/713": _ACTIVITY_713, "/v1/forex/currencies": _CURRENCIES})
+    with patch("app.campaigns._campaign_call", api):
+        result = await get_activity_logic({"activity_id": 713, "campaign_id": 433})
+    assert result["id"] == 713 and result["campaign"] == {"id": 433, "name": "Abhinav Whatsapp Replied Campaign"}
+    assert [c["path"] for c in api.calls] == ["/v1/campaigns/433/activities/713", "/v1/forex/currencies"]
+
+
+@pytest.mark.asyncio
+async def test_activity_id_alone_is_found_through_search():
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_713), "/v1/forex/currencies": _CURRENCIES})
+    with patch("app.campaigns._campaign_call", api):
+        result = await get_activity_logic({"activity_id": 713})
+    assert result["id"] == 713
+    assert api.call_to(_SEARCH_ACTIVITIES)["body"]["jsonRule"]["rules"] == [
+        {"id": "id", "field": "id", "type": "long", "operator": "equal", "value": 713}]
+
+
+@pytest.mark.asyncio
+async def test_unknown_activity_id_is_not_found():
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows()})
+    with patch("app.campaigns._campaign_call", api):
+        with pytest.raises(KylasAPIError, match="Activity not found"):
+            await get_activity_logic({"activity_id": 999999})
+
+
+@pytest.mark.asyncio
+async def test_activity_name_prefers_the_exact_match():
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_716, _ACTIVITY_713),
+                            "/v1/forex/currencies": _CURRENCIES})
+    with patch("app.campaigns._campaign_call", api):
+        result = await get_activity_logic({"activity_name": "abhinav whatsapp reply"})
+    assert result["id"] == 713
+    assert api.call_to(_SEARCH_ACTIVITIES)["body"]["jsonRule"]["rules"][0]["value"] == "abhinav whatsapp reply"
+
+
+@pytest.mark.asyncio
+async def test_activity_name_with_several_matches_asks_the_user():
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_716, _ACTIVITY_713)})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_analytics_logic({"activity_name": "Abhinav"})
+    assert [m["id"] for m in result["matches"]] == [716, 713]
+    assert result["matches"][0]["campaign"]["name"] == "Abhinav Whatsapp Replied Campaign"
+    assert [m["total_engagement"] for m in result["matches"]] == [4, 4]
+    assert result["note"].startswith("STOP")
+    assert "Ask the user to choose one" in result["note"]
+    assert "don't run this for each match" in result["note"]
+    assert [c["path"] for c in api.calls] == [_SEARCH_ACTIVITIES]
+
+
+@pytest.mark.asyncio
+async def test_activity_name_is_narrowed_by_campaign_id():
+    other = {**_ACTIVITY_716, "campaign": {"id": 425, "name": "Diwali Special Offer from Kylas!"}}
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(other, _ACTIVITY_713), "/v1/forex/currencies": _CURRENCIES})
+    with patch("app.campaigns._campaign_call", api):
+        result = await get_activity_logic({"activity_name": "Abhinav", "campaign_id": 433})
+    assert result["id"] == 713
+
+
+@pytest.mark.parametrize("payload,error,message", [
+    ({"activity_name": "Holi Mega Blast"}, KylasAPIError, "No activity name contains 'Holi Mega Blast'"),
+    ({}, ValueError, "Give 'activity_id' or 'activity_name'"),
+    ({"activity_id": "abc"}, ValueError, "positive integer id"),
+])
+@pytest.mark.asyncio
+async def test_activity_lookup_errors(payload, error, message):
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows()})
+    with patch("app.campaigns._campaign_call", api):
+        with pytest.raises(error, match=message):
+            await get_activity_logic(payload)
+
+
+# --- campaign_activity.search / get -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_activities_sends_filters_and_shows_campaign():
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: {"content": [_ACTIVITY_713], "totalElements": 4, "last": False},
+                            "/v1/forex/currencies": _CURRENCIES})
+    with patch("app.campaigns._campaign_call", api):
+        result = await search_activities_logic({
+            "filters": [{"field": "type", "value": "whatsapp"}, {"field": "status", "operator": "in", "value": ["paused"]}],
+            "search_term": "Abhinav", "sort": "type,desc", "size": 5,
+        })
+    call = api.call_to(_SEARCH_ACTIVITIES)
+    assert call["params"] == {"page": 0, "size": 5, "sort": "type,desc"}
+    assert [(r["field"], r["value"]) for r in call["body"]["jsonRule"]["rules"]] == [
+        ("type", "WHATSAPP"), ("status", ["PAUSED"]), ("multi_field", "Abhinav")]
+    assert result["total"] == 4 and result["has_more"] is True
+    activity = result["activities"][0]
+    assert activity["campaign"] == {"id": 433, "name": "Abhinav Whatsapp Replied Campaign"}
+    assert activity["actual_expense"] == {"value": 0.0, "currency": "INR", "currency_id": 431}
+
+
+@pytest.mark.parametrize("payload,message", [
+    ({"filters": [{"field": "campaign_id", "value": 433}]}, "can't be filtered by campaign"),
+    ({"filters": [{"field": "type", "value": "SMS"}]}, "not valid for 'type'"),
+    ({"sort": "totalEngagement,desc"}, "Can't sort by 'totalEngagement'"),
+])
+@pytest.mark.asyncio
+async def test_search_activities_rejects_bad_input_before_calling_api(payload, message):
+    api = _FakeCampaignApi({})
+    with patch("app.campaigns._campaign_call", api):
+        with pytest.raises(ValueError, match=message):
+            await search_activities_logic(payload)
+    assert api.calls == []
+
+
+@pytest.mark.asyncio
+async def test_get_call_activity_includes_dialer_and_agent_metrics():
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_685), "/v1/forex/currencies": _CURRENCIES})
+    with patch("app.campaigns._campaign_call", api):
+        result = await get_activity_logic({"activity_id": 685})
+    assert result["content"]["dialer_app"] == "Campaign Test Tata Tele"
+    assert result["connectedCalls"] == 2
+    assert result["agent_metrics"] == [{
+        "agent": {"id": 11220, "name": "Aditya Tambe"}, "status": "COMPLETED", "records_assigned": 4,
+        "dialed_calls": 4, "connected_calls": 2, "conversion_rate": 0.0, "average_handling_time": 20.5}]
+
+
+# --- campaign_activity.analytics --------------------------------------------
+
+
+_ANALYTICS_713 = "/v1/campaigns/433/activities/713/analytics"
+_ANALYTICS_685 = "/v1/campaigns/399/activities/685/analytics"
+
+
+@pytest.mark.asyncio
+async def test_activity_funnel_defaults_to_the_activity_page_range():
+    rows = [{"id": None, "name": n, "dimension": [], "value": v}
+            for n, v in [("Read", 4), ("Delivered", 4), ("Failed", 2), ("Replied", 1), ("Sent", 6)]]
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_713), _ANALYTICS_713: rows})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_analytics_logic({"activity_id": 713, "timezone": "Asia/Calcutta"})
+    body = api.call_to(_ANALYTICS_713)["body"]
+    assert body["groupBy"] == ["ACTIVITY_STATUS"]
+    # startDate 13 Oct (IST), no endDate -> 13 Oct to 20 Oct, like CampaignActivityFunnelChart.
+    assert body["dateRange"] == ["2026-10-12T18:30:00.000Z", "2026-10-20T18:29:59.999Z"]
+    assert result["date_from"] == "2026-10-13" and result["date_to"] == "2026-10-20"
+    assert "activity page's default" in result["date_range"]
+    assert result["funnel"] == [{"step": "Sent", "count": 6}, {"step": "Delivered", "count": 4},
+                                {"step": "Read", "count": 4}, {"step": "Replied", "count": 1},
+                                {"step": "Failed", "count": 2}]
+    assert "total" not in result  # steps overlap, a sum would double-count
+    assert "note" not in result
+
+
+@pytest.mark.asyncio
+async def test_empty_funnel_gets_a_note():
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_713),
+                            _ANALYTICS_713: [{"name": "Sent", "value": 0}]})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_analytics_logic({"activity_id": 713, "timezone": "Asia/Calcutta",
+                                                 "date_from": "2026-01-01", "date_to": "2026-01-31"})
+    assert result["note"] == "Nothing in this date range."
+
+
+@pytest.mark.asyncio
+async def test_activity_default_range_ends_on_the_end_date():
+    activity = {**_ACTIVITY_713, "endDate": "2026-10-15T05:30:00.000Z"}
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(activity), _ANALYTICS_713: []})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_analytics_logic({"activity_id": 713, "timezone": "Asia/Calcutta"})
+    assert (result["date_from"], result["date_to"]) == ("2026-10-13", "2026-10-15")
+
+
+@pytest.mark.asyncio
+async def test_email_funnel_fills_missing_steps_with_zero():
+    email = {**_ACTIVITY_713, "type": "EMAIL"}
+    rows = [{"name": "Opened", "value": 70}, {"name": "Failed", "value": 66}, {"name": "Sent", "value": 70}]
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(email), _ANALYTICS_713: rows})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_analytics_logic({"activity_id": 713, "timezone": "Asia/Calcutta"})
+    assert result["funnel"] == [{"step": "Sent", "count": 70}, {"step": "Opened", "count": 70},
+                                {"step": "Clicked", "count": 0}, {"step": "Failed", "count": 66}]
+
+
+@pytest.mark.asyncio
+async def test_activity_day_engagement_uses_requested_dates():
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_713),
+                            _ANALYTICS_713: _days(("2026-10-12T18:30Z", 4), ("2026-10-13T18:30Z", 0))})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_analytics_logic({"activity_id": 713, "group_by": "day", "timezone": "Asia/Calcutta",
+                                                 "date_from": "2026-10-01", "date_to": "2026-10-31"})
+    assert api.call_to(_ANALYTICS_713)["body"]["groupBy"] == ["DAY"]
+    assert result["date_range"] == "as requested"
+    assert result["days"] == [{"date": "2026-10-13", "engagements": 4}] and result["total"] == 4
+    assert "WhatsApp messages read" in result["metric"]
+
+
+@pytest.mark.asyncio
+async def test_call_activity_defaults_to_outcomes_per_day():
+    rows = [{"id": None, "name": "2026-05-10T18:30Z", "value": None,
+             "dimension": [{"name": "CONNECTED", "value": 2}, {"name": "MISSED_CALL", "value": 2}]},
+            {"id": None, "name": "2026-05-11T18:30Z", "value": None, "dimension": []}]
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_685), _ANALYTICS_685: rows})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_analytics_logic({"activity_id": 685, "timezone": "Asia/Calcutta", "agent_ids": ["11220"],
+                                                 "date_from": "2026-05-01", "date_to": "2026-05-31"})
+    body = api.call_to(_ANALYTICS_685)["body"]
+    assert body["groupBy"] == ["DAY", "OUTCOME"]
+    assert body["rules"] == [{"id": "userAgent", "field": "userAgent", "type": "long", "operator": "in", "value": [11220]}]
+    assert result["days"] == [{"date": "2026-05-11", "outcomes": [{"outcome": "CONNECTED", "calls": 2},
+                                                                  {"outcome": "MISSED_CALL", "calls": 2}]}]
+    assert result["per_outcome_total"] == [{"outcome": "CONNECTED", "calls": 2}, {"outcome": "MISSED_CALL", "calls": 2}]
+    assert result["total"] == 4
+
+
+@pytest.mark.asyncio
+async def test_call_dispositions_name_the_unset_one():
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_685),
+                            _ANALYTICS_685: [{"id": None, "name": None, "dimension": [], "value": 4}]})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_analytics_logic({"activity_id": 685, "group_by": "CALL_DISPOSITION",
+                                                 "timezone": "Asia/Calcutta"})
+    assert result["dispositions"] == [{"id": None, "disposition": "No disposition", "calls": 4}]
+
+
+@pytest.mark.asyncio
+async def test_empty_default_window_tells_the_model_to_widen_it():
+    # 685 was scheduled for 1 Apr but started on 11 May: the page's default window is empty.
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_685), _ANALYTICS_685: []})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_analytics_logic({"activity_id": 685, "timezone": "Asia/Calcutta"})
+    assert (result["date_from"], result["date_to"]) == ("2026-04-01", "2026-04-08")
+    assert "retry with date_from" in result["note"]
+    # Following the advice must not break the 366-day range limit.
+    assert "at most 365 days after date_from" in result["note"]
+
+
+@pytest.mark.parametrize("activity,payload,message", [
+    (_ACTIVITY_713, {"group_by": "DAY_OUTCOME"}, "isn't valid for a WHATSAPP activity"),
+    (_ACTIVITY_685, {"group_by": "ACTIVITY_STATUS"}, "isn't valid for a CALL activity"),
+    (_ACTIVITY_713, {"agent_ids": [11220]}, "only applies to CALL"),
+    (_ACTIVITY_685, {"agent_ids": ["x"]}, "needs a number"),
+])
+@pytest.mark.asyncio
+async def test_activity_analytics_rejects_bad_input_before_analytics_call(activity, payload, message):
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(activity)})
+    with patch("app.campaigns._campaign_call", api):
+        with pytest.raises(ValueError, match=message):
+            await activity_analytics_logic({"activity_id": activity["id"], **payload})
+    assert [c["path"] for c in api.calls] == [_SEARCH_ACTIVITIES]
+
+
+# --- campaign_activity.recipients -------------------------------------------
+
+
+_RECIPIENTS_713 = "/v1/campaigns/activities/713/recipient-status"
+_RECIPIENTS_685 = "/v1/campaigns/activities/685/recipient-status"
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_recipients_filter_by_status_newest_sent_first():
+    row = {"id": "e94ac5af", "entityId": 753402, "entityType": "LEAD", "recipientName": "Aditya T",
+           "phoneNumber": "+917350806466", "status": "REPLIED", "sentAt": "2026-10-13T06:24:19.000Z",
+           "deliveredAt": "2026-10-13T06:24:20.000Z", "readAt": "2026-10-13T06:25:10.000Z", "failedAt": None,
+           "repliedAt": "2026-10-19T06:18:44.312Z", "errorMessage": None}
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_713),
+                            _RECIPIENTS_713: {"content": [row], "totalElements": 1, "last": True}})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_recipients_logic({
+            "activity_name": "Abhinav Whatsapp Reply",
+            "filters": [{"field": "status", "operator": "in", "value": ["read", "replied"]}],
+        })
+    call = api.call_to(_RECIPIENTS_713)
+    assert call["params"] == {"page": 0, "size": 20, "sort": "sentAt,desc"}
+    assert call["body"]["jsonRule"]["rules"][0]["value"] == ["READ", "REPLIED"]
+    assert result["activity"]["id"] == 713 and result["total"] == 1
+    assert result["recipients"] == [{
+        "name": "Aditya T", "entity_type": "LEAD", "entity_id": 753402, "phone_number": "+917350806466",
+        "status": "REPLIED", "sent_at": "2026-10-13T06:24:19.000Z", "delivered_at": "2026-10-13T06:24:20.000Z",
+        "read_at": "2026-10-13T06:25:10.000Z", "replied_at": "2026-10-19T06:18:44.312Z", "failed_at": None}]
+
+
+@pytest.mark.asyncio
+async def test_email_recipient_keeps_the_failure_reason():
+    email = {**_ACTIVITY_713, "type": "EMAIL"}
+    row = {"entityId": 499675, "entityType": "LEAD", "recipientName": "Jessika Mante", "email": "j@example.com",
+           "status": "FAILED", "sentAt": "2026-05-22T07:31:47.417Z", "openedAt": None, "clickedAt": None,
+           "failedAt": "2026-05-22T07:31:56.913Z", "errorMessage": "550-5.1.1 The email account does not exist."}
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(email),
+                            _RECIPIENTS_713: {"content": [row], "totalElements": 1, "last": True}})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_recipients_logic({"activity_id": 713, "sort": "failedAt"})
+    assert api.call_to(_RECIPIENTS_713)["params"]["sort"] == "failedAt,asc"
+    recipient = result["recipients"][0]
+    assert recipient["email"] == "j@example.com" and recipient["error"].startswith("550-5.1.1")
+
+
+@pytest.mark.asyncio
+async def test_call_recipients_filter_by_outcome_newest_call_first():
+    row = {"entityId": 676016, "entityType": "LEAD", "recipientName": "Aditya Campaign Test 3",
+           "phoneNumber": "+919823289810", "outcome": "MISSED_CALL", "disposition": None,
+           "userAgent": {"id": 11220, "name": "Aditya Tambe"}, "duration": None, "callId": 157799,
+           "callCreatedAt": "2026-05-11T09:01:38.723Z"}
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_685),
+                            _RECIPIENTS_685: {"content": [row], "totalElements": 1, "last": True}})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_recipients_logic({"activity_id": 685,
+                                                  "filters": [{"field": "outcome", "value": "missed_call"}]})
+    call = api.call_to(_RECIPIENTS_685)
+    assert call["params"]["sort"] == "callCreatedAt,desc"
+    assert call["body"]["jsonRule"]["rules"][0]["value"] == "MISSED_CALL"
+    assert result["recipients"][0] == {
+        "name": "Aditya Campaign Test 3", "entity_type": "LEAD", "entity_id": 676016, "phone_number": "+919823289810",
+        "outcome": "MISSED_CALL", "disposition": None, "agent": {"id": 11220, "name": "Aditya Tambe"},
+        "duration_seconds": None, "call_id": 157799, "called_at": "2026-05-11T09:01:38.723Z"}
+
+
+@pytest.mark.parametrize("activity,payload,message", [
+    (_ACTIVITY_713, {"filters": [{"field": "openedAt", "operator": "is_not_null"}]}, "'openedAt' is not filterable"),
+    (_ACTIVITY_713, {"filters": [{"field": "status", "value": "OPENED"}]}, "not valid for 'status'"),
+    (_ACTIVITY_685, {"filters": [{"field": "status", "value": "READ"}]}, "'status' is not filterable"),
+    (_ACTIVITY_713, {"sort": "callCreatedAt,desc"}, "Can't sort by 'callCreatedAt'"),
+])
+@pytest.mark.asyncio
+async def test_recipient_filters_depend_on_activity_type(activity, payload, message):
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(activity)})
+    with patch("app.campaigns._campaign_call", api):
+        with pytest.raises(ValueError, match=message):
+            await activity_recipients_logic({"activity_id": activity["id"], **payload})
+    assert [c["path"] for c in api.calls] == [_SEARCH_ACTIVITIES]
+
+
+@pytest.mark.asyncio
+async def test_draft_activity_recipients_explain_why_empty():
+    draft = {**_ACTIVITY_713, "status": "DRAFT"}
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(draft)})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_recipients_logic({"activity_id": 713, "size": 5})
+    assert result["total"] == 0 and result["recipients"] == [] and result["size"] == 5
+    assert "hasn't sent anything" in result["note"]
+    # sd-campaign always answers an empty page for unsent activities, so it isn't asked.
+    assert [c["path"] for c in api.calls] == [_SEARCH_ACTIVITIES]
+
+
+# --- campaign_activity.generated_records ------------------------------------
+
+
+_GENERATED_713 = "/v1/campaigns/activities/713/generated-records"
+
+
+@pytest.mark.asyncio
+async def test_generated_records_by_id_skip_the_lookup():
+    row = {"id": 1, "entityId": 900001, "entityType": "LEAD", "entityName": "Riya P",
+           "phoneNumbers": [{"type": "MOBILE", "code": "IN", "value": "9876543210", "dialCode": "+91", "primary": True}],
+           "emails": [{"type": "OFFICE", "value": "riya@example.com", "primary": True}],
+           "createdAt": "2026-10-14T05:00:00.000Z"}
+    api = _FakeCampaignApi({_GENERATED_713: {"content": [row], "totalElements": 1, "last": True}})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_generated_records_logic({"activity_id": 713})
+    assert [c["path"] for c in api.calls] == [_GENERATED_713]
+    assert api.calls[0]["params"] == {"page": 0, "size": 20, "sort": "createdAt,desc"}
+    assert result["activity"] == {"id": 713}
+    assert result["records"] == [{"entity_type": "LEAD", "entity_id": 900001, "name": "Riya P",
+                                  "phone_numbers": ["+919876543210"], "emails": ["riya@example.com"],
+                                  "created_at": "2026-10-14T05:00:00.000Z"}]
+
+
+@pytest.mark.asyncio
+async def test_generated_records_by_name_resolve_the_activity():
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_713),
+                            _GENERATED_713: {"content": [], "totalElements": 0, "last": True}})
+    with patch("app.campaigns._campaign_call", api):
+        result = await activity_generated_records_logic({"activity_name": "Abhinav Whatsapp Reply"})
+    assert result["activity"]["campaign"]["id"] == 433 and result["records"] == []
+
+
+# --- registry wiring ----------------------------------------------------------
+
+
+def test_campaign_activity_bucket_lists_the_five_read_ids():
+    from app.tools import list_tool
+
+    ids = sorted(r["id"] for r in json.loads(list_tool(bucket="campaign_activity"))["results"])
+    assert ids == ["campaign_activity.analytics", "campaign_activity.generated_records", "campaign_activity.get",
+                   "campaign_activity.recipients", "campaign_activity.search"]
+
+
+@pytest.mark.asyncio
+async def test_build_payload_returns_campaign_activity_schemas():
+    from app.tools import build_payload
+
+    analytics = json.loads(await build_payload("campaign_activity.analytics"))
+    assert analytics["path"] == "/v1/campaigns/{campaign_id}/activities/{activity_id}/analytics"
+    assert analytics["schema"]["properties"]["group_by"]["enum"] == [
+        "ACTIVITY_STATUS", "CALL_DISPOSITION", "DAY", "DAY_OUTCOME"]
+    assert {"activity_id", "activity_name", "campaign_id"} <= set(analytics["schema"]["properties"])
+
+    recipients = json.loads(await build_payload("campaign_activity.recipients"))
+    fields = recipients["schema"]["properties"]["filters"]["items"]["properties"]["field"]["enum"]
+    assert {"status", "readAt", "openedAt", "outcome", "callCreatedAt"} <= set(fields)
+
+
+@pytest.mark.asyncio
+async def test_execute_request_returns_activity_choices_as_ok():
+    from app.tools import execute_request
+
+    api = _FakeCampaignApi({_SEARCH_ACTIVITIES: _activity_rows(_ACTIVITY_716, _ACTIVITY_713)})
+    with patch("app.campaigns._campaign_call", api):
+        result = json.loads(await execute_request("campaign_activity.get", {"activity_name": "Abhinav"}))
+    assert result["ok"] is True
+    assert len(result["data"]["matches"]) == 2

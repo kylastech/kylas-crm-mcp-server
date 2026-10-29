@@ -56,8 +56,11 @@
        (e.g. "abhinav"), then pick the campaign whose name clearly matches
        what they said.
     3. More than one match (names can repeat, e.g. two "testing bulk email"
-       campaigns): list them with id, status and dates and ask which one —
-       never pick one silently.
+       campaigns): STOP and ask the user to choose one — a single-choice
+       question with one option per match showing name, id, status,
+       total_engagement and started date (clickable choices if your app
+       offers them). Never pick one silently, and don't run campaign.get /
+       campaign.analytics for every match unless the user asked for all.
     4. Exactly one match: use its id with campaign.get / campaign.analytics.
 
     page (0-based), size (1-50, default 20), sort "<field>,<asc|desc>"
@@ -94,7 +97,10 @@
     audience filters, budget and engagement numbers.
 
     This is also the way to list one campaign's activities — activity
-    search can't filter by campaign.
+    search can't filter by campaign. For one activity's performance
+    (sent/delivered/read funnel, call outcomes) use
+    campaign_activity.analytics; for its recipients,
+    campaign_activity.recipients.
 
     Budget/expense values are {value, currency, currency_id}. Timestamps are
     UTC — convert to the user's timezone before showing them. A DRAFT

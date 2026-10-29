@@ -216,8 +216,14 @@
   method: GET
   path: /v1/campaigns/lookup
   dynamic_fields: false
-  description: "Look up campaigns by name — campaign ids for the campaignActivities report filter."
+  description: "REPORT FILTERS ONLY — campaign id for the campaignActivities filter in report.create / report.preview. To find a campaign or answer questions about one, use campaign.search."
   usage_notes: >
+    Only for building a report filter (report.create / report.preview).
+    To find a campaign the user names,
+    or to answer anything about campaigns or their activities, use
+    campaign.search (search_term) / campaign.get / campaign_activity.* —
+    this lookup returns bare "ID | Name" rows with nothing else.
+
     query: the campaign name or part of it (sent as name:<query>); leave it
     empty to list every campaign. Returns "ID | Name" rows. Use the ID as
     the value of the campaignActivities filter in report.create. To filter
@@ -230,8 +236,12 @@
   method: GET
   path: /v1/campaigns/{campaign_id}
   dynamic_fields: false
-  description: "List one campaign's activities — activity ids for the activities report filter."
+  description: "REPORT FILTERS ONLY — activity ids for the activities filter in report.create / report.preview. To see a campaign's activities, use campaign.get."
   usage_notes: >
+    Only for building a report filter (report.create / report.preview). To
+    list or answer questions about a campaign's activities use campaign.get
+    (all its activities with details) or campaign_activity.*.
+
     campaign_id: the campaign's ID from campaign.lookup. Returns "ID | Name"
     rows for that campaign's activities. In report.create the activities
     filter also needs a campaignActivities filter on the SAME campaign
