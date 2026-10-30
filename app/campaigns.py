@@ -1363,6 +1363,212 @@ async def check_utm_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Confirmation — every create / update is two calls (plan W7). The first (no
+# confirm) validates and builds the exact request body but writes nothing; it
+# returns a preview. Only a second call with the same details and
+# confirm: true writes — and it re-runs every check before writing. The code
+# enforces this; it doesn't rely on the model.
+# ---------------------------------------------------------------------------
+
+
+async def _acting_user() -> Dict[str, Any]:
+    """Who a write runs as — shown in every preview."""
+    u = await _fetch_current_user()
+    name = u.get("name") or f"{u.get('firstName') or ''} {u.get('lastName') or ''}".strip() or None
+    return {"id": u.get("id"), "name": name, "tenant_id": u.get("tenantId"),
+            "timezone": u.get("timezone") or DEFAULT_TIMEZONE}
+
+
+def _preview_reply(op: str, details: Dict[str, Any], user: Dict[str, Any], what: str) -> Dict[str, Any]:
+    return {
+        "executed": False,
+        "preview": details,
+        "runs_as": {"user": user["name"], "user_id": user["id"], "tenant_id": user["tenant_id"]},
+        "note": f"NOTHING WAS WRITTEN — this is a preview. Show the user every detail above and that it runs as "
+                f"{user['name']}, then ask a Yes / No question to {what} (clickable choices if your app offers "
+                f"them). Yes: call {op} again with exactly the same details plus confirm: true. No: stop — make "
+                "no other call. If the user wants changes, call again without confirm for a new preview. Never "
+                "say it was done until a call returns executed: true.",
+    }
+
+
+# ---------------------------------------------------------------------------
+# campaign.create / campaign.update
+# ---------------------------------------------------------------------------
+
+_TEXT_FIELDS = ("name", "description", "utm_campaign", "utm_source", "utm_medium", "utm_content", "utm_term")
+_REQUIRED_ON_CREATE = ("name", "utm_campaign", "utm_source", "utm_medium")
+_CAMPAIGN_CHANGEABLE = _TEXT_FIELDS + ("budget", "start_date", "end_date")
+# A started campaign: sd-campaign applies only these and silently ignores the rest
+# (Campaign.applyCampaignStandardUpdates), so anything else is refused up front.
+_STARTED_CHANGEABLE = {"budget", "end_date"}
+
+
+def _text_value(payload: Dict[str, Any], key: str, required: bool) -> Optional[str]:
+    value = payload.get(key)
+    text = str(value).strip() if value is not None else ""
+    if required and not text:
+        raise ValueError(f"'{key}' is required.")
+    if len(text) > 255 and key != "description":
+        raise ValueError(f"'{key}' can be at most 255 characters.")
+    return text or None
+
+
+async def _budget_body(value: Any, default_currency_id: Optional[int]) -> Dict[str, Any]:
+    """budget as a number or {value, currency} -> {currencyId, value}. No currency: default_currency_id, else base."""
+    if isinstance(value, dict):
+        amount, currency = value.get("value"), value.get("currency")
+    else:
+        amount, currency = value, None
+    if amount in (None, ""):
+        raise ValueError("'budget' needs a value, e.g. {\"value\": 50000, \"currency\": \"INR\"}.")
+    number = _number_value(amount, "double", "budget", "value")
+    if number < 0:
+        raise ValueError("'budget' can't be negative.")
+    currency_id = await _resolve_currency(currency) if currency not in (None, "") else (
+        default_currency_id or await _resolve_currency(None))
+    return {"currencyId": currency_id, "value": number}
+
+
+def _instant(value: Optional[str]) -> Optional[datetime]:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+
+
+def _local_text(value: Optional[str], tz_name: str) -> Optional[str]:
+    instant = _instant(value)
+    return f"{instant.astimezone(ZoneInfo(tz_name)):%d %b %Y, %I:%M:%S %p} ({tz_name})" if instant else None
+
+
+def _campaign_details(body: Dict[str, Any], currencies: Dict[int, str], tz_name: str) -> Dict[str, Any]:
+    """A campaign body as the readable details the user confirms."""
+    budget = body.get("estimatedBudget") or {}
+    return {
+        "name": body.get("name"),
+        "description": body.get("description"),
+        "budget": {"value": budget.get("value"), "currency": currencies.get(budget.get("currencyId")),
+                   "currency_id": budget.get("currencyId")},
+        "start_date": _local_text(body.get("startDate"), tz_name),
+        "end_date": _local_text(body.get("endDate"), tz_name) or "none",
+        "utm": {k: body.get(f"utm{k.title()}") for k in ("campaign", "source", "medium", "content", "term")},
+    }
+
+
+async def _campaign_create_body(payload: Dict[str, Any], tz_name: str) -> Dict[str, Any]:
+    texts = {k: _text_value(payload, k, k in _REQUIRED_ON_CREATE) for k in _TEXT_FIELDS}
+    if payload.get("budget") in (None, ""):
+        raise ValueError("'budget' is required, e.g. {\"value\": 50000, \"currency\": \"INR\"} (currency "
+                         "defaults to the tenant's base currency).")
+    if payload.get("start_date") in (None, ""):
+        raise ValueError("'start_date' is required (the user's local date, YYYY-MM-DD).")
+    start = _write_date(payload["start_date"], tz_name, False, "start_date")
+    end = _write_date(payload["end_date"], tz_name, True, "end_date") if payload.get("end_date") else None
+    _check_date_order(start, end)
+    budget = await _budget_body(payload["budget"], None)
+    body = {_CAMPAIGN_FIELD_MAP[k]: v for k, v in texts.items()}
+    body.update({"startDate": start, "endDate": end, "estimatedBudget": budget,
+                 # sd-campaign sets the same itself; sent because the web form does.
+                 "actualExpense": {"currencyId": budget["currencyId"], "value": 0}})
+    return body
+
+
+async def create_campaign_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST /v1/campaigns — in two calls: preview (nothing written), then the same details with confirm: true."""
+    user = await _acting_user()
+    tz_name = await _resolve_timezone(payload.get("timezone") or user["timezone"])
+    body = await _campaign_create_body(payload, tz_name)
+    if payload.get("confirm") is True:
+        created = await _campaign_call("POST", "/v1/campaigns", "Create campaign", body=body)
+        return {"executed": True, "campaign": await get_campaign_logic({"campaign_id": created["id"]})}
+    details = {**_campaign_details(body, await _currency_names(), tz_name), "status": "DRAFT (nothing is sent)"}
+    return _preview_reply("campaign.create", details, user, "create this campaign")
+
+
+def _same(a: Any, b: Any) -> bool:
+    return (a or None) == (b or None)
+
+
+async def _campaign_update_body(
+    payload: Dict[str, Any], current: Dict[str, Any], tz_name: str,
+) -> Tuple[Dict[str, Any], Dict[str, Tuple[Any, Any]]]:
+    """(full PUT body, {field: (before, after)}) for the fields the user changes — validated like sd-campaign."""
+    asked = [k for k in _CAMPAIGN_CHANGEABLE if k in payload]
+    if not asked:
+        raise ValueError(f"Nothing to change. Give any of: {', '.join(_CAMPAIGN_CHANGEABLE)}.")
+    status = current.get("status")
+    if status != "DRAFT" and set(asked) - _STARTED_CHANGEABLE:
+        raise ValueError(f"This campaign is {status}: only budget and end_date can change now (Kylas ignores the "
+                         f"rest once a campaign has started). Not allowed: {sorted(set(asked) - _STARTED_CHANGEABLE)}.")
+
+    changes: Dict[str, Any] = {}
+    for key in asked:
+        if key in _TEXT_FIELDS:
+            changes[key] = _text_value(payload, key, key in _REQUIRED_ON_CREATE)
+        elif key == "start_date":
+            changes[key] = _write_date(payload[key], tz_name, False, key)
+        elif key == "end_date":  # empty clears it
+            changes[key] = _write_date(payload[key], tz_name, True, key) if payload.get(key) else None
+    body = merge_for_update(current, changes, _CAMPAIGN_FIELD_MAP, _CAMPAIGN_BODY_FIELDS)
+    if "budget" in asked:
+        body["estimatedBudget"] = await _budget_body(
+            payload["budget"], (current.get("estimatedBudget") or {}).get("currencyId"))
+
+    # The same checks sd-campaign runs on update (Campaign.validateUpdateProperties).
+    _check_date_order(body["startDate"], body.get("endDate"))
+    start, end = _instant(body["startDate"]), _instant(body.get("endDate"))
+    for a in current.get("activities") or []:
+        for label, field in (("starts", "startDate"), ("ends", "endDate")):
+            when = _instant(a.get(field))
+            if when and (when < start or (end and when > end)):
+                raise ValueError(f"Activity '{a.get('name')}' {label} on {_local_text(a.get(field), tz_name)}, "
+                                 "outside the new campaign dates. Change that activity first, or keep its dates "
+                                 "inside the campaign.")
+    activity_budget = sum(((a.get("estimatedBudget") or {}).get("value") or 0) for a in current.get("activities") or [])
+    if activity_budget > body["estimatedBudget"]["value"]:
+        raise ValueError(f"The activities' budgets add up to {activity_budget:g}, more than the new campaign "
+                         f"budget {body['estimatedBudget']['value']:g}.")
+
+    api_names = {**_CAMPAIGN_FIELD_MAP, "budget": "estimatedBudget"}
+    diff = {k: (current.get(api_names[k]), body.get(api_names[k])) for k in asked
+            if not _same(current.get(api_names[k]), body.get(api_names[k]))}
+    if not diff:
+        raise ValueError("Those values are already set — nothing would change.")
+    return body, diff
+
+
+async def update_campaign_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """PUT /v1/campaigns/{id} (full body, read-merge-write) — in two calls: preview, then confirm: true.
+
+    Both calls read the campaign fresh and run every check, so the confirm
+    writes the user's changes on top of its current values.
+    """
+    user = await _acting_user()
+    tz_name = await _resolve_timezone(payload.get("timezone") or user["timezone"])
+    campaign_id, choice = await _resolve_campaign_id(payload)
+    if choice:
+        return choice
+    current = await _campaign_call("GET", f"/v1/campaigns/{campaign_id}", "Fetch campaign")
+    body, diff = await _campaign_update_body(payload, current, tz_name)
+    if payload.get("confirm") is True:
+        await _campaign_call("PUT", f"/v1/campaigns/{campaign_id}", "Update campaign", body=body)
+        return {"executed": True, "campaign": await get_campaign_logic({"campaign_id": campaign_id})}
+
+    currencies = await _currency_names()
+
+    def shown(field: str, value: Any) -> Any:
+        if field == "budget":
+            return {"value": (value or {}).get("value"), "currency": currencies.get((value or {}).get("currencyId"))}
+        return _local_text(value, tz_name) or "none" if field in ("start_date", "end_date") else value
+
+    details = {
+        "campaign": {"id": campaign_id, "name": current.get("name"), "status": current.get("status")},
+        "changes": {k: {"before": shown(k, before), "after": shown(k, after)} for k, (before, after) in diff.items()},
+        "after_update": _campaign_details(body, currencies, tz_name),
+    }
+    return _preview_reply("campaign.update", details, user,
+                          f"apply these changes to campaign '{current.get('name')}'")
+
+
+# ---------------------------------------------------------------------------
 # Input schemas (what build_payload returns for each id)
 # ---------------------------------------------------------------------------
 
@@ -1417,6 +1623,26 @@ _ANALYTICS_DATE_PROPERTIES = {
 }
 
 _RECIPIENT_FILTER_FIELD_NAMES = sorted({f for fields in RECIPIENT_FILTER_FIELDS.values() for f in fields})
+
+_CAMPAIGN_WRITE_PROPERTIES = {
+    "name": {"type": "string", "maxLength": 255},
+    "description": {"type": "string"},
+    "budget": {"type": "object", "description": "Estimated budget.",
+               "properties": {"value": {"type": "number", "minimum": 0},
+                              "currency": {"type": ["string", "integer"],
+                                           "description": "Code (INR) or currency_id; defaults to the base currency "
+                                                          "(create) or the current one (update)."}}},
+    "start_date": {"type": "string", "description": "User's local date YYYY-MM-DD (start of that day) or datetime."},
+    "end_date": {"type": ["string", "null"],
+                 "description": "User's local date YYYY-MM-DD (end of that day) or datetime; empty clears it."},
+    "timezone": {"type": "string", "description": "IANA timezone of the dates; defaults to the current user's."},
+    **{f"utm_{k}": {"type": "string", "maxLength": 255} for k in ("campaign", "source", "medium", "content", "term")},
+}
+
+_CONFIRM_PROPERTIES = {
+    "confirm": {"type": "boolean",
+                "description": "Leave out for the preview. true only after the user said Yes to it, with the same details."},
+}
 
 CampaignRouter = Callable[[Dict[str, Any]], Awaitable[Any]]
 
@@ -1487,6 +1713,17 @@ CAMPAIGN_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
     },
     "campaign.currencies": {"type": "object", "properties": {}},
+    "campaign.create": {"type": "object", "properties": {**_CAMPAIGN_WRITE_PROPERTIES, **_CONFIRM_PROPERTIES}},
+    "campaign.update": {
+        "type": "object",
+        "properties": {
+            "campaign_id": {"type": "integer", "description": "The campaign's id. Give this or campaign_name."},
+            "campaign_name": {"type": "string",
+                              "description": "The campaign's name (or part of it); several matches return a choice."},
+            **_CAMPAIGN_WRITE_PROPERTIES,
+            **_CONFIRM_PROPERTIES,
+        },
+    },
     "campaign_activity.email_templates": {
         "type": "object",
         "properties": {
@@ -1532,6 +1769,8 @@ CAMPAIGN_ROUTERS: Dict[str, CampaignRouter] = {
     "campaign_activity.recipients": activity_recipients_logic,
     "campaign_activity.generated_records": activity_generated_records_logic,
     "campaign.currencies": currencies_logic,
+    "campaign.create": create_campaign_logic,
+    "campaign.update": update_campaign_logic,
     "campaign_activity.email_templates": email_templates_logic,
     "campaign_activity.whatsapp_accounts": whatsapp_accounts_logic,
     "campaign_activity.whatsapp_templates": whatsapp_templates_logic,

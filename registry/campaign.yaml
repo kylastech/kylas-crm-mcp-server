@@ -151,3 +151,85 @@
     the user names none, the tenant's base currency is used. An activity's
     budget always uses its campaign's currency.
   example: {}
+
+# ---------------------------------------------------------------------------
+# Writes (Plan 2). Every write is TWO calls: a preview that writes nothing, then
+# — only after the user says Yes — the same call with confirm: true. The server
+# enforces this.
+# ---------------------------------------------------------------------------
+
+- id: campaign.create
+  bucket: campaign
+  intent: create
+  method: POST
+  path: /v1/campaigns
+  dynamic_fields: false
+  description: "Create a marketing campaign (as DRAFT — nothing is sent). Two calls: preview, then confirm."
+  usage_notes: >
+    Step 1 — preview (no confirm): send the details. Nothing is written; the
+    result is {executed: false, preview, runs_as, note}. Show the user EVERY
+    detail in preview and who it runs as, then ask a Yes / No question
+    (clickable choices if your app offers them).
+    Step 2 — only if the user says Yes: call campaign.create again with
+    exactly the same details plus confirm: true. The server checks everything
+    again, creates the campaign and returns {executed: true, campaign}.
+    If the user says No, stop and make no other call. If they want changes,
+    send the changed details WITHOUT confirm for a new preview and ask again.
+    Never tell the user the campaign was created until a call returns
+    executed: true.
+
+    Fields: name (required, max 255); description; budget {value (required,
+    0 or more), currency (code like "INR" or currency_id; defaults to the
+    tenant's base currency — see campaign.currencies)}; start_date
+    (required) and end_date (optional) as the user's LOCAL date YYYY-MM-DD
+    or datetime — a plain start date means 00:00 and a plain end date
+    23:59:59 that day, in the current user's timezone unless timezone is
+    given; end_date can't be before start_date; utm_campaign, utm_source,
+    utm_medium (required, max 255), utm_content, utm_term (optional). Ask
+    the user for any required value they didn't give — don't invent UTM
+    values.
+
+    New campaigns are always DRAFT: nothing is sent until it is started.
+    Add activities with campaign_activity ids.
+  example:
+    name: "Diwali Offer 2026"
+    budget: {value: 50000, currency: INR}
+    start_date: "2026-11-01"
+    end_date: "2026-11-30"
+    utm_campaign: "diwali-2026"
+    utm_source: "kylas"
+    utm_medium: "whatsapp"
+
+- id: campaign.update
+  bucket: campaign
+  intent: update
+  method: PUT
+  path: /v1/campaigns/{campaign_id}
+  dynamic_fields: false
+  description: "Change a campaign's details, budget or dates. Two calls: preview, then confirm."
+  usage_notes: >
+    Identify the campaign with campaign_id or campaign_name (several name
+    matches return {matches[], note}: ask the user which one first). Send
+    only the fields that change; everything else keeps its current value.
+
+    Step 1 — preview (no confirm): nothing is written; the result shows each
+    change as before -> after, the campaign after the update, and who it
+    runs as. Show all of it and ask a Yes / No question (clickable choices
+    if your app offers them).
+    Step 2 — only if the user says Yes: call campaign.update again with
+    exactly the same campaign and changes plus confirm: true. The server
+    reads the campaign again, re-runs every check and applies the changes
+    on top of its current values. No: stop, make no other call. Never say
+    it was updated until a call returns executed: true.
+
+    Changeable: name, description, budget {value, currency}, start_date,
+    end_date (empty clears it), utm_campaign, utm_source, utm_medium,
+    utm_content, utm_term — dates are the user's LOCAL date/datetime as in
+    campaign.create. Once a campaign has started (not DRAFT) only budget and
+    end_date can change; other fields are refused. Checked before the
+    preview: end_date not before start_date, every activity's dates still
+    inside the campaign's, and the activities' budgets not more than the
+    new campaign budget.
+  example:
+    campaign_name: "Diwali Offer"
+    budget: {value: 75000}

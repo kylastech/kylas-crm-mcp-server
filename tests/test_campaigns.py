@@ -573,7 +573,8 @@ def test_campaign_bucket_lists_its_ids():
     from app.tools import list_tool
 
     ids = sorted(r["id"] for r in json.loads(list_tool(bucket="campaign"))["results"])
-    assert ids == ["campaign.analytics", "campaign.currencies", "campaign.get", "campaign.search"]
+    assert ids == ["campaign.analytics", "campaign.create", "campaign.currencies", "campaign.get", "campaign.search",
+                   "campaign.update"]
 
 
 @pytest.mark.asyncio

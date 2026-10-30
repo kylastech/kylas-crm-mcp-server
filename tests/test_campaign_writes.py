@@ -452,3 +452,243 @@ async def test_check_utm_excludes_the_activity_itself():
         result = await check_utm_logic({"utm_campaign": "abhinav", "activity_id": 713})
     assert result == {"utm_campaign": "abhinav", "available": True}
     assert api.calls[0]["params"] == {"fieldName": "utmCampaign", "value": "abhinav", "id": 713}
+
+
+# ---------------------------------------------------------------------------
+# Phase C1 — campaign.create / campaign.update: a preview first (nothing
+# written), then the same details with confirm: true.
+# ---------------------------------------------------------------------------
+
+from app.campaigns import create_campaign_logic, update_campaign_logic  # noqa: E402
+
+_USER = {"id": 8112, "name": "Akash Nakhate", "tenant_id": 3691, "timezone": "Asia/Calcutta"}
+
+_CREATE = {
+    "name": "Diwali Offer 2026", "description": "Festive push",
+    "budget": {"value": 50000, "currency": "INR"}, "start_date": "2026-11-01", "end_date": "2026-11-30",
+    "utm_campaign": "diwali-2026", "utm_source": "kylas", "utm_medium": "whatsapp",
+}
+_CREATE_BODY = {
+    "name": "Diwali Offer 2026", "description": "Festive push",
+    "utmCampaign": "diwali-2026", "utmSource": "kylas", "utmMedium": "whatsapp", "utmContent": None, "utmTerm": None,
+    "startDate": "2026-10-31T18:30:00.000Z", "endDate": "2026-11-30T18:29:59.999Z",
+    "estimatedBudget": {"currencyId": 431, "value": 50000.0}, "actualExpense": {"currencyId": 431, "value": 0},
+}
+
+
+class _FakeWriteApi:
+    """Stands in for _campaign_call in write tests: routes by (method, path), records every call."""
+
+    def __init__(self, responses=None):
+        self.responses = responses or {}
+        self.calls = []
+
+    async def __call__(self, method, path, op, *, params=None, body=None, allow_empty=False):
+        self.calls.append({"method": method, "path": path, "body": body})
+        return self.responses.get((method, path), {})
+
+    def writes(self):
+        return [c for c in self.calls if c["method"] == "PUT" or (c["method"] == "POST" and not c["path"].endswith("/search"))]
+
+
+class _Patched:
+    """The write tests' doubles: Kylas calls, the acting user, currencies, and the final campaign.get."""
+
+    def __init__(self, api, user=_USER):
+        self.patches = [
+            patch("app.campaigns._campaign_call", api),
+            patch("app.campaigns._acting_user", AsyncMock(return_value=user)),
+            patch("app.campaigns._fetch_currencies", AsyncMock(return_value=_CURRENCY_ROWS)),
+            patch("app.campaigns._currency_names", AsyncMock(return_value={431: "INR", 400: "USD"})),
+            patch("app.campaigns.get_campaign_logic", AsyncMock(side_effect=lambda p: {"id": p["campaign_id"]})),
+        ]
+
+    def __enter__(self):
+        for p in self.patches:
+            p.start()
+
+    def __exit__(self, *exc):
+        for p in reversed(self.patches):
+            p.stop()
+
+
+# --- campaign.create ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_preview_writes_nothing_and_shows_everything():
+    api = _FakeWriteApi()
+    with _Patched(api):
+        result = await create_campaign_logic(dict(_CREATE))
+    assert api.calls == []
+    assert result["executed"] is False
+    preview = result["preview"]
+    assert preview["name"] == "Diwali Offer 2026"
+    assert preview["budget"] == {"value": 50000.0, "currency": "INR", "currency_id": 431}
+    assert preview["start_date"] == "01 Nov 2026, 12:00:00 AM (Asia/Calcutta)"
+    assert preview["end_date"] == "30 Nov 2026, 11:59:59 PM (Asia/Calcutta)"
+    assert preview["utm"]["campaign"] == "diwali-2026"
+    assert preview["status"].startswith("DRAFT")
+    assert result["runs_as"] == {"user": "Akash Nakhate", "user_id": 8112, "tenant_id": 3691}
+    assert "NOTHING WAS WRITTEN" in result["note"] and "Yes / No" in result["note"]
+    assert "confirm: true" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_create_with_confirm_sends_the_body():
+    api = _FakeWriteApi({("POST", "/v1/campaigns"): {"id": 500}})
+    with _Patched(api):
+        result = await create_campaign_logic({**_CREATE, "confirm": True})
+    assert api.writes() == [{"method": "POST", "path": "/v1/campaigns", "body": _CREATE_BODY}]
+    assert result == {"executed": True, "campaign": {"id": 500}}
+
+
+@pytest.mark.parametrize("confirm", [False, "true", 1, None])
+@pytest.mark.asyncio
+async def test_only_confirm_true_writes(confirm):
+    api = _FakeWriteApi()
+    with _Patched(api):
+        result = await create_campaign_logic({**_CREATE, "confirm": confirm})
+    assert result["executed"] is False and api.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_create_defaults_to_the_base_currency_and_allows_no_end_date():
+    payload = {k: v for k, v in _CREATE.items() if k != "end_date"}
+    payload["budget"] = 1000
+    api = _FakeWriteApi({("POST", "/v1/campaigns"): {"id": 501}})
+    with _Patched(api):
+        preview = await create_campaign_logic(dict(payload))
+        await create_campaign_logic({**payload, "confirm": True})
+    assert preview["preview"]["end_date"] == "none"
+    body = api.writes()[0]["body"]
+    assert body["estimatedBudget"] == {"currencyId": 431, "value": 1000.0} and body["endDate"] is None
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"name": ""}, "'name' is required"),
+    ({"utm_source": None}, "'utm_source' is required"),
+    ({"name": "x" * 256}, "at most 255 characters"),
+    ({"budget": None}, "'budget' is required"),
+    ({"budget": {"value": -5}}, "can't be negative"),
+    ({"budget": {"value": 10, "currency": "GBP"}}, "isn't an active currency"),
+    ({"start_date": None}, "'start_date' is required"),
+    ({"end_date": "2026-10-01"}, "on or after 'start_date'"),
+])
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.asyncio
+async def test_create_is_validated_before_anything_is_written(change, message, confirm):
+    api = _FakeWriteApi()
+    with _Patched(api):
+        with pytest.raises(ValueError, match=message):
+            await create_campaign_logic({**_CREATE, **change, "confirm": confirm})
+    assert api.calls == []
+
+
+# --- campaign.update ------------------------------------------------------------
+
+_CURRENT = {
+    "id": 440, "name": "Diwali Offer", "description": None, "status": "DRAFT",
+    "estimatedBudget": {"currencyId": 431, "value": 30000.0}, "actualExpense": {"currencyId": 431, "value": 0.0},
+    "startDate": "2026-10-31T18:30:00.000Z", "endDate": "2026-11-30T18:29:59.999Z", "startedAt": None,
+    "endedAt": None, "startedBy": None, "endedBy": None, "utmSource": "kylas", "utmCampaign": "diwali-offer",
+    "utmMedium": "email", "utmContent": None, "utmTerm": None, "updatedAt": "2026-10-23T11:18:38.483Z",
+    "activities": [{"id": 900, "name": "Diwali email", "startDate": "2026-11-05T04:30:00.000Z",
+                    "endDate": "2026-11-10T04:30:00.000Z", "estimatedBudget": {"currencyId": 431, "value": 10000.0}}],
+    "recordActions": {"update": True}, "totalEngagement": 0,
+}
+
+
+def _update_api(current=_CURRENT):
+    return _FakeWriteApi({("GET", "/v1/campaigns/440"): current, ("PUT", "/v1/campaigns/440"): {"id": 440}})
+
+
+@pytest.mark.asyncio
+async def test_update_preview_shows_before_and_after_and_writes_nothing():
+    api = _update_api()
+    with _Patched(api):
+        result = await update_campaign_logic({"campaign_id": 440, "budget": {"value": 75000},
+                                              "description": "Bigger push"})
+    assert api.writes() == []
+    assert result["executed"] is False
+    changes = result["preview"]["changes"]
+    assert changes["budget"] == {"before": {"value": 30000.0, "currency": "INR"},
+                                 "after": {"value": 75000.0, "currency": "INR"}}
+    assert changes["description"] == {"before": None, "after": "Bigger push"}
+    assert result["preview"]["after_update"]["name"] == "Diwali Offer"
+    assert result["preview"]["campaign"] == {"id": 440, "name": "Diwali Offer", "status": "DRAFT"}
+
+
+@pytest.mark.asyncio
+async def test_update_with_confirm_puts_the_merged_body():
+    api = _update_api()
+    with _Patched(api):
+        result = await update_campaign_logic({"campaign_id": 440, "budget": {"value": 75000},
+                                              "end_date": "2026-12-15", "confirm": True})
+    (put,) = api.writes()
+    body = put["body"]
+    assert put["path"] == "/v1/campaigns/440"
+    assert body["estimatedBudget"] == {"currencyId": 431, "value": 75000.0}
+    assert body["endDate"] == "2026-12-15T18:29:59.999Z"
+    assert body["utmCampaign"] == "diwali-offer" and body["name"] == "Diwali Offer"
+    assert "recordActions" not in body and "activities" not in body and "status" not in body
+    assert result == {"executed": True, "campaign": {"id": 440}}
+
+
+@pytest.mark.asyncio
+async def test_update_confirm_merges_onto_the_current_values():
+    # Someone else renamed it after the preview: the confirm keeps their name and applies only our change.
+    renamed = {**_CURRENT, "name": "Diwali Mega Offer"}
+    api = _update_api(renamed)
+    with _Patched(api):
+        await update_campaign_logic({"campaign_id": 440, "budget": 75000, "confirm": True})
+    body = api.writes()[0]["body"]
+    assert body["name"] == "Diwali Mega Offer" and body["estimatedBudget"]["value"] == 75000.0
+
+
+@pytest.mark.asyncio
+async def test_update_by_name_with_several_matches_asks_first():
+    api = _FakeWriteApi({("POST", "/v1/campaigns/search"): _campaign_rows(
+        {"id": 13, "name": "Summer Promo"}, {"id": 14, "name": "Summer Promo"})})
+    with _Patched(api):
+        result = await update_campaign_logic({"campaign_name": "Summer Promo", "budget": 1, "confirm": True})
+    assert [m["id"] for m in result["matches"]] == [13, 14] and "nothing was done" in result["note"]
+    assert api.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_started_campaign_only_takes_budget_and_end_date():
+    started = {**_CURRENT, "status": "IN_PROGRESS"}
+    with _Patched(_update_api(started)):
+        with pytest.raises(ValueError, match=r"only budget and end_date.*Not allowed: \['name'\]"):
+            await update_campaign_logic({"campaign_id": 440, "name": "New name", "budget": 40000})
+        result = await update_campaign_logic({"campaign_id": 440, "budget": 40000, "end_date": "2026-12-31"})
+    assert set(result["preview"]["changes"]) == {"budget", "end_date"}
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"start_date": "2026-11-07"}, "Activity 'Diwali email' starts on .* outside the new campaign dates"),
+    ({"end_date": "2026-11-08"}, "Activity 'Diwali email' ends on .* outside the new campaign dates"),
+    ({"budget": 5000}, "activities' budgets add up to 10000, more than the new campaign budget 5000"),
+    ({"end_date": "2026-10-15"}, "on or after 'start_date'"),
+    ({}, "Nothing to change"),
+    ({"name": "Diwali Offer"}, "already set"),
+])
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.asyncio
+async def test_update_runs_the_backend_checks_before_anything_is_written(change, message, confirm):
+    api = _update_api()
+    with _Patched(api):
+        with pytest.raises(ValueError, match=message):
+            await update_campaign_logic({"campaign_id": 440, **change, "confirm": confirm})
+    assert api.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_update_can_clear_the_end_date():
+    api = _update_api()
+    with _Patched(api):
+        preview = await update_campaign_logic({"campaign_id": 440, "end_date": None})
+        await update_campaign_logic({"campaign_id": 440, "end_date": None, "confirm": True})
+    assert preview["preview"]["changes"]["end_date"]["after"] == "none"
+    assert api.writes()[0]["body"]["endDate"] is None

@@ -793,10 +793,12 @@ def list_tool(
       report has create and preview (report.create — creates and SAVES a real Kylas
       report / chart; report.preview — runs the same report and returns its
       numbers WITHOUT saving; both need entity="<entity>" in build_payload);
-      campaign is READ-ONLY for now — search, get, analytics (campaign.analytics:
-      engagement per day for one marketing campaign); campaign_activity is
-      READ-ONLY — search, get, analytics (funnel / call outcomes), plus
-      recipients and generated_records (search intent); _meta
+      campaign has search, get, analytics (campaign.analytics: engagement per
+      day for one marketing campaign), lookup (campaign.currencies), create
+      and update (both two calls: preview, then confirm); campaign_activity is
+      READ-ONLY for now — search, get, analytics (funnel / call outcomes),
+      lookups for templates/accounts/UTM, plus recipients and
+      generated_records (search intent); _meta
       is bucket-less and has lookup entries only (user.lookup,
       product.lookup, pipeline.lookup, pipeline.details,
       datetime.parse_to_utc, team.lookup, campaign.lookup,
