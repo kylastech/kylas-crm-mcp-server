@@ -747,7 +747,7 @@ def _load_registry(registry_dir: Path = _REGISTRY_DIR) -> Tuple[Dict[str, Any], 
 _REGISTRY_INDEX, _REGISTRY = _load_registry()
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
 def list_tool(
     bucket: Optional[str] = None,
     intent: Optional[str] = None,
@@ -889,6 +889,7 @@ async def _fold_field_metadata_into_schema(
     for_search: bool,
     requested_picklists: Optional[List[str]] = None,
     bucket: Optional[str] = None,
+    for_update: bool = False,
 ) -> Dict[str, Any]:
     """
     Fetch this tenant's real field metadata for one bucket (via whichever
@@ -967,6 +968,11 @@ async def _fold_field_metadata_into_schema(
     # registry originally hardcoded lead.create's required as
     # [firstName, lastName, email], but Kylas actually accepted a real create
     # with no email at all. Live data is the only real source of truth here.
+    # An update merges into the stored record (GET + merge + PUT), so it needs
+    # only the record's id — sending create's required fields again would
+    # overwrite values that changed meanwhile.
+    if for_update:
+        return schema
     live_required = [f.get("name") for f in fields_meta if f.get("standard", False) and f.get("required", False)]
     if live_required:
         schema["required"] = live_required
@@ -974,7 +980,7 @@ async def _fold_field_metadata_into_schema(
     return schema
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
 async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Optional[str] = None) -> str:
     """
     Step 2 of 3 in the generic CRM tool flow: get everything about the ONE
@@ -1207,6 +1213,7 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
                         for_search=(entry["intent"] == "search"),
                         requested_picklists=fields,
                         bucket=entry["bucket"],
+                        for_update=(entry["intent"] == "update"),
                     )
                     fetched_live = True
                 except KylasAPIError as e:
@@ -1215,11 +1222,21 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
                     # their own; only the live tenant field/picklist enrichment is missing.
                     live_fetch_error = e.message
 
+    usage_notes = entry.get("usage_notes", "")
+    create_entry = _REGISTRY.get(f"{entry['bucket']}.create") if entry["intent"] == "update" else None
+    if create_entry and create_entry.get("usage_notes"):
+        # Update notes say "the same rules as <bucket>.create apply"; a caller on
+        # the update step never fetches those, so they are given here in full.
+        usage_notes = (f"{usage_notes}\n\nRules from {create_entry['id']} (they apply to every "
+                       f"field you change here):\n{create_entry['usage_notes']}")
     result = {
         "id": entry["id"],
         "method": entry["method"],
         "path": entry["path"],
-        "usage_notes": entry.get("usage_notes", ""),
+        # Whether execute_request on this id only reads (search, get, lookup,
+        # preview) or changes the CRM (create, update, cancel, delete).
+        "read_only": entry["intent"] in _READ_ONLY_INTENTS,
+        "usage_notes": usage_notes,
         "schema": schema,
         "example": entry.get("example"),
         "dynamic_fields": bool(entry.get("dynamic_fields")),
@@ -1258,7 +1275,7 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
 # Not fixed here; flagging it exactly where it now lives.
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True})
 async def execute_request(id: str, payload: Dict[str, Any]) -> str:
     """
     Step 3 of 3 in the generic CRM tool flow: actually perform the call for the
@@ -1327,7 +1344,12 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
             # already uses for this bucket's schema, not a second hardcoded map.
             original_get_tool = _REGISTRY_BUCKET_TO_GET_TOOL.get(bucket)
             id_field = (_ORIGINAL_TOOL_PARAMETERS.get(original_get_tool, {}).get("required") or ["entity_id"])[0]
-            result = await get_entity_logic(bucket, payload[id_field])
+            # Either name is accepted: "<bucket>_id" (this id's schema) or the
+            # "entity_id" every update takes.
+            record_id = payload.get(id_field, payload.get("entity_id"))
+            if record_id is None:
+                raise KeyError(f"{id_field} (or entity_id)")
+            result = await get_entity_logic(bucket, record_id)
         elif intent == "search":
             result = await search_entity_logic(
                 entity_type=bucket,
@@ -1357,7 +1379,11 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
             result = await create_entity_logic(bucket, payload)
         elif intent == "update":
             update_payload = dict(payload)
-            entity_id = update_payload.pop("entity_id")
+            entity_id = update_payload.pop("entity_id", None)
+            bucket_id = update_payload.pop(f"{bucket}_id", None)
+            entity_id = entity_id if entity_id is not None else bucket_id
+            if entity_id is None:
+                raise KeyError(f"entity_id (or {bucket}_id)")
             result = await update_entity_logic(bucket, entity_id, update_payload)
         elif intent == "preview" and bucket == "report":
             result = await preview_report_logic(payload)
@@ -1389,6 +1415,15 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
                 error_obj["details"] = json.loads(e.response_body)
             except (json.JSONDecodeError, TypeError):
                 error_obj["details"] = e.response_body
+        details = error_obj.get("details")
+        if isinstance(details, dict) and str(details.get("code")) == _KYLAS_INVALID_JSON:
+            # Kylas says only "Invalid JSON", never which field: almost always a
+            # value of the wrong type — a picklist sent as a name, not its option id.
+            error_obj["hint"] = (
+                "Kylas could not read a field's value. Most often a picklist field was sent as "
+                f"a name instead of its option id, or a date is not ISO-8601 UTC. Call "
+                f"build_payload(\"{id}\") and send the option ids it lists; do not resend the "
+                "same payload.")
         return json.dumps({"ok": False, "error": error_obj}, indent=2)
     except (KeyError, ValueError, TypeError) as e:
         # Missing/malformed payload field (e.g. lead.get called without "lead_id") —
@@ -1459,6 +1494,12 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
 # these is actually dispatched — the underlying Python function for every
 # one of them still exists in this file unchanged, just no longer
 # separately advertised.
+# Kylas's error code for a body it could not deserialize ("Invalid JSON").
+_KYLAS_INVALID_JSON = "000004"
+
+# Registry intents whose execute_request only reads.
+_READ_ONLY_INTENTS = {"get", "search", "search_by_term", "search_idle", "lookup", "preview"}
+
 _REGISTRY_ONLY_TOOL_NAMES = {
     "list_tool", "build_payload", "execute_request",
     "get_current_user", "get_entity_labels",

@@ -18,6 +18,7 @@ from app.helpers import (
     _get_filterable_fields_map,
     _is_stage_lock_error,
     _normalize_field_values,
+    resolve_picklist_values,
     _rule_type_for_value,
     _threshold_iso_days_ago,
     parse_datetime_to_utc_iso,
@@ -79,7 +80,7 @@ async def get_lead_field_instructions_logic(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
 async def get_entity_labels() -> str:
     """
     Returns the mapping of this tenant's custom entity display names to standard CRM entity types.
@@ -167,7 +168,7 @@ async def _fetch_current_user() -> Dict[str, Any]:
         return await handle_api_response(response, "Fetch current user")
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
 async def get_current_user() -> str:
     """
     Get the current authenticated user's profile from Kylas (GET /users/me).
@@ -1515,6 +1516,8 @@ async def create_task_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
+    # Kylas takes picklist option ids (status 38256, not "OPEN"); map names/labels here.
+    payload = resolve_picklist_values(payload, await _fetch_task_fields())
     logger.info("Creating task with fields: %s", list(payload.keys()))
     async with get_client() as client:
         response = await client.post("/v1/tasks", json=payload)
@@ -1534,6 +1537,7 @@ async def update_task_logic(task_id: int, field_values: Dict[str, Any]) -> Dict[
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
     if not payload:
         raise KylasAPIError("field_values produced an empty payload.")
+    payload = resolve_picklist_values(payload, await _fetch_task_fields())
     logger.info("Updating task %s with fields: %s", task_id, list(payload.keys()))
     async with get_client() as client:
         get_response = await client.get(f"/v1/tasks/{task_id}")

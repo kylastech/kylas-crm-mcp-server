@@ -542,6 +542,105 @@ def _is_stage_lock_error(error: KylasAPIError) -> bool:
         return False
 
 
+# Accepted phoneNumbers entry shape, shown in every phone error so a caller
+# can fix the payload in one retry instead of guessing.
+PHONE_SHAPES = (
+    'send phoneNumbers: [{"value": "7888108842", "code": "IN", "type": "MOBILE", '
+    '"primary": true}] (code may be "IN" or "+91"), or the shorthand phone + '
+    'phone_country_code + phone_type'
+)
+
+# Keys a phoneNumbers entry may use for its number and its country.
+_PHONE_VALUE_KEYS = ("value", "phone", "number", "phoneNumber", "phone_number")
+_PHONE_COUNTRY_KEYS = ("code", "phone_country_code", "countryCode", "country_code", "dialCode", "dial_code")
+
+
+def _normalize_phone_item(item: Any, default_country: str = "") -> Dict[str, Any]:
+    """One phoneNumbers entry in Kylas's shape {value, code, type, primary}.
+
+    Takes the number from value/phone/number/phoneNumber and the country from
+    code/phone_country_code/countryCode/dialCode ("IN" or "+91"); falls back
+    to the top-level phone_country_code. Raises ValueError naming the
+    accepted shapes when the number is missing."""
+    if not isinstance(item, dict):
+        raise ValueError(f"Each phoneNumbers entry must be an object: {PHONE_SHAPES}.")
+    entry = dict(item)
+    value = next((entry.pop(k) for k in _PHONE_VALUE_KEYS if entry.get(k)), None)
+    for k in _PHONE_VALUE_KEYS:
+        entry.pop(k, None)
+    if not value or not str(value).strip():
+        raise ValueError(f"A phoneNumbers entry has no number: {PHONE_SHAPES}.")
+    country_raw = next((entry.pop(k) for k in _PHONE_COUNTRY_KEYS if entry.get(k)), None)
+    for k in _PHONE_COUNTRY_KEYS:
+        entry.pop(k, None)
+    country = _normalize_country_code(country_raw) if country_raw else ""
+    if country_raw and not country:
+        raise ValueError(f"Unknown phone country '{country_raw}': use a 2-letter code like IN "
+                         f"or a dial code like +91. {PHONE_SHAPES}.")
+    entry["value"] = str(value).strip()
+    if country or default_country:
+        entry["code"] = country or default_country
+    if entry.get("type"):
+        phone_type = str(entry["type"]).strip().upper()
+        if phone_type not in PHONE_TYPES:
+            raise ValueError(f"Invalid phone type '{entry['type']}'. Must be one of: "
+                             f"{', '.join(PHONE_TYPES)}.")
+        entry["type"] = phone_type
+    return entry
+
+
+def resolve_picklist_values(payload: Dict[str, Any], fields: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Send picklist fields as Kylas wants them on create/update: the option id.
+
+    A value may be the option id (38256 or "38256"), its internal name
+    ("OPEN") or its label ("Open"), any case — this server already has every
+    option, so the caller need not look the id up. Standard fields are read
+    at the top level, custom ones in customFieldValues. An unknown value
+    raises ValueError listing the options as "Label=id". Values that are
+    already objects (e.g. {"id": 1}) are left alone."""
+    picklists: Dict[str, List[Dict[str, Any]]] = {}
+    for field in fields or []:
+        if field.get("type") not in ("PICK_LIST", "MULTI_PICKLIST") or not field.get("name"):
+            continue
+        picklist = field.get("picklist") or {}
+        options = picklist.get("values") or picklist.get("picklistValues") or []
+        picklists[field["name"]] = [o for o in options if isinstance(o, dict) and o.get("id") is not None]
+
+    def _key(text: Any) -> str:
+        return " ".join(str(text).replace("_", " ").split()).lower()
+
+    def _one(name: str, value: Any) -> Any:
+        options = picklists[name]
+        if isinstance(value, bool) or isinstance(value, dict) or value is None:
+            return value
+        if isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit()):
+            return int(value)
+        wanted = _key(value)
+        for option in options:
+            names = (option.get("name"), option.get("displayName"), option.get("label"))
+            if any(n is not None and _key(n) == wanted for n in names):
+                return option["id"]
+        choices = ", ".join(
+            f"{o.get('displayName') or o.get('name')}={o['id']}" for o in options[:40])
+        raise ValueError(f"'{value}' is not an option of picklist field '{name}'. "
+                         f"Send the option id (or its exact name): {choices}.")
+
+    def _resolve(name: str, value: Any) -> Any:
+        if isinstance(value, list):
+            return [_one(name, v) for v in value]
+        return _one(name, value)
+
+    resolved = dict(payload)
+    for name in picklists:
+        if name in resolved:
+            resolved[name] = _resolve(name, resolved[name])
+    custom = resolved.get("customFieldValues")
+    if isinstance(custom, dict):
+        resolved["customFieldValues"] = {
+            k: (_resolve(k, v) if k in picklists else v) for k, v in custom.items()}
+    return resolved
+
+
 def _normalize_field_values(
     field_values: Dict[str, Any],
     custom_field_id_to_name: Optional[Dict[str, str]] = None,
@@ -568,14 +667,19 @@ def _normalize_field_values(
         raise ValueError(
             f"Invalid phone type '{phone_type}'. Must be one of: {', '.join(PHONE_TYPES)}."
         )
+    if isinstance(fv.get("phoneNumbers"), list):
+        fv["phoneNumbers"] = [_normalize_phone_item(p, phone_country) for p in fv["phoneNumbers"]]
+    phones_have_country = (
+        isinstance(fv.get("phoneNumbers"), list) and len(fv["phoneNumbers"]) > 0
+        and all(isinstance(p, dict) and p.get("code") for p in fv["phoneNumbers"])
+    )
     has_phone_data = (
         fv.get("phone") or fv.get("phoneNumber")
         or (isinstance(fv.get("phoneNumbers"), list) and len(fv["phoneNumbers"]) > 0)
     )
-    # Require explicit phone_country_code whenever any phone number is present (do not assume India).
-    # This applies even if phoneNumbers array already has "code" on each entry—caller must pass
-    # phone_country_code at top level so we know the user was asked, not assumed.
-    if has_phone_data and not phone_country:
+    # Require an explicit country whenever any phone number is present (do not assume India):
+    # top-level phone_country_code, or a code on every phoneNumbers entry.
+    if has_phone_data and not phone_country and not phones_have_country:
         raise ValueError(
             "Phone number(s) were provided but country/dial code was not. "
             "Ask the user which country and dial code to use (e.g. India: IN or +91, US: US or +1) and include 'phone_country_code' in field_values."
@@ -639,10 +743,8 @@ def _normalize_field_values(
                 if not isinstance(p, dict):
                     continue
                 entry = dict(p)
-                if "code" not in entry or not entry.get("code"):
+                if not entry.get("code"):
                     entry["code"] = phone_country
-                elif len(str(entry["code"])) > 2:
-                    entry["code"] = _normalize_country_code(entry["code"]) or entry["code"]
                 phones.append(entry)
             payload["phoneNumbers"] = _ensure_single_primary(phones, PHONE_TYPES, "MOBILE")
             continue

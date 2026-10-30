@@ -305,10 +305,59 @@ def test_normalize_field_values_phone_numbers_single_primary():
 
 
 def test_normalize_field_values_phone_numbers_array_requires_country_code():
-    """phoneNumbers array without top-level phone_country_code must raise (do not assume India)."""
-    fv = {"phoneNumbers": [{"type": "MOBILE", "code": "IN", "value": "7447631718", "primary": True}]}
+    """A phone with no country anywhere must raise (do not assume India)."""
+    fv = {"phoneNumbers": [{"type": "MOBILE", "value": "7447631718", "primary": True}]}
     with pytest.raises(ValueError, match="country.*dial code"):
         _normalize_field_values(fv)
+
+
+def test_normalize_field_values_phone_numbers_take_their_own_country():
+    """A country on each entry is as explicit as a top-level phone_country_code."""
+    fv = {"phoneNumbers": [{"type": "mobile", "code": "+91", "value": "7447631718"}]}
+    payload = _normalize_field_values(fv)
+    assert payload["phoneNumbers"] == [
+        {"type": "MOBILE", "code": "IN", "value": "7447631718", "primary": True}]
+
+
+def test_normalize_field_values_phone_entries_in_the_shapes_models_send():
+    """The shape that failed six times: phone + phone_country_code inside the entry."""
+    fv = {"phoneNumbers": [{"phone": "7888108842", "phone_country_code": "IN"}]}
+    payload = _normalize_field_values(fv)
+    assert payload["phoneNumbers"] == [
+        {"type": "MOBILE", "code": "IN", "value": "7888108842", "primary": True}]
+
+
+def test_normalize_field_values_phone_entry_without_a_number_says_what_to_send():
+    fv = {"phone_country_code": "IN", "phoneNumbers": [{"code": "IN", "type": "MOBILE"}]}
+    with pytest.raises(ValueError, match="phoneNumbers.*value"):
+        _normalize_field_values(fv)
+
+
+TASK_FIELDS = [
+    {"name": "status", "type": "PICK_LIST", "standard": True,
+     "picklist": {"values": [{"id": 38256, "name": "OPEN", "displayName": "Open"},
+                             {"id": 38257, "name": "COMPLETED", "displayName": "Completed"}]}},
+    {"name": "type", "type": "PICK_LIST", "standard": True,
+     "picklist": {"values": [{"id": 38253, "name": "FOLLOW_UP", "displayName": "Follow up"}]}},
+    {"name": "cfStage", "type": "MULTI_PICKLIST", "standard": False,
+     "picklist": {"values": [{"id": 7, "name": "HOT", "displayName": "Hot"}]}},
+]
+
+
+def test_picklists_are_sent_as_option_ids_whatever_the_caller_sent():
+    from app.helpers import resolve_picklist_values
+    payload = {"name": "Call", "status": "OPEN", "type": "Follow Up",
+               "customFieldValues": {"cfStage": ["hot"], "cfNote": "x"}}
+    assert resolve_picklist_values(payload, TASK_FIELDS) == {
+        "name": "Call", "status": 38256, "type": 38253,
+        "customFieldValues": {"cfStage": [7], "cfNote": "x"}}
+    assert resolve_picklist_values({"status": "38257"}, TASK_FIELDS) == {"status": 38257}
+
+
+def test_an_unknown_picklist_value_lists_the_options():
+    from app.helpers import resolve_picklist_values
+    with pytest.raises(ValueError, match="Open=38256, Completed=38257"):
+        resolve_picklist_values({"status": "Done"}, TASK_FIELDS)
 
 
 def test_normalize_field_values_custom_fields():
