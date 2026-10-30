@@ -137,3 +137,17 @@
     group_by: DAY_ACTIVITIES
     date_from: "2026-10-01"
     date_to: "2026-10-31"
+
+- id: campaign.currencies
+  bucket: campaign
+  intent: lookup
+  method: GET
+  path: /v1/forex/currencies
+  dynamic_fields: false
+  description: "Active currencies for a campaign or activity budget (code, id, and which is the base currency)."
+  usage_notes: >
+    Returns {currencies: [{currency_id, code, base}]} — only active ones.
+    A budget's currency can be given by code ("INR") or currency_id; when
+    the user names none, the tenant's base currency is used. An activity's
+    budget always uses its campaign's currency.
+  example: {}

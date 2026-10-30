@@ -29,8 +29,8 @@ from dateutil import parser as dateutil_parser
 
 from app.client import KylasAPIError, get_client, handle_api_response
 from app.config import DEFAULT_TIMEZONE, logger
-from app.entities import _fetch_current_user
-from app.helpers import _convert_date_value_to_utc
+from app.entities import _BUCKET_PICKLIST_RULES, _fetch_contact_fields, _fetch_current_user, _fetch_lead_fields
+from app.helpers import _build_search_json_rule, _convert_date_value_to_utc, _get_filterable_fields_map
 
 CAMPAIGN_BUCKETS = frozenset({"campaign", "campaign_activity"})
 
@@ -174,18 +174,29 @@ async def _campaign_call(
     *,
     params: Optional[Dict[str, Any]] = None,
     body: Optional[Dict[str, Any]] = None,
+    allow_empty: bool = False,
 ) -> Any:
-    """One request to sd-campaign. Raises KylasAPIError on failure, like handle_api_response."""
-    if method not in ("GET", "POST"):
+    """One request to sd-campaign. Raises KylasAPIError on failure, like handle_api_response.
+
+    PUT is for updates. There is deliberately no DELETE: campaigns and
+    activities are never deleted through the MCP. allow_empty is for the
+    lifecycle actions (start/pause/resume/complete), which answer 200 with an
+    empty body that handle_api_response would otherwise fail to parse.
+    """
+    if method not in ("GET", "POST", "PUT"):
         raise ValueError(f"Unsupported method for campaign call: {method}")
     kwargs: Dict[str, Any] = {"params": params} if params else {}
     async with get_client() as client:
         if method == "GET":
             response = await client.get(path, **kwargs)
+        elif method == "PUT":
+            response = await client.put(path, json=body if body is not None else {}, **kwargs)
         else:
             response = await client.post(path, json=body if body is not None else {}, **kwargs)
     if response.status_code == 403 and not (response.text or "").strip():
         raise KylasAPIError(_EMPTY_403_MESSAGE.format(op=op), status_code=403)
+    if allow_empty and response.is_success and not (response.text or "").strip():
+        return {}
     return await handle_api_response(response, op)
 
 
@@ -373,10 +384,15 @@ def _page_params(
 # ---------------------------------------------------------------------------
 
 
+async def _fetch_currencies() -> List[Dict[str, Any]]:
+    """The tenant's currency rows — the same call sd-campaign's ForexService makes."""
+    return await _campaign_call("GET", "/v1/forex/currencies", "Fetch tenant currencies") or []
+
+
 async def _currency_names() -> Dict[int, str]:
     """currencyValueId -> code (INR, USD, ...) for this tenant. Reads never fail because of it."""
     try:
-        rows = await _campaign_call("GET", "/v1/forex/currencies", "Fetch tenant currencies")
+        rows = await _fetch_currencies()
         return {r["currencyValueId"]: r.get("name") for r in rows if r.get("currencyValueId") is not None}
     except Exception as e:  # timeout, network error, unexpected shape — money just loses its currency code
         logger.warning("Campaign currencies unavailable, money shows currency_id only: %r", e)
@@ -979,6 +995,374 @@ async def activity_generated_records_logic(payload: Dict[str, Any]) -> Dict[str,
 
 
 # ---------------------------------------------------------------------------
+# Write helpers (Plan 2) — shared by campaign / activity create, update and
+# lifecycle. Nothing here writes on its own.
+# ---------------------------------------------------------------------------
+
+
+def _write_date(value: Any, tz_name: str, end_of_day: bool, field: str) -> str:
+    """start_date / end_date from the user's local time to the UTC instant sd-campaign stores.
+
+    A plain date is the whole day: start_date -> 00:00:00.000, end_date ->
+    23:59:59.999 local (end_of_day). A datetime is taken as given (local
+    unless it carries an offset).
+    """
+    return _date_value(value, tz_name, end_of_day, "Invalid date", field)
+
+
+def _check_date_order(start: str, end: Optional[str]) -> None:
+    # Both come from _write_date in the same UTC format, so they compare as strings.
+    if end and end < start:
+        raise ValueError("'end_date' must be on or after 'start_date'.")
+
+
+# Model-facing field -> API field, for the plain fields a user can change.
+_CAMPAIGN_FIELD_MAP = {
+    "name": "name", "description": "description", "start_date": "startDate", "end_date": "endDate",
+    "utm_campaign": "utmCampaign", "utm_source": "utmSource", "utm_medium": "utmMedium",
+    "utm_content": "utmContent", "utm_term": "utmTerm",
+}
+_ACTIVITY_FIELD_MAP = {k: v for k, v in _CAMPAIGN_FIELD_MAP.items() if k != "description"}
+
+# Exactly the fields of sd-campaign's UpdateCampaignRequest / UpdateActivityRequest.
+# A PUT body is built from these only, so read-only fields (status counters,
+# recordActions, activities, ...) can never be sent back.
+_CAMPAIGN_BODY_FIELDS = (
+    "id", "name", "description", "estimatedBudget", "actualExpense", "startDate", "endDate",
+    "startedAt", "endedAt", "startedBy", "endedBy",
+    "utmSource", "utmCampaign", "utmMedium", "utmContent", "utmTerm",
+)
+_ACTIVITY_BODY_FIELDS = (
+    "name", "status", "estimatedBudget", "actualExpense", "startDate", "endDate",
+    "utmSource", "utmCampaign", "utmMedium", "utmContent", "utmTerm", "filters", "entity", "payload",
+)
+
+
+def merge_for_update(
+    current: Dict[str, Any],
+    changes: Dict[str, Any],
+    field_map: Dict[str, str],
+    body_fields: Iterable[str],
+) -> Dict[str, Any]:
+    """Full PUT body: the record's current value for every field the update takes, with only the user's changes.
+
+    sd-campaign's PUT needs the whole object (name, startDate, UTM, payload,
+    filters, ...); sending just the changed field fails validation or wipes
+    the rest. `changes` uses model-facing names (field_map); anything not
+    changed keeps its current value.
+    """
+    body = {field: current.get(field) for field in body_fields}
+    for key, api_field in field_map.items():
+        if key in changes:
+            body[api_field] = changes[key]
+    return body
+
+
+async def _resolve_campaign_id(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+    """The campaign a payload names, as (id, None) — or (None, choice) when a name matches several.
+
+    Same rules as _resolve_activity: campaign_id is used as given; a
+    campaign_name is looked up in the first page (50) of "name contains"
+    matches, newest-updated first, and an exact name (any case) wins.
+    """
+    campaign_id = _optional_id(payload, "campaign_id")
+    if campaign_id:
+        return campaign_id, None
+    name = str(payload.get("campaign_name") or "").strip()
+    if not name:
+        raise ValueError("Give 'campaign_id' or 'campaign_name'.")
+    body = {"jsonRule": {"condition": "AND", "valid": True, "rules": []}}
+    _add_search_term(body, {"search_term": name})
+    data = await _campaign_call("POST", "/v1/campaigns/search", "Search campaigns",
+                                params={"page": 0, "size": MAX_PAGE_SIZE, "sort": "updatedAt,desc"}, body=body)
+    rows = data.get("content") or []
+    matches = [r for r in rows if (r.get("name") or "").strip().lower() == name.lower()] or rows
+    if not matches:
+        raise KylasAPIError(
+            f"No campaign name contains '{name}'. Retry once with its most distinctive word. If that finds "
+            "nothing either, STOP and tell the user no campaign has that name.", status_code=404)
+    if len(matches) > 1:
+        return None, {
+            "matches": [{"id": r.get("id"), "name": r.get("name"), "status": r.get("status"),
+                         "total_engagement": r.get("totalEngagement"), "started_at": r.get("startedAt")}
+                        for r in matches],
+            "note": f"STOP: more than one campaign matched '{name}' and nothing was done to any of them. "
+                    "Ask the user to choose one: a single-choice question with one option per match showing "
+                    "name, #id, status, engagement and started date — as clickable choices if your app offers "
+                    "them. Then call again with the chosen campaign_id. Don't pick one yourself, and don't run "
+                    "this for each match.",
+        }
+    return matches[0]["id"], None
+
+
+_AUDIENCE_FIELD_FETCHERS = {"LEAD": _fetch_lead_fields, "CONTACT": _fetch_contact_fields}
+
+
+async def build_audience_rule(entity: str, filters: Optional[List[Dict[str, Any]]], timezone: str) -> Dict[str, Any]:
+    """An activity's audience as the jsonRule its `filters` stores.
+
+    Same filter format the model already uses for lead.search / contact.search
+    (field / operator / value, checked against the tenant's filterable
+    fields), because sd-campaign runs these rules through that same search.
+    At least one filter is required, so an activity can never target every
+    lead or contact by accident.
+    """
+    entity = str(entity or "").strip().upper()
+    if entity not in _AUDIENCE_FIELD_FETCHERS:
+        raise ValueError(f"'entity' must be one of {ACTIVITY_ENTITIES}, got {entity or None!r}.")
+    if not filters:
+        raise ValueError("'audience_filters' needs at least one filter — an activity can't target every "
+                         f"{entity.lower()}.")
+    filterable = _get_filterable_fields_map(await _AUDIENCE_FIELD_FETCHERS[entity]())
+    json_rule, error = _build_search_json_rule(
+        filters, filterable, default_timezone=timezone,
+        internal_name_fields=_BUCKET_PICKLIST_RULES.get(entity.lower(), {}).get("internal_name", set()),
+    )
+    if error:
+        raise ValueError(f"Invalid audience filter: {error}")
+    return json_rule
+
+
+async def count_audience(entity: str, json_rule: Dict[str, Any]) -> int:
+    """How many leads / contacts the audience matches right now — the same search the activity will run.
+
+    An activity can only start with 1–10,000 recipients (sd-campaign isActivityRunnable).
+    """
+    async with get_client() as client:
+        response = await client.post(f"/v1/search/{entity.lower()}", params={"page": 0, "size": 1},
+                                     json={"fields": ["id"], "jsonRule": json_rule})
+        data = await handle_api_response(response, "Count audience")
+    return int((data or {}).get("totalElements") or 0)
+
+
+# ---------------------------------------------------------------------------
+# Lookups for the create / update forms — the web form's dropdown sources
+# (sd-ui formLayout getFormLookupUrl). Each "lookup" call answers at most
+# 10 rows ({"content": [...]}, paging ignored), so a name is searched with
+# q=<name> and an id is fetched directly by id.
+# ---------------------------------------------------------------------------
+
+
+async def _kylas_get(path: str, op: str, params: Optional[Dict[str, Any]] = None, not_found: str = "") -> Any:
+    """GET from another Kylas service (email, messages). A 404 becomes `not_found` when given."""
+    try:
+        async with get_client() as client:
+            response = await client.get(path, params=params)
+            return await handle_api_response(response, op)
+    except KylasAPIError as e:
+        if e.status_code == 404 and not_found:
+            raise KylasAPIError(not_found, status_code=404)
+        raise
+
+
+def _lookup_rows(data: Any) -> List[Dict[str, Any]]:
+    return (data or {}).get("content") or [] if isinstance(data, dict) else list(data or [])
+
+
+def _choose_by_name(
+    rows: List[Dict[str, Any]],
+    name: str,
+    label: str,
+    names: Callable[[Dict[str, Any]], List[str]] = lambda r: [r.get("name") or ""],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """One row for a name, as (row, None) — or (None, choice) when several match. Exact name (any case) wins."""
+    exact = [r for r in rows if name.lower() in [n.strip().lower() for n in names(r)]]
+    matches = exact or rows
+    if not matches:
+        raise KylasAPIError(f"No {label} name contains '{name}'. Check the name with the user (the matching "
+                            f"lookup id lists the available ones).", status_code=404)
+    if len(matches) > 1:
+        return None, {
+            "matches": matches,
+            "note": f"STOP: more than one {label} matched '{name}' and nothing was done. Ask the user to choose "
+                    "one (a single-choice question, clickable if your app offers it), then call again with its id.",
+        }
+    return matches[0], None
+
+
+def _id_or_name(value: Any) -> Tuple[Optional[int], str]:
+    """A template / account given as an id (number or digits) or as a name."""
+    if isinstance(value, bool):
+        raise ValueError(f"Expected an id or a name, got {value!r}.")
+    if isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit()):
+        return int(value), ""
+    name = str(value or "").strip()
+    if not name:
+        raise ValueError("Expected an id or a name.")
+    return None, name
+
+
+async def _active_currencies() -> List[Dict[str, Any]]:
+    return [{"currency_id": r.get("currencyValueId"), "code": r.get("name"), "base": bool(r.get("baseCurrency"))}
+            for r in await _fetch_currencies() if r.get("active") and r.get("currencyValueId") is not None]
+
+
+async def _resolve_currency(value: Any) -> int:
+    """A currency code ("INR") or id -> the currencyValueId to send; none given -> the tenant's base currency.
+
+    Kylas wants currencyValueId, not the currency row's id, and only an
+    active currency is accepted.
+    """
+    currencies = await _active_currencies()
+    if value in (None, ""):
+        base = next((c for c in currencies if c["base"]), None)
+        if not base:
+            raise ValueError("This tenant has no base currency; give the budget's currency.")
+        return base["currency_id"]
+    text = str(value).strip()
+    for c in currencies:
+        if (text.isdigit() and c["currency_id"] == int(text)) or text.upper() == str(c["code"]).upper():
+            return c["currency_id"]
+    active = ", ".join(f"{c['code']} ({c['currency_id']})" for c in currencies)
+    raise ValueError(f"Currency {value!r} isn't an active currency here. Active: {active}.")
+
+
+async def _resolve_email_template(value: Any, entity: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """An email template by id or name, as the {id, name} an EMAIL activity's payload stores."""
+    template_id, name = _id_or_name(value)
+    if template_id:
+        t = await _kylas_get(f"/v1/email-templates/{template_id}", "Fetch email template",
+                             not_found=f"Email template {template_id} not found.")
+        if str(t.get("category") or "").upper() != entity:
+            raise ValueError(f"Email template '{t.get('name')}' is for {str(t.get('category')).upper()}s, "
+                             f"not {entity}s.")
+        return {"id": t["id"], "name": t.get("name")}, None
+    data = await _kylas_get("/v1/email-templates/lookup", "Look up email templates",
+                            params={"category": entity.lower(), "q": name})
+    row, choice = _choose_by_name(_lookup_rows(data), name, "email template")
+    return (None, choice) if choice else ({"id": row["id"], "name": row.get("name")}, None)
+
+
+def _account_body(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {"id": row.get("id"), "name": row.get("name"), "businessName": row.get("businessName")}
+
+
+async def _resolve_whatsapp_account(value: Any) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """A WhatsApp account by id or name (its name or business name), as {id, name, businessName}."""
+    account_id, name = _id_or_name(value)
+    if account_id:
+        rows = _lookup_rows(await _kylas_get("/v1/messages/connected-accounts/lookup",
+                                             "Look up WhatsApp accounts", params={"q": ""}))
+        row = next((r for r in rows if r.get("id") == account_id), None)
+        if row:
+            return _account_body(row), None
+        # Not in the first 10. GET by id names the fields the other way round:
+        # its "name" is the business name and "displayName" the account name.
+        a = await _kylas_get(f"/v1/messages/connected-accounts/{account_id}", "Fetch WhatsApp account",
+                             not_found=f"WhatsApp account {account_id} not found.")
+        return {"id": a["id"], "name": a.get("displayName"), "businessName": a.get("name")}, None
+    rows = _lookup_rows(await _kylas_get("/v1/messages/connected-accounts/lookup",
+                                         "Look up WhatsApp accounts", params={"q": name}))
+    if not rows:
+        # The lookup searches the account name only, but users often say the business
+        # name ("Kylas Devs"), so match both ourselves over the (short) account list.
+        rows = [r for r in _lookup_rows(await _kylas_get("/v1/messages/connected-accounts/lookup",
+                                                         "Look up WhatsApp accounts", params={"q": ""}))
+                if name.lower() in f"{r.get('name') or ''}\n{r.get('businessName') or ''}".lower()]
+    row, choice = _choose_by_name(rows, name, "WhatsApp account",
+                                  names=lambda r: [r.get("name") or "", r.get("businessName") or ""])
+    if choice:
+        choice["matches"] = [_account_body(m) for m in choice["matches"]]
+        return None, choice
+    return _account_body(row), None
+
+
+async def _resolve_whatsapp_template(
+    value: Any, account_id: int, entity: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """A WhatsApp template of that account and entity, by id or name, as {id, name}. It must be APPROVED.
+
+    A name goes through the web form's lookup, which only returns APPROVED
+    templates of that account and entity, so whatever it picks is usable. An
+    id skips the lookup, so that template is fetched and checked here.
+    """
+    template_id, name = _id_or_name(value)
+    if not template_id:
+        data = await _kylas_get("/v1/messages/whatsapp-templates/lookup", "Look up WhatsApp templates",
+                                params={"connectedAccountId": account_id, "entityType": entity.lower(), "q": name})
+        row, choice = _choose_by_name(_lookup_rows(data), name, "WhatsApp template")
+        return (None, choice) if choice else ({"id": row["id"], "name": row.get("name")}, None)
+    t = await _kylas_get(f"/v1/messages/whatsapp-templates/{template_id}", "Fetch WhatsApp template",
+                         not_found=f"WhatsApp template {template_id} not found.")
+    _check_whatsapp_template(t, account_id, entity)
+    return {"id": t["id"], "name": t.get("name")}, None
+
+
+def _check_whatsapp_template(t: Dict[str, Any], account_id: int, entity: str) -> None:
+    """A template is usable only from its own account, for its own entity, once WhatsApp approved it."""
+    if (t.get("connectedAccount") or {}).get("id") != account_id:
+        raise ValueError(f"WhatsApp template '{t.get('name')}' belongs to another WhatsApp account.")
+    if str(t.get("entityType") or "").upper() != entity:
+        raise ValueError(f"WhatsApp template '{t.get('name')}' is for {str(t.get('entityType')).upper()}s, "
+                         f"not {entity}s.")
+    if t.get("status") != "APPROVED":
+        raise ValueError(f"WhatsApp template '{t.get('name')}' is {t.get('status')}, not APPROVED.")
+
+
+async def _utm_campaign_taken(value: str, activity_id: Optional[int] = None) -> bool:
+    """Whether another activity already uses this utm_campaign (it must be unique per tenant).
+
+    activity_id excludes that activity itself, for updates.
+    """
+    params: Dict[str, Any] = {"fieldName": "utmCampaign", "value": value}
+    if activity_id:
+        params["id"] = activity_id
+    data = await _campaign_call("GET", "/v1/campaigns/activities/has-duplicates", "Check UTM campaign",
+                                params=params)
+    return bool((data or {}).get("duplicate"))
+
+
+def _entity_arg(payload: Dict[str, Any]) -> str:
+    entity = str(payload.get("entity") or "").strip().upper()
+    if entity not in ACTIVITY_ENTITIES:
+        raise ValueError(f"'entity' must be one of {ACTIVITY_ENTITIES} — who the activity targets.")
+    return entity
+
+
+async def currencies_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Active currencies for a campaign / activity budget."""
+    return {"currencies": await _active_currencies()}
+
+
+async def email_templates_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Email templates for LEAD or CONTACT activities, optionally narrowed by name (max 10 rows)."""
+    data = await _kylas_get("/v1/email-templates/lookup", "Look up email templates",
+                            params={"category": _entity_arg(payload).lower(), "q": str(payload.get("query") or "")})
+    return {"templates": [{"id": r.get("id"), "name": r.get("name")} for r in _lookup_rows(data)]}
+
+
+async def whatsapp_accounts_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Connected WhatsApp accounts, optionally narrowed by name (max 10 rows)."""
+    data = await _kylas_get("/v1/messages/connected-accounts/lookup", "Look up WhatsApp accounts",
+                            params={"q": str(payload.get("query") or "")})
+    return {"accounts": [{"id": r.get("id"), "name": r.get("name"), "business_name": r.get("businessName")}
+                         for r in _lookup_rows(data)]}
+
+
+async def whatsapp_templates_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Approved WhatsApp templates of one account for LEAD or CONTACT, optionally narrowed by name (max 10 rows)."""
+    entity = _entity_arg(payload)
+    if payload.get("whatsapp_account") in (None, ""):
+        raise ValueError("'whatsapp_account' is required (its name or id, from campaign_activity.whatsapp_accounts).")
+    account, choice = await _resolve_whatsapp_account(payload["whatsapp_account"])
+    if choice:
+        return choice
+    data = await _kylas_get("/v1/messages/whatsapp-templates/lookup", "Look up WhatsApp templates",
+                            params={"connectedAccountId": account["id"], "entityType": entity.lower(),
+                                    "q": str(payload.get("query") or "")})
+    return {"account": account, "templates": [{"id": r.get("id"), "name": r.get("name")} for r in _lookup_rows(data)]}
+
+
+async def check_utm_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Whether a utm_campaign is free to use."""
+    value = str(payload.get("utm_campaign") or "").strip()
+    if not value:
+        raise ValueError("'utm_campaign' is required.")
+    taken = await _utm_campaign_taken(value, _optional_id(payload, "activity_id"))
+    return {"utm_campaign": value, "available": not taken}
+
+
+# ---------------------------------------------------------------------------
 # Input schemas (what build_payload returns for each id)
 # ---------------------------------------------------------------------------
 
@@ -1102,6 +1486,40 @@ CAMPAIGN_SCHEMAS: Dict[str, Dict[str, Any]] = {
             **_paging_properties("Field: createdAt. Leave it out for the newest first."),
         },
     },
+    "campaign.currencies": {"type": "object", "properties": {}},
+    "campaign_activity.email_templates": {
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string", "enum": ACTIVITY_ENTITIES, "description": "Who the activity targets."},
+            "query": {"type": "string", "description": "Part of the template name; leave out to list the first 10."},
+        },
+        "required": ["entity"],
+    },
+    "campaign_activity.whatsapp_accounts": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Part of the account name; leave out to list them."},
+        },
+    },
+    "campaign_activity.whatsapp_templates": {
+        "type": "object",
+        "properties": {
+            "whatsapp_account": {"type": ["string", "integer"],
+                                 "description": "The WhatsApp account's name or id."},
+            "entity": {"type": "string", "enum": ACTIVITY_ENTITIES, "description": "Who the activity targets."},
+            "query": {"type": "string", "description": "Part of the template name; leave out to list the first 10."},
+        },
+        "required": ["whatsapp_account", "entity"],
+    },
+    "campaign_activity.check_utm": {
+        "type": "object",
+        "properties": {
+            "utm_campaign": {"type": "string"},
+            "activity_id": {"type": "integer",
+                            "description": "When updating an activity: its id, so it doesn't count itself."},
+        },
+        "required": ["utm_campaign"],
+    },
 }
 
 CAMPAIGN_ROUTERS: Dict[str, CampaignRouter] = {
@@ -1113,6 +1531,11 @@ CAMPAIGN_ROUTERS: Dict[str, CampaignRouter] = {
     "campaign_activity.analytics": activity_analytics_logic,
     "campaign_activity.recipients": activity_recipients_logic,
     "campaign_activity.generated_records": activity_generated_records_logic,
+    "campaign.currencies": currencies_logic,
+    "campaign_activity.email_templates": email_templates_logic,
+    "campaign_activity.whatsapp_accounts": whatsapp_accounts_logic,
+    "campaign_activity.whatsapp_templates": whatsapp_templates_logic,
+    "campaign_activity.check_utm": check_utm_logic,
 }
 
 

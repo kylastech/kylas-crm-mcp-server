@@ -212,3 +212,69 @@
     contact.get with entity_id for more about a record.
   example:
     activity_id: 713
+
+# ---------------------------------------------------------------------------
+# Lookups for creating / updating activities (Plan 2). Each answers at most 10
+# rows — pass query to narrow by name. Activity create/update also accept a
+# template or account by name directly, so these are mainly for showing the
+# user what exists.
+# ---------------------------------------------------------------------------
+
+- id: campaign_activity.email_templates
+  bucket: campaign_activity
+  intent: lookup
+  method: GET
+  path: /v1/email-templates/lookup
+  dynamic_fields: false
+  description: "Email templates an EMAIL activity can use, for leads or for contacts."
+  usage_notes: >
+    entity: LEAD or CONTACT — lead templates and contact templates are
+    separate, and an activity can only use one for its own entity.
+    query: part of the template name (case-insensitive); leave it out to
+    list the first 10. Returns {templates: [{id, name}]} — at most 10, so
+    narrow with query when the user names one.
+  example: {entity: LEAD, query: "Lead creation"}
+
+- id: campaign_activity.whatsapp_accounts
+  bucket: campaign_activity
+  intent: lookup
+  method: GET
+  path: /v1/messages/connected-accounts/lookup
+  dynamic_fields: false
+  description: "Connected WhatsApp accounts a WHATSAPP activity can send from."
+  usage_notes: >
+    query: part of the account name; leave it out to list them (at most
+    10). Returns {accounts: [{id, name, business_name}]}. Users may refer to
+    an account by either name or business name.
+  example: {}
+
+- id: campaign_activity.whatsapp_templates
+  bucket: campaign_activity
+  intent: lookup
+  method: GET
+  path: /v1/messages/whatsapp-templates/lookup
+  dynamic_fields: false
+  description: "Approved WhatsApp templates of one account, for leads or for contacts."
+  usage_notes: >
+    whatsapp_account: the account's name or id (from
+    campaign_activity.whatsapp_accounts); entity: LEAD or CONTACT. Lists
+    only templates usable for that account and entity, as the web form
+    does. query: part of the template name; leave it out to list the first
+    10. Returns {account, templates: [{id, name}]}. If the account name
+    matches several accounts the result is {matches[], note}: ask the user
+    which one.
+  example: {whatsapp_account: "Kylas Devs", entity: LEAD, query: "Please Reply"}
+
+- id: campaign_activity.check_utm
+  bucket: campaign_activity
+  intent: lookup
+  method: GET
+  path: /v1/campaigns/activities/has-duplicates
+  dynamic_fields: false
+  description: "Check whether a utm_campaign value is still free (it must be unique across the tenant's activities)."
+  usage_notes: >
+    utm_campaign: the value to check. When updating an activity, also pass
+    its activity_id so it doesn't count itself. Returns {utm_campaign,
+    available}. Activity create/update run this check themselves; use it to
+    suggest a free value before asking the user to confirm.
+  example: {utm_campaign: "diwali-whatsapp-2026"}

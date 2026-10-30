@@ -569,11 +569,11 @@ async def test_analytics_rejects_bad_input_before_calling_api(payload, message):
 # ---------------------------------------------------------------------------
 
 
-def test_campaign_bucket_lists_the_three_read_ids():
+def test_campaign_bucket_lists_its_ids():
     from app.tools import list_tool
 
     ids = sorted(r["id"] for r in json.loads(list_tool(bucket="campaign"))["results"])
-    assert ids == ["campaign.analytics", "campaign.get", "campaign.search"]
+    assert ids == ["campaign.analytics", "campaign.currencies", "campaign.get", "campaign.search"]
 
 
 @pytest.mark.asyncio
@@ -1135,12 +1135,14 @@ async def test_generated_records_by_name_resolve_the_activity():
 # --- registry wiring ----------------------------------------------------------
 
 
-def test_campaign_activity_bucket_lists_the_five_read_ids():
+def test_campaign_activity_bucket_lists_its_ids():
     from app.tools import list_tool
 
     ids = sorted(r["id"] for r in json.loads(list_tool(bucket="campaign_activity"))["results"])
-    assert ids == ["campaign_activity.analytics", "campaign_activity.generated_records", "campaign_activity.get",
-                   "campaign_activity.recipients", "campaign_activity.search"]
+    assert ids == ["campaign_activity.analytics", "campaign_activity.check_utm", "campaign_activity.email_templates",
+                   "campaign_activity.generated_records", "campaign_activity.get", "campaign_activity.recipients",
+                   "campaign_activity.search", "campaign_activity.whatsapp_accounts",
+                   "campaign_activity.whatsapp_templates"]
 
 
 @pytest.mark.asyncio
