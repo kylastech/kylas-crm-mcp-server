@@ -1,0 +1,214 @@
+# registry/campaign_activity.yaml
+#
+# Registry entries for the "campaign_activity" bucket — the EMAIL / WHATSAPP /
+# CALL activities inside a marketing campaign (sd-campaign).
+#
+# Same split as registry/campaign.yaml: this YAML holds the operation
+# metadata and the LLM-facing guidance; the input schemas and the logic live
+# in app/campaigns.py (CAMPAIGN_SCHEMAS / CAMPAIGN_ROUTERS). The server
+# refuses to start if an id here has no schema or router there.
+#
+# Every id except search takes activity_id OR activity_name; campaign_id is
+# optional (the server finds it). Users know activities by name, not id.
+
+- id: campaign_activity.search
+  bucket: campaign_activity
+  intent: search
+  method: POST
+  path: /v1/campaigns/activities/search
+  dynamic_fields: false
+  description: "Search campaign activities (email, WhatsApp, call) across all campaigns by type, status, name or dates."
+  usage_notes: >
+    Lists activities from every campaign, newest-updated first by default;
+    each row shows its campaign. Use it for questions across campaigns
+    ("all paused activities", "every WhatsApp activity"). To list ONE
+    campaign's activities use campaign.get — activity search can't filter
+    by campaign.
+
+    To act on ONE activity the user names (its details, performance,
+    recipients), you don't need this search: pass activity_name to that id
+    directly. If you do search by name and get more than one match: STOP
+    and ask the user to choose one — a single-choice question with one
+    option per match (name, id, status, total_engagement, and campaign when
+    they differ), as clickable choices if your app offers them. Do not run
+    get / analytics / recipients for each match, unless the user explicitly
+    asked about all of them.
+
+    When the user names an activity, look only at activities — "in
+    campaigns" just says where activities live. No match for the full
+    name: search once more with its most distinctive word. Still nothing:
+    STOP and tell the user no activity has that name (you may offer to
+    check campaigns if they meant a campaign). Don't search campaigns, try
+    other words, or list every activity to scan, unless the user asks.
+
+    filters: list of {field, operator, value}, combined with AND. Allowed:
+    type (EMAIL, WHATSAPP, CALL — equal, not_equal, in, not_in);
+    status (DRAFT, QUEUED, FAILED, IN_PROGRESS, PAUSED, RETRYING,
+    PROCESSED, COMPLETED — equal, not_equal, in, not_in);
+    entity (LEAD, CONTACT — who it targets);
+    id (equal, not_equal, in, not_in);
+    name (equal, not_equal, contains, not_contains, begins_with, in, not_in);
+    estimatedBudget, actualExpense (number: equal, not_equal, greater,
+    greater_or_equal, less, less_or_equal, between, not_between);
+    createdAt, updatedAt, startedAt, endedAt (greater, greater_or_equal,
+    less, less_or_equal, between, not_between, is_null, is_not_null — the
+    user's LOCAL date "YYYY-MM-DD" or datetime; the server converts using
+    the filter's optional timeZone, else the current user's timezone);
+    createdBy, updatedBy, startedBy, endedBy (user id from user.lookup).
+
+    search_term: matched against the activity name as one phrase,
+    case-insensitive, anywhere in the name.
+
+    page (0-based), size (1-50, default 20), sort "<field>,<asc|desc>"
+    (direction defaults to asc) with field one of id, name, status,
+    startDate, endDate, startedAt, endedAt, createdAt, updatedAt,
+    estimatedBudget, actualExpense, type, entity, processedAt. Activities
+    with no value for the sort field come FIRST on desc.
+
+    Returns {total, page, size, has_more, activities[]}; each has its
+    campaign {id, name}, budget/expense as {value, currency, currency_id},
+    total_engagement and records_generated. Timestamps are UTC — convert to
+    the user's timezone before showing them.
+  example:
+    filters:
+      - field: status
+        operator: equal
+        value: PAUSED
+    size: 20
+
+- id: campaign_activity.get
+  bucket: campaign_activity
+  intent: get
+  method: GET
+  path: /v1/campaigns/{campaign_id}/activities/{activity_id}
+  dynamic_fields: false
+  description: "Get one campaign activity: what it sends, to whom, its template/account, audience, budget and engagement."
+  usage_notes: >
+    activity_id, or activity_name when the user names it (part of the name
+    is enough). campaign_id is optional — the server finds the campaign.
+    If the name matches several activities the result is {matches[], note}
+    instead of an activity: follow the note — ask the user to choose one
+    (one option per match: name, id, status, total_engagement, campaign),
+    never pick one yourself — then call again with the chosen activity_id.
+    The other activity ids below answer several matches the same way.
+
+    Returns the same data as the activity details page: type (EMAIL,
+    WHATSAPP, CALL), status, campaign, target entity (LEAD/CONTACT), dates,
+    UTM values, content (email or WhatsApp template and sending account;
+    for CALL the dialer app, agents and DID number), audience_filters,
+    budget/expense, total_engagement, records_generated. CALL activities
+    also have dialed/connected call totals and agent_metrics per agent.
+
+    For how it performed (sent/delivered/read, call outcomes) use
+    campaign_activity.analytics; for who received it use
+    campaign_activity.recipients. Timestamps are UTC — convert to the
+    user's timezone before showing them.
+  example:
+    activity_name: "Abhinav Whatsapp Reply"
+
+- id: campaign_activity.analytics
+  bucket: campaign_activity
+  intent: analytics
+  method: POST
+  path: /v1/campaigns/{campaign_id}/activities/{activity_id}/analytics
+  dynamic_fields: false
+  description: "How one activity performed: email/WhatsApp funnel (sent, delivered, read, …), engagement per day, call outcomes or dispositions."
+  usage_notes: >
+    The charts on the activity details page. Identify the activity with
+    activity_id or activity_name (campaign_id optional), as in
+    campaign_activity.get — several name matches return {matches[], note}:
+    ask the user to choose one, as the note says.
+
+    group_by depends on the activity's type (the server checks it):
+    EMAIL / WHATSAPP — ACTIVITY_STATUS (default): the funnel, how many
+    recipients were Sent, Delivered, Read, Replied, Failed (WhatsApp) or
+    Sent, Opened, Clicked, Failed (email); DAY: engagements per day
+    (WhatsApp read / email opened).
+    CALL — DAY_OUTCOME (default): calls per day by outcome (CONNECTED,
+    MISSED_CALL, NO_ANSWER, BUSY, REJECTED, IN_PROGRESS) plus
+    per_outcome_total; CALL_DISPOSITION: calls per disposition ("No
+    disposition" when agents didn't set one). agent_ids (CALL only): limit
+    to these agents (user ids).
+
+    date_from / date_to: the user's local calendar dates, YYYY-MM-DD,
+    inclusive, at most 366 days; give both or neither. Neither means the
+    activity page's default: the activity's start date to its end date, or
+    start date + 7 days when it has no end date — opens or replies after
+    that window are not counted, so for "all time" pass dates from the
+    start date to today. timezone: IANA name; defaults to the current
+    user's. The result's date_range says which range was used.
+
+    Each funnel step counts recipients whose step happened inside the date
+    range. total 0 means nothing in the range (a DRAFT activity always
+    shows 0).
+  example:
+    activity_name: "Abhinav Whatsapp Reply"
+    group_by: ACTIVITY_STATUS
+
+- id: campaign_activity.recipients
+  bucket: campaign_activity
+  intent: search
+  method: POST
+  path: /v1/campaigns/activities/{activity_id}/recipient-status
+  dynamic_fields: false
+  description: "Who an activity was sent to and what each recipient did (read, replied, opened, failed, call outcome)."
+  usage_notes: >
+    The recipient list of one activity. Identify it with activity_id or
+    activity_name (campaign_id optional); several name matches return
+    {matches[], note}: ask the user to choose one, as the note says.
+
+    filters: list of {field, operator, value}; allowed fields depend on the
+    activity's type (the server checks it):
+    WHATSAPP — status (SENT, DELIVERED, READ, REPLIED, FAILED: equal,
+    not_equal, in, not_in), sentAt, deliveredAt, readAt, repliedAt,
+    failedAt;
+    EMAIL — status (SENT, OPENED, CLICKED, FAILED), sentAt, openedAt,
+    clickedAt, failedAt;
+    CALL — outcome (CONNECTED, REJECTED, BUSY, NO_ANSWER, MISSED_CALL,
+    IN_PROGRESS), disposition (disposition id), userAgent (agent's user
+    id), callCreatedAt.
+    Date fields take greater, greater_or_equal, less, less_or_equal,
+    between, not_between, is_null, is_not_null with the user's LOCAL date
+    or datetime (converted like campaign_activity.search). status is the
+    recipient's latest step, so "who read it" is status in [READ, REPLIED]
+    for WhatsApp, or readAt is_not_null.
+
+    page (0-based), size (1-50, default 20), sort "<field>,<asc|desc>" on
+    a date field above; default newest sent (CALL: newest call) first.
+
+    Returns {activity, total, page, size, has_more, recipients[]}; each
+    recipient has name, entity_type/entity_id (the lead or contact), email
+    or phone_number, status (CALL: outcome, disposition, agent,
+    duration_seconds) and its timestamps, plus error when it failed.
+    A DRAFT, QUEUED or FAILED activity has sent nothing, so it has no
+    recipients. Timestamps are UTC — convert to the user's timezone.
+  example:
+    activity_name: "Abhinav Whatsapp Reply"
+    filters:
+      - field: status
+        operator: in
+        value: [READ, REPLIED]
+
+- id: campaign_activity.generated_records
+  bucket: campaign_activity
+  intent: search
+  method: POST
+  path: /v1/campaigns/activities/{activity_id}/generated-records
+  dynamic_fields: false
+  description: "Leads/contacts created as a result of one campaign activity."
+  usage_notes: >
+    The "records generated" list of one activity — the count is
+    records_generated in campaign_activity.get. Identify the activity with
+    activity_id or activity_name (campaign_id optional); several name
+    matches return {matches[], note}: ask the user to choose one, as the
+    note says.
+
+    page (0-based), size (1-50, default 20), sort "createdAt,<asc|desc>";
+    default newest first.
+
+    Returns {activity, total, page, size, has_more, records[]}; each record
+    has entity_type (LEAD/CONTACT), entity_id, name, phone_numbers, emails
+    and created_at (UTC — convert to the user's timezone). Use lead.get /
+    contact.get with entity_id for more about a record.
+  example:
+    activity_id: 713

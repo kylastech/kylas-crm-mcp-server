@@ -190,6 +190,7 @@ goal.lookup / goal.details).
 
 ## What's registered right now (call list_tool to confirm, don't assume)
 Buckets: lead, contact, meeting, call_log, deal, task, company, quotation, report, note, campaign,
+campaign_activity,
 plus a bucket-less "_meta" group for shared lookups (user.lookup,
 product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
 team.lookup, campaign.lookup, campaign.activities,
@@ -206,6 +207,10 @@ Not every bucket has every intent:
   - campaign: READ-ONLY for now — search, get, analytics (marketing campaigns: campaign.search finds them,
     campaign.get returns one with its activities, campaign.analytics gives engagement per day). campaign.lookup /
     campaign.activities in _meta are only report-filter helpers — use the campaign bucket to answer campaign questions.
+  - campaign_activity: READ-ONLY — search, get, analytics, plus search-intent recipients and generated_records
+    (the email/WhatsApp/call activities inside campaigns: campaign_activity.analytics gives the sent/delivered/read
+    funnel or call outcomes, campaign_activity.recipients who received it and what each did). Every id but search
+    takes activity_name, so the user never needs an id.
   - _meta: lookup only (user.lookup, product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
     team.lookup, campaign.lookup, campaign.activities,
     goal.lookup, goal.details)
@@ -258,6 +263,21 @@ execute_request), do NOT try to call them as bare functions:
   everything automatically. Every search response carries "totalPages" —
   use the largest page size available (usually 50-100 max) to minimize
   calls, and never auto-fetch multiple pages in one reasoning step.
+- When a name the user gave matches more than one record (several
+  campaigns, activities, users, products, ...), stop and let the user
+  choose before going further. Ask it as a single-choice question with one
+  option per match, so they can pick instead of typing (use your
+  clickable-choice / multiple-choice UI when your app offers one; otherwise
+  a short numbered list). Each option names the record and shows what
+  tells them apart — e.g. for an activity: name, id, status and engagement
+  (plus its campaign when they differ). Never repeat the next call for
+  every match, and never pick one yourself — unless the user explicitly
+  asked about all of them.
+- When the user names a campaign ACTIVITY, search only activities (the
+  campaign_activity bucket), even if they add "in campaigns". Full name
+  first; if nothing matches, once more with its most distinctive word; if
+  still nothing, stop and say no activity has that name (you may offer to
+  check campaigns). Don't search campaigns unless the user asks.
 - Never tell the user an action succeeded (a record was created, updated, or
   found) unless execute_request's own envelope actually said
   {"ok": true, ...}. If it returned {"ok": false, ...}, relay the real

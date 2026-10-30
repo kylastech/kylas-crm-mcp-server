@@ -22,7 +22,7 @@ service shape the helpers below:
 """
 
 from datetime import date, datetime, time, timedelta, timezone as dt_timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil import parser as dateutil_parser
@@ -108,6 +108,53 @@ ACTIVITY_GROUP_BY: Dict[str, Dict[str, List[str]]] = {
     "WHATSAPP": {"ACTIVITY_STATUS": ["ACTIVITY_STATUS"], "DAY": ["DAY"]},
     "CALL": {"CALL_DISPOSITION": ["CALL_DISPOSITION"], "DAY_OUTCOME": ["DAY", "OUTCOME"]},
 }
+
+# What "how did this activity do?" means per type: the funnel for messages,
+# connected/missed calls per day for calls.
+DEFAULT_ACTIVITY_GROUP_BY = {"EMAIL": "ACTIVITY_STATUS", "WHATSAPP": "ACTIVITY_STATUS", "CALL": "DAY_OUTCOME"}
+
+# Funnel steps in the order the activity page shows them (sd-ui CampaignActivityFunnelChart).
+FUNNEL_ORDER = {
+    "EMAIL": ["Sent", "Opened", "Clicked", "Failed"],
+    "WHATSAPP": ["Sent", "Delivered", "Read", "Replied", "Failed"],
+}
+
+# ---------------------------------------------------------------------------
+# Activity search / recipient list allow-lists
+# ---------------------------------------------------------------------------
+
+# sd-campaign sorts activities on any Activity attribute; these are the useful ones.
+ACTIVITY_SORT_FIELDS = CAMPAIGN_SORT_FIELDS + ["type", "entity", "processedAt"]
+
+CALL_OUTCOMES = ["CONNECTED", "REJECTED", "BUSY", "NO_ANSWER", "MISSED_CALL", "IN_PROGRESS"]
+
+# Recipient filters per activity type — the filterable columns 
+RECIPIENT_FILTER_FIELDS: Dict[str, Dict[str, FilterSpec]] = {
+    "EMAIL": {
+        "status": ("string", _ID_OPS, ["SENT", "OPENED", "CLICKED", "FAILED"]),
+        **{f: ("date", _DATE_OPS, None) for f in ("sentAt", "openedAt", "clickedAt", "failedAt")},
+    },
+    "WHATSAPP": {
+        "status": ("string", _ID_OPS, ["SENT", "DELIVERED", "READ", "REPLIED", "FAILED"]),
+        **{f: ("date", _DATE_OPS, None) for f in ("sentAt", "deliveredAt", "readAt", "repliedAt", "failedAt")},
+    },
+    "CALL": {
+        "outcome": ("string", _ID_OPS, CALL_OUTCOMES),
+        "disposition": ("long", _ID_OPS, None),
+        "userAgent": ("long", _ID_OPS, None),
+        "callCreatedAt": ("date", _DATE_OPS, None),
+    },
+}
+
+# Sortable recipient columns are the timestamps; the first is the page's default (desc).
+RECIPIENT_SORT_FIELDS = {
+    "EMAIL": ["sentAt", "openedAt", "clickedAt", "failedAt"],
+    "WHATSAPP": ["sentAt", "deliveredAt", "readAt", "repliedAt", "failedAt"],
+    "CALL": ["callCreatedAt"],
+}
+
+# Activities in these states have sent nothing, so their recipient list is empty.
+_NOT_SENT_STATUSES = {"DRAFT", "QUEUED", "FAILED"}
 
 # ---------------------------------------------------------------------------
 # HTTP
@@ -290,7 +337,15 @@ def _require_id(payload: Dict[str, Any], key: str) -> int:
     return number
 
 
-def _page_params(payload: Dict[str, Any], default_sort: str) -> Dict[str, Any]:
+def _optional_id(payload: Dict[str, Any], key: str) -> Optional[int]:
+    return _require_id(payload, key) if payload.get(key) not in (None, "") else None
+
+
+def _page_params(
+    payload: Dict[str, Any],
+    default_sort: str,
+    sort_fields: List[str] = CAMPAIGN_SORT_FIELDS,
+) -> Dict[str, Any]:
     """page/size/sort query params, validated so sd-campaign never sees a value it 403s on."""
     try:
         page = int(payload.get("page", 0))
@@ -305,8 +360,8 @@ def _page_params(payload: Dict[str, Any], default_sort: str) -> Dict[str, Any]:
     sort = str(payload.get("sort") or default_sort).strip()
     field, _, direction = sort.partition(",")
     direction = (direction or "asc").strip().lower()
-    if field.strip() not in CAMPAIGN_SORT_FIELDS:
-        raise ValueError(f"Can't sort by '{field.strip()}'. Sortable fields: {CAMPAIGN_SORT_FIELDS}.")
+    if field.strip() not in sort_fields:
+        raise ValueError(f"Can't sort by '{field.strip()}'. Sortable fields: {sort_fields}.")
     if direction not in ("asc", "desc"):
         raise ValueError(f"Sort direction must be 'asc' or 'desc', got '{direction}'.")
     return {"page": page, "size": size, "sort": f"{field.strip()},{direction}"}
@@ -387,6 +442,12 @@ def _activity_detail(activity: Dict[str, Any], currencies: Dict[int, str]) -> Di
     if activity.get("type") == "CALL":
         for key in ("totalRecords", "dialedCalls", "connectedCalls", "conversionRate", "averageHandlingTime"):
             detail[key] = activity.get(key)
+        detail["agent_metrics"] = [
+            {"agent": _user(m), "status": m.get("callDialerStatus"), "records_assigned": m.get("totalRecordsAssigned"),
+             "dialed_calls": m.get("dialedCalls"), "connected_calls": m.get("connectedCalls"),
+             "conversion_rate": m.get("conversionRate"), "average_handling_time": m.get("averageHandlingTime")}
+            for m in activity.get("agentDialerMetrics") or []
+        ]
     return detail
 
 
@@ -408,6 +469,69 @@ def _campaign_summary(campaign: Dict[str, Any], currencies: Dict[int, str]) -> D
             {"id": a.get("id"), "name": a.get("name"), "type": a.get("type"), "status": a.get("status")}
             for a in campaign.get("activities") or []
         ],
+    }
+
+
+def _activity_ref(activity: Dict[str, Any]) -> Dict[str, Any]:
+    """Which activity a result is about — enough for the model to name it and its campaign."""
+    campaign = activity.get("campaign") or {}
+    return {
+        "id": activity.get("id"),
+        "name": activity.get("name"),
+        "type": activity.get("type"),
+        "status": activity.get("status"),
+        "campaign": {"id": campaign.get("id"), "name": campaign.get("name")},
+    }
+
+
+def _activity_summary(activity: Dict[str, Any], currencies: Dict[int, str]) -> Dict[str, Any]:
+    return {
+        **_activity_ref(activity),
+        "entity": activity.get("entity"),
+        "estimated_budget": _money(activity.get("estimatedBudget"), currencies),
+        "actual_expense": _money(activity.get("actualExpense"), currencies),
+        "start_date": activity.get("startDate"),
+        "started_at": activity.get("startedAt"),
+        "ended_at": activity.get("endedAt"),
+        "total_engagement": activity.get("totalEngagement"),
+        "records_generated": activity.get("recordsGenerated"),
+    }
+
+
+def _recipient(row: Dict[str, Any], activity_type: str) -> Dict[str, Any]:
+    """One row of the recipient list (Email/WhatsApp/CallRecipientStatusResponse), timestamps UTC."""
+    recipient = {"name": row.get("recipientName"), "entity_type": row.get("entityType"), "entity_id": row.get("entityId")}
+    if activity_type == "EMAIL":
+        recipient.update({
+            "email": row.get("email"), "status": row.get("status"), "sent_at": row.get("sentAt"),
+            "opened_at": row.get("openedAt"), "clicked_at": row.get("clickedAt"), "failed_at": row.get("failedAt"),
+        })
+    elif activity_type == "WHATSAPP":
+        recipient.update({
+            "phone_number": row.get("phoneNumber"), "status": row.get("status"), "sent_at": row.get("sentAt"),
+            "delivered_at": row.get("deliveredAt"), "read_at": row.get("readAt"),
+            "replied_at": row.get("repliedAt"), "failed_at": row.get("failedAt"),
+        })
+    else:
+        recipient.update({
+            "phone_number": row.get("phoneNumber"), "outcome": row.get("outcome"),
+            "disposition": (row.get("disposition") or {}).get("name"), "agent": _user(row.get("userAgent")),
+            "duration_seconds": row.get("duration"), "call_id": row.get("callId"), "called_at": row.get("callCreatedAt"),
+        })
+    if row.get("errorMessage"):
+        recipient["error"] = row["errorMessage"]
+    return recipient
+
+
+def _generated_record(row: Dict[str, Any]) -> Dict[str, Any]:
+    """A lead/contact created from the activity (GeneratedRecordResponse)."""
+    return {
+        "entity_type": row.get("entityType"),
+        "entity_id": row.get("entityId"),
+        "name": row.get("entityName"),
+        "phone_numbers": [f"{p.get('dialCode') or ''}{p.get('value') or ''}" for p in row.get("phoneNumbers") or []],
+        "emails": [e.get("value") for e in row.get("emails") or []],
+        "created_at": row.get("createdAt"),
     }
 
 
@@ -439,15 +563,21 @@ def _parse_local_date(value: Any, key: str) -> date:
         raise ValueError(f"'{key}' must be a calendar date YYYY-MM-DD, got {value!r}.")
 
 
-def _resolve_date_range(payload: Dict[str, Any], tz_name: str) -> Tuple[date, date]:
+def _resolve_date_range(
+    payload: Dict[str, Any],
+    tz_name: str,
+    default: Optional[Tuple[date, date]] = None,
+) -> Tuple[date, date]:
     raw_from, raw_to = payload.get("date_from"), payload.get("date_to")
     if not raw_from and not raw_to:
+        if default:
+            return default
         # Current week, Monday to Sunday — the web app's default for these charts.
         today = datetime.now(ZoneInfo(tz_name)).date()
         monday = today - timedelta(days=today.weekday())
         return monday, monday + timedelta(days=6)
     if not raw_from or not raw_to:
-        raise ValueError("Give both 'date_from' and 'date_to', or neither (defaults to the current week).")
+        raise ValueError("Give both 'date_from' and 'date_to', or neither (defaults are in usage_notes).")
     date_from, date_to = _parse_local_date(raw_from, "date_from"), _parse_local_date(raw_to, "date_to")
     if date_from > date_to:
         raise ValueError("'date_from' must be on or before 'date_to'.")
@@ -466,6 +596,35 @@ def _local_day(api_day: str, tz_name: str) -> str:
     return instant.astimezone(ZoneInfo(tz_name)).date().isoformat()
 
 
+def _activity_default_range(activity: Dict[str, Any], tz_name: str) -> Optional[Tuple[date, date]]:
+    """The activity page's default chart range: start date -> end date, or start date + 7 days.
+
+    sd-ui CampaignActivityFunnelChart. None when the activity has no start
+    date (the caller then falls back to the current week).
+    """
+    if not activity.get("startDate"):
+        return None
+    start = date.fromisoformat(_local_day(activity["startDate"], tz_name))
+    end = date.fromisoformat(_local_day(activity["endDate"], tz_name)) if activity.get("endDate") else None
+    end = end or start + timedelta(days=7)
+    return start, min(max(end, start), start + timedelta(days=MAX_ANALYTICS_DAYS - 1))
+
+
+def _engagement_days(rows: Optional[List[Dict[str, Any]]], tz_name: str) -> List[Dict[str, Any]]:
+    """DAY analytics rows -> [{date, engagements}] for the days that had any."""
+    days = [{"date": _local_day(r["name"], tz_name), "engagements": r.get("value") or 0} for r in rows or []]
+    return [d for d in days if d["engagements"]]
+
+
+async def _filter_timezone(filters: List[Any], allowed: Dict[str, FilterSpec]) -> str:
+    """Timezone for date filters that don't carry their own; looks up the user only when one needs it."""
+    needs_timezone = any(
+        isinstance(f, dict) and not f.get("timeZone") and allowed.get(f.get("field"), ("",))[0] == "date"
+        for f in filters
+    )
+    return await _resolve_timezone(None) if needs_timezone else DEFAULT_TIMEZONE
+
+
 # ---------------------------------------------------------------------------
 # campaign.search / campaign.get / campaign.analytics
 # ---------------------------------------------------------------------------
@@ -474,18 +633,9 @@ def _local_day(api_day: str, tz_name: str) -> str:
 async def search_campaigns_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     """POST /v1/campaigns/search — what the campaign list page calls."""
     filters = payload.get("filters") or []
-    needs_timezone = any(
-        isinstance(f, dict) and not f.get("timeZone")
-        and CAMPAIGN_FILTER_FIELDS.get(f.get("field"), ("",))[0] == "date"
-        for f in filters
-    )
-    timezone = await _resolve_timezone(None) if needs_timezone else DEFAULT_TIMEZONE
+    timezone = await _filter_timezone(filters, CAMPAIGN_FILTER_FIELDS)
     body = build_campaign_json_rule(filters, CAMPAIGN_FILTER_FIELDS, timezone)
-    search_term = str(payload.get("search_term") or "").strip()
-    if search_term:
-        body["jsonRule"]["rules"].append(
-            {"id": "multi_field", "field": "multi_field", "type": "string", "operator": "multi_field", "value": search_term}
-        )
+    _add_search_term(body, payload)
     params = _page_params(payload, "updatedAt,desc")
     data = await _campaign_call("POST", "/v1/campaigns/search", "Search campaigns", params=params, body=body)
     currencies = await _currency_names()
@@ -544,8 +694,7 @@ async def campaign_analytics_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
         "date_to": date_to.isoformat(),
     }
     if group_by == "DAY":
-        days = [{"date": _local_day(r["name"], tz_name), "engagements": r.get("value") or 0} for r in rows or []]
-        result["days"] = [d for d in days if d["engagements"]]
+        result["days"] = _engagement_days(rows, tz_name)
     else:
         days, per_activity = [], {}
         for r in rows or []:
@@ -571,13 +720,272 @@ async def campaign_analytics_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# campaign_activity.* — one activity (EMAIL / WHATSAPP / CALL) inside a campaign
+# ---------------------------------------------------------------------------
+
+
+def _add_search_term(body: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    """search_term -> sd-campaign's name search (lower(name) LIKE %term%), as the list pages send it."""
+    search_term = str(payload.get("search_term") or "").strip()
+    if search_term:
+        body["jsonRule"]["rules"].append(
+            {"id": "multi_field", "field": "multi_field", "type": "string", "operator": "multi_field", "value": search_term}
+        )
+
+
+async def _search_activity_rows(rules: List[Dict[str, Any]], size: int) -> List[Dict[str, Any]]:
+    body = {"jsonRule": {"condition": "AND", "valid": True, "rules": rules}}
+    data = await _campaign_call("POST", "/v1/campaigns/activities/search", "Search campaign activities",
+                                params={"page": 0, "size": size, "sort": "updatedAt,desc"}, body=body)
+    return data.get("content") or []
+
+
+async def _resolve_activity(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """The activity a payload names, as (activity, None) — or (None, choice) when a name matches several.
+
+    Users know activities by name, and Kylas needs the campaign id in most
+    activity URLs (a wrong one is a 404), so: activity_id + campaign_id is a
+    direct GET; activity_id alone or activity_name is looked up through
+    activity search, whose rows carry the full activity and its campaign.
+    """
+    activity_id = _optional_id(payload, "activity_id")
+    campaign_id = _optional_id(payload, "campaign_id")
+    name = str(payload.get("activity_name") or "").strip()
+
+    if activity_id:
+        if campaign_id:
+            path = f"/v1/campaigns/{campaign_id}/activities/{activity_id}"
+            return await _campaign_call("GET", path, "Fetch campaign activity"), None
+        rows = await _search_activity_rows(
+            [{"id": "id", "field": "id", "type": "long", "operator": "equal", "value": activity_id}], 1)
+        if not rows:
+            raise KylasAPIError("Activity not found.", status_code=404)
+        return rows[0], None
+
+    if not name:
+        raise ValueError("Give 'activity_id' or 'activity_name'.")
+    rows = await _search_activity_rows(
+        [{"id": "multi_field", "field": "multi_field", "type": "string", "operator": "multi_field", "value": name}],
+        MAX_PAGE_SIZE)
+    if campaign_id:
+        rows = [r for r in rows if (r.get("campaign") or {}).get("id") == campaign_id]
+    exact = [r for r in rows if (r.get("name") or "").strip().lower() == name.lower()]
+    matches = exact or rows
+    if not matches:
+        raise KylasAPIError(
+            f"No activity name contains '{name}'. Retry once with its most distinctive word. If that "
+            "finds nothing either, STOP and tell the user no activity has that name — you may offer to "
+            "check campaigns if they meant a campaign, but don't search campaigns (or try more words) "
+            "unless they ask.", status_code=404)
+    if len(matches) > 1:
+        return None, {
+            "matches": [{**_activity_ref(r), "total_engagement": r.get("totalEngagement")} for r in matches],
+            "note": f"STOP: more than one activity matched '{name}' and nothing was fetched for any of them. "
+                    "Ask the user to choose one: a single-choice question with one option per match showing "
+                    "name, #id, status and engagement (and campaign when they differ) — as clickable choices "
+                    "if your app offers them. Then call again with the chosen activity_id. Don't pick one "
+                    "yourself, and don't run this for each match or for all of them unless the user "
+                    "explicitly asked for all.",
+        }
+    return matches[0], None
+
+
+async def search_activities_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST /v1/campaigns/activities/search — activities across all campaigns."""
+    filters = payload.get("filters") or []
+    timezone = await _filter_timezone(filters, ACTIVITY_FILTER_FIELDS)
+    body = build_campaign_json_rule(filters, ACTIVITY_FILTER_FIELDS, timezone)
+    _add_search_term(body, payload)
+    params = _page_params(payload, "updatedAt,desc", ACTIVITY_SORT_FIELDS)
+    data = await _campaign_call("POST", "/v1/campaigns/activities/search", "Search campaign activities",
+                                params=params, body=body)
+    currencies = await _currency_names()
+    return {
+        "total": data.get("totalElements"),
+        "page": params["page"],
+        "size": params["size"],
+        "has_more": not data.get("last", True),
+        "activities": [_activity_summary(a, currencies) for a in data.get("content") or []],
+    }
+
+
+async def get_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """One activity with everything the activity details page shows."""
+    activity, choice = await _resolve_activity(payload)
+    if choice:
+        return choice
+    currencies = await _currency_names()
+    detail = _activity_detail(activity, currencies)
+    detail.update({
+        "campaign": _activity_ref(activity)["campaign"],
+        "created_by": _user(activity.get("createdBy")),
+        "started_by": _user(activity.get("startedBy")),
+        "ended_by": _user(activity.get("endedBy")),
+        "created_at": activity.get("createdAt"),
+        "updated_at": activity.get("updatedAt"),
+    })
+    return detail
+
+
+def _funnel(rows: Optional[List[Dict[str, Any]]], activity_type: str) -> List[Dict[str, Any]]:
+    """ACTIVITY_STATUS rows -> funnel steps in the page's order; a step with no row counts 0."""
+    counts = {r.get("name"): r.get("value") or 0 for r in rows or []}
+    order = FUNNEL_ORDER.get(activity_type, [])
+    steps = [{"step": s, "count": counts.pop(s, 0)} for s in order]
+    return steps + [{"step": s, "count": c} for s, c in counts.items()]
+
+
+async def activity_analytics_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST /v1/campaigns/{cid}/activities/{aid}/analytics — the charts on the activity details page."""
+    activity, choice = await _resolve_activity(payload)
+    if choice:
+        return choice
+    activity_type = activity.get("type")
+    allowed = ACTIVITY_GROUP_BY.get(activity_type)
+    if not allowed:
+        raise ValueError(f"Activity type '{activity_type}' has no analytics.")
+    group_by = str(payload.get("group_by") or DEFAULT_ACTIVITY_GROUP_BY[activity_type]).strip().upper()
+    if group_by not in allowed:
+        # sd-campaign answers a bare 403 for a groupBy the activity type doesn't support.
+        raise ValueError(f"group_by '{group_by}' isn't valid for a {activity_type} activity. Use one of {sorted(allowed)}.")
+    agent_ids = payload.get("agent_ids") or []
+    if agent_ids and activity_type != "CALL":
+        raise ValueError("'agent_ids' only applies to CALL activities.")
+    if not isinstance(agent_ids, list):
+        raise ValueError("'agent_ids' must be a list of user ids.")
+    agent_ids = [_number_value(a, "long", "agent_ids", "agent_ids") for a in agent_ids]
+
+    tz_name = await _resolve_timezone(payload.get("timezone"))
+    default_range = _activity_default_range(activity, tz_name)
+    date_from, date_to = _resolve_date_range(payload, tz_name, default_range)
+    if payload.get("date_from") or payload.get("date_to"):
+        range_source = "as requested"
+    elif default_range:
+        range_source = "activity start date to its end date (or start + 7 days) — the activity page's default"
+    else:
+        range_source = "current week (the activity has no start date)"
+
+    body = analytics_body(
+        allowed[group_by],
+        _utc_instant(date_from, tz_name),
+        _utc_instant(date_to, tz_name, end_of_day=True),
+        tz_name,
+    )
+    if agent_ids:
+        body["rules"] = [{"id": "userAgent", "field": "userAgent", "type": "long", "operator": "in", "value": agent_ids}]
+    campaign_id = (activity.get("campaign") or {}).get("id")
+    rows = await _campaign_call(
+        "POST", f"/v1/campaigns/{campaign_id}/activities/{activity['id']}/analytics", "Activity analytics", body=body)
+
+    result: Dict[str, Any] = {
+        "activity": _activity_ref(activity),
+        "group_by": group_by,
+        "timezone": tz_name,
+        "date_from": date_from.isoformat(),
+        "date_to": date_to.isoformat(),
+        "date_range": range_source,
+    }
+    if group_by == "ACTIVITY_STATUS":
+        # No "total": the steps overlap (a read message was also sent and delivered).
+        result["metric"] = "recipients reaching each step in the date range (each step by its own timestamp)"
+        result["funnel"] = _funnel(rows, activity_type)
+    elif group_by == "DAY":
+        result["metric"] = "engagements: " + ("emails opened" if activity_type == "EMAIL" else "WhatsApp messages read")
+        result["days"] = _engagement_days(rows, tz_name)
+        result["total"] = sum(d["engagements"] for d in result["days"])
+    elif group_by == "DAY_OUTCOME":
+        result["metric"] = "calls per outcome per day"
+        days, per_outcome = [], {}
+        for r in rows or []:
+            outcomes = [{"outcome": d.get("name"), "calls": d.get("value") or 0}
+                        for d in r.get("dimension") or [] if d.get("value")]
+            if outcomes:
+                days.append({"date": _local_day(r["name"], tz_name), "outcomes": outcomes})
+            for o in outcomes:
+                per_outcome[o["outcome"]] = per_outcome.get(o["outcome"], 0) + o["calls"]
+        result["days"] = days
+        result["per_outcome_total"] = [{"outcome": k, "calls": v}
+                                       for k, v in sorted(per_outcome.items(), key=lambda kv: -kv[1])]
+        result["total"] = sum(per_outcome.values())
+    else:  # CALL_DISPOSITION
+        result["metric"] = "calls per disposition"
+        result["dispositions"] = [
+            {"id": r.get("id"), "disposition": r.get("name") or "No disposition", "calls": r.get("value") or 0}
+            for r in rows or [] if r.get("value")
+        ]
+        result["total"] = sum(d["calls"] for d in result["dispositions"])
+
+    if not (result.get("total") or any(step["count"] for step in result.get("funnel", []))):
+        result["note"] = "Nothing in this date range."
+        if default_range and range_source != "as requested":
+            result["note"] += (" This was the activity page's default window (start date to end date or +7 days);"
+                               " the activity may have run later — retry with date_from = its started_at date"
+                               " and date_to = today (at most 365 days after date_from — the range limit is"
+                               f" {MAX_ANALYTICS_DAYS} days) before telling the user there was no activity.")
+    return result
+
+
+async def activity_recipients_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST /v1/campaigns/activities/{aid}/recipient-status — who it went to and what each one did."""
+    activity, choice = await _resolve_activity(payload)
+    if choice:
+        return choice
+    activity_type = activity.get("type")
+    sort_fields = RECIPIENT_SORT_FIELDS[activity_type]
+    params = _page_params(payload, f"{sort_fields[0]},desc", sort_fields)
+    if activity.get("status") in _NOT_SENT_STATUSES:
+        # sd-campaign answers these with an empty page anyway — skip the call.
+        return {
+            "activity": _activity_ref(activity), "total": 0, "page": params["page"], "size": params["size"],
+            "has_more": False, "recipients": [],
+            "note": f"This activity is {activity['status']}: it hasn't sent anything, so it has no recipients.",
+        }
+    allowed = RECIPIENT_FILTER_FIELDS[activity_type]
+    filters = payload.get("filters") or []
+    timezone = await _filter_timezone(filters, allowed)
+    body = build_campaign_json_rule(filters, allowed, timezone)
+    data = await _campaign_call("POST", f"/v1/campaigns/activities/{activity['id']}/recipient-status",
+                                "Fetch activity recipients", params=params, body=body)
+    return {
+        "activity": _activity_ref(activity),
+        "total": data.get("totalElements"),
+        "page": params["page"],
+        "size": params["size"],
+        "has_more": not data.get("last", True),
+        "recipients": [_recipient(r, activity_type) for r in data.get("content") or []],
+    }
+
+
+async def activity_generated_records_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST /v1/campaigns/activities/{aid}/generated-records — leads/contacts created from the activity."""
+    activity_id = _optional_id(payload, "activity_id")
+    activity_ref: Dict[str, Any] = {"id": activity_id}
+    if not activity_id:
+        activity, choice = await _resolve_activity(payload)
+        if choice:
+            return choice
+        activity_id, activity_ref = activity["id"], _activity_ref(activity)
+    params = _page_params(payload, "createdAt,desc", ["createdAt"])
+    data = await _campaign_call("POST", f"/v1/campaigns/activities/{activity_id}/generated-records",
+                                "Fetch generated records", params=params)
+    return {
+        "activity": activity_ref,
+        "total": data.get("totalElements"),
+        "page": params["page"],
+        "size": params["size"],
+        "has_more": not data.get("last", True),
+        "records": [_generated_record(r) for r in data.get("content") or []],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Input schemas (what build_payload returns for each id)
 # ---------------------------------------------------------------------------
 
 _ALL_FILTER_OPERATORS = sorted(set(_ID_OPS + _TEXT_OPS + _NUMBER_OPS + _DATE_OPS))
 
 
-def _filters_schema(fields: Dict[str, FilterSpec]) -> Dict[str, Any]:
+def _filters_schema(fields: Iterable[str]) -> Dict[str, Any]:
     return {
         "type": "array",
         "description": "AND-combined filters. Allowed fields/operators/values are listed in usage_notes.",
@@ -595,15 +1003,36 @@ def _filters_schema(fields: Dict[str, FilterSpec]) -> Dict[str, Any]:
     }
 
 
-_PAGING_PROPERTIES = {
-    "page": {"type": "integer", "minimum": 0, "default": 0, "description": "0-based page."},
-    "size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE_SIZE, "default": 20},
-    "sort": {"type": "string", "default": "updatedAt,desc",
-             "description": f"'<field>,<asc|desc>' (direction defaults to asc). "
-                            f"Fields: {', '.join(CAMPAIGN_SORT_FIELDS)}."},
-}
+def _paging_properties(sort_description: str) -> Dict[str, Any]:
+    return {
+        "page": {"type": "integer", "minimum": 0, "default": 0, "description": "0-based page."},
+        "size": {"type": "integer", "minimum": 1, "maximum": MAX_PAGE_SIZE, "default": 20},
+        "sort": {"type": "string",
+                 "description": f"'<field>,<asc|desc>' (direction defaults to asc). {sort_description}"},
+    }
+
+
+_PAGING_PROPERTIES = _paging_properties(
+    f"Fields: {', '.join(CAMPAIGN_SORT_FIELDS)}. Leave it out for newest-updated first.")
 
 _CAMPAIGN_ID_PROPERTY = {"campaign_id": {"type": "integer", "description": "Campaign id (from campaign.search)."}}
+
+_ACTIVITY_REF_PROPERTIES = {
+    "activity_id": {"type": "integer", "description": "Activity id. Give this or activity_name."},
+    "activity_name": {"type": "string",
+                      "description": "Activity name or part of it, when the id isn't known. Several matches "
+                                     "return a list to ask the user about."},
+    "campaign_id": {"type": "integer",
+                    "description": "Optional. The activity's campaign; found automatically when left out."},
+}
+
+_ANALYTICS_DATE_PROPERTIES = {
+    "date_from": {"type": "string", "format": "date", "description": "Local date YYYY-MM-DD."},
+    "date_to": {"type": "string", "format": "date", "description": "Local date YYYY-MM-DD, inclusive."},
+    "timezone": {"type": "string", "description": "IANA timezone; defaults to the current user's."},
+}
+
+_RECIPIENT_FILTER_FIELD_NAMES = sorted({f for fields in RECIPIENT_FILTER_FIELDS.values() for f in fields})
 
 CampaignRouter = Callable[[Dict[str, Any]], Awaitable[Any]]
 
@@ -627,11 +1056,51 @@ CAMPAIGN_SCHEMAS: Dict[str, Dict[str, Any]] = {
             **_CAMPAIGN_ID_PROPERTY,
             "group_by": {"type": "string", "enum": sorted(CAMPAIGN_GROUP_BY), "default": "DAY",
                          "description": "DAY = engagements per day; DAY_ACTIVITIES = per day split by activity."},
-            "date_from": {"type": "string", "format": "date", "description": "Local date YYYY-MM-DD."},
-            "date_to": {"type": "string", "format": "date", "description": "Local date YYYY-MM-DD, inclusive."},
-            "timezone": {"type": "string", "description": "IANA timezone; defaults to the current user's."},
+            **_ANALYTICS_DATE_PROPERTIES,
         },
         "required": ["campaign_id"],
+    },
+    "campaign_activity.search": {
+        "type": "object",
+        "properties": {
+            "filters": _filters_schema(ACTIVITY_FILTER_FIELDS),
+            "search_term": {"type": "string", "description": "Free text matched against the activity name."},
+            **_paging_properties(f"Fields: {', '.join(ACTIVITY_SORT_FIELDS)}. Leave it out for newest-updated first."),
+        },
+    },
+    "campaign_activity.get": {
+        "type": "object",
+        "properties": dict(_ACTIVITY_REF_PROPERTIES),
+    },
+    "campaign_activity.analytics": {
+        "type": "object",
+        "properties": {
+            **_ACTIVITY_REF_PROPERTIES,
+            "group_by": {"type": "string",
+                         "enum": sorted({g for groups in ACTIVITY_GROUP_BY.values() for g in groups}),
+                         "description": "EMAIL/WHATSAPP: ACTIVITY_STATUS (funnel, default) or DAY. "
+                                        "CALL: DAY_OUTCOME (default) or CALL_DISPOSITION."},
+            **_ANALYTICS_DATE_PROPERTIES,
+            "agent_ids": {"type": "array", "items": {"type": "integer"},
+                          "description": "CALL only: limit to these agents' calls (user ids)."},
+        },
+    },
+    "campaign_activity.recipients": {
+        "type": "object",
+        "properties": {
+            **_ACTIVITY_REF_PROPERTIES,
+            "filters": _filters_schema(_RECIPIENT_FILTER_FIELD_NAMES),
+            **_paging_properties("Fields: EMAIL sentAt, openedAt, clickedAt, failedAt; WHATSAPP sentAt, "
+                                 "deliveredAt, readAt, repliedAt, failedAt; CALL callCreatedAt. "
+                                 "Leave it out for the newest first."),
+        },
+    },
+    "campaign_activity.generated_records": {
+        "type": "object",
+        "properties": {
+            **_ACTIVITY_REF_PROPERTIES,
+            **_paging_properties("Field: createdAt. Leave it out for the newest first."),
+        },
     },
 }
 
@@ -639,6 +1108,11 @@ CAMPAIGN_ROUTERS: Dict[str, CampaignRouter] = {
     "campaign.search": search_campaigns_logic,
     "campaign.get": get_campaign_logic,
     "campaign.analytics": campaign_analytics_logic,
+    "campaign_activity.search": search_activities_logic,
+    "campaign_activity.get": get_activity_logic,
+    "campaign_activity.analytics": activity_analytics_logic,
+    "campaign_activity.recipients": activity_recipients_logic,
+    "campaign_activity.generated_records": activity_generated_records_logic,
 }
 
 
