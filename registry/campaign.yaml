@@ -1,0 +1,133 @@
+# registry/campaign.yaml
+#
+# Registry entries for the "campaign" bucket (marketing campaigns, sd-campaign).
+#
+# ARCHITECTURE — what lives here vs. what lives in app/campaigns.py
+# ---------------------------------------------------------------------------
+# Same split as every other bucket file: this YAML holds the operation
+# metadata and the LLM-facing guidance (description, usage_notes, example).
+# There is no "schema:" block. Unlike lead/contact/deal, campaign schemas are
+# not snapshots of old @mcp.tool parameters — they live next to their logic
+# in app/campaigns.py (CAMPAIGN_SCHEMAS), and execute_request runs the
+# matching CAMPAIGN_ROUTERS entry. The server refuses to start if an id here
+# has no schema or router there.
+#
+# The existing _meta ids campaign.lookup / campaign.activities (report-filter
+# helpers) are separate and unchanged.
+
+- id: campaign.search
+  bucket: campaign
+  intent: search
+  method: POST
+  path: /v1/campaigns/search
+  dynamic_fields: false
+  description: "Search marketing campaigns by status, name, budget, dates or creator."
+  usage_notes: >
+    Lists campaigns, newest-updated first by default. Use it to find a
+    campaign's id, then campaign.get for details or campaign.analytics for
+    engagement.
+
+    filters: list of {field, operator, value}, combined with AND. Allowed:
+    id (long: equal, not_equal, in, not_in);
+    name (text: equal, not_equal, contains, not_contains, begins_with, in, not_in);
+    status (DRAFT, IN_PROGRESS, PAUSED, PROCESSED, COMPLETED — equal, not_equal, in, not_in);
+    estimatedBudget, actualExpense (number: equal, not_equal, greater,
+    greater_or_equal, less, less_or_equal, between, not_between);
+    createdAt, updatedAt, startedAt, endedAt (greater, greater_or_equal,
+    less, less_or_equal, between, not_between, is_null, is_not_null — give
+    the user's LOCAL date "YYYY-MM-DD" or datetime, not UTC; the server
+    converts using the filter's optional timeZone, else the current user's
+    timezone. A bare date covers the whole day: "between
+    ['2026-10-01', '2026-10-31']" includes all of 31 Oct);
+    createdBy, updatedBy, startedBy, endedBy (user id from user.lookup:
+    equal, not_equal, in, not_in).
+    in/not_in take a list; between/not_between take [from, to].
+
+    search_term: matched against the campaign name as one phrase,
+    case-insensitive, anywhere in the name ("replied campaign" finds
+    "Abhinav Whatsapp Replied Campaign"; "abhinav whatsapp campaign" and
+    "abhinav whatsapp reply campaign" find nothing — the words must appear
+    together, exactly). Prefer it over a name filter when the user names a
+    campaign.
+
+    Finding a campaign the user names (they won't know ids):
+    1. Search with the name they gave.
+    2. No match: search again with the single most distinctive word of it
+       (e.g. "abhinav"), then pick the campaign whose name clearly matches
+       what they said.
+    3. More than one match (names can repeat, e.g. two "testing bulk email"
+       campaigns): list them with id, status and dates and ask which one —
+       never pick one silently.
+    4. Exactly one match: use its id with campaign.get / campaign.analytics.
+
+    page (0-based), size (1-50, default 20), sort "<field>,<asc|desc>"
+    (direction defaults to asc; leave sort out for newest-updated first) with
+    field one of id, name, status, startDate, endDate, startedAt, endedAt,
+    createdAt, updatedAt, estimatedBudget, actualExpense.
+
+    Returns {total, page, size, has_more, campaigns[]}; each campaign has
+    budget/expense as {value, currency, currency_id}, its activities
+    (id, name, type, status) and total_engagement. Timestamps are UTC —
+    convert to the user's timezone before showing them.
+  example:
+    filters:
+      - field: status
+        operator: equal
+        value: IN_PROGRESS
+    size: 10
+
+- id: campaign.get
+  bucket: campaign
+  intent: get
+  method: GET
+  path: /v1/campaigns/{campaign_id}/overview
+  dynamic_fields: false
+  description: "Get one campaign with its activities, budget, UTM values and engagement totals."
+  usage_notes: >
+    campaign_id: the campaign's id. Users refer to campaigns by name — get
+    the id from campaign.search with search_term first (see its
+    usage_notes for no match / several matches). Returns the same
+    data as the campaign details page: status, budget and actual expense,
+    dates, UTM values, created/started/ended by, total_engagement,
+    records_generated, and every activity with its type (EMAIL, WHATSAPP,
+    CALL), status, target entity (LEAD/CONTACT), template and account,
+    audience filters, budget and engagement numbers.
+
+    This is also the way to list one campaign's activities — activity
+    search can't filter by campaign.
+
+    Budget/expense values are {value, currency, currency_id}. Timestamps are
+    UTC — convert to the user's timezone before showing them. A DRAFT
+    campaign has not sent anything yet, so it has no engagement.
+  example:
+    campaign_id: 433
+
+- id: campaign.analytics
+  bucket: campaign
+  intent: analytics
+  method: POST
+  path: /v1/campaigns/{campaign_id}/analytics
+  dynamic_fields: false
+  description: "Engagement over time for one campaign, per day or per day and activity."
+  usage_notes: >
+    The two charts on the campaign details page. "Engagement" counts
+    WhatsApp messages read, emails opened and calls made.
+
+    campaign_id: the campaign's id — resolve a campaign name with
+    campaign.search first.
+    group_by: DAY (default) — engagements per day; DAY_ACTIVITIES — per day
+    split by activity, plus per_activity_total.
+    date_from / date_to: the user's local calendar dates, YYYY-MM-DD,
+    inclusive, at most 366 days. Give both or neither; neither means the
+    current week (Monday to Sunday), the web app's default.
+    timezone: IANA name; leave it out to use the current user's timezone
+    (from get_current_user).
+
+    Returns {total, days[], …} with only the days that had engagement, each
+    as a local date. total 0 means no engagement in the range (a DRAFT
+    campaign always shows 0).
+  example:
+    campaign_id: 433
+    group_by: DAY_ACTIVITIES
+    date_from: "2026-10-01"
+    date_to: "2026-10-31"

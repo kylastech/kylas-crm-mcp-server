@@ -55,7 +55,7 @@ SYSTEM_INSTRUCTIONS = """
 # Kylas CRM MCP Server — Generic Registry Architecture
 
 This server does not expose one dedicated tool per CRM operation. Every
-operation (lead, contact, deal, task, company, meeting, call_log, quotation,
+operation (lead, contact, deal, task, company, meeting, call_log, quotation, campaign,
 plus shared user/product/pipeline/datetime lookups) is reached through
 exactly 3 generic tools, plus exactly 2 standalone tools that don't fit the
 id-based flow: get_current_user and get_entity_labels (see MANDATORY FIRST
@@ -189,7 +189,7 @@ goal.lookup / goal.details).
    build_payload does no validation of its own, on purpose.
 
 ## What's registered right now (call list_tool to confirm, don't assume)
-Buckets: lead, contact, meeting, call_log, deal, task, company, quotation, report, note,
+Buckets: lead, contact, meeting, call_log, deal, task, company, quotation, report, note, campaign,
 plus a bucket-less "_meta" group for shared lookups (user.lookup,
 product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
 team.lookup, campaign.lookup, campaign.activities,
@@ -203,6 +203,9 @@ Not every bucket has every intent:
   - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
   - report: create, preview (report.create saves a report; report.preview shows its numbers without saving; build_payload needs entity="<entity>")
   - note: create (note.create — add notes to lead, contact, deal, company, meeting, call_log, task)
+  - campaign: READ-ONLY for now — search, get, analytics (marketing campaigns: campaign.search finds them,
+    campaign.get returns one with its activities, campaign.analytics gives engagement per day). campaign.lookup /
+    campaign.activities in _meta are only report-filter helpers — use the campaign bucket to answer campaign questions.
   - _meta: lookup only (user.lookup, product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
     team.lookup, campaign.lookup, campaign.activities,
     goal.lookup, goal.details)

@@ -26,6 +26,8 @@ buckets:
   - quotation
   - report
   - note
+  - campaign
+  - campaign_activity
   - _meta
 
 intents:
@@ -39,4 +41,5 @@ intents:
   - preview
   - cancel
   - delete
+  - analytics
 
