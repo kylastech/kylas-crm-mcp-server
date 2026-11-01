@@ -1478,7 +1478,12 @@ async def create_campaign_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     body = await _campaign_create_body(payload, tz_name)
     if payload.get("confirm") is True:
         created = await _campaign_call("POST", "/v1/campaigns", "Create campaign", body=body)
-        return {"executed": True, "campaign": await get_campaign_logic({"campaign_id": created["id"]})}
+        try:
+            campaign_detail = await get_campaign_logic({"campaign_id": created["id"]})
+        except Exception:
+            campaign_detail = {"id": created["id"]}  # Return minimal info so caller doesn't retry
+        return {"executed": True, "campaign": campaign_detail}
+
     details = {**_campaign_details(body, await _currency_names(), tz_name), "status": "DRAFT (nothing is sent)"}
     return _preview_reply("campaign.create", details, user, "create this campaign")
 
