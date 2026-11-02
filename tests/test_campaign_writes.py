@@ -218,7 +218,7 @@ _LEAD_FIELDS = [
 
 @pytest.mark.asyncio
 async def test_audience_uses_the_lead_search_filter_format():
-    with patch("app.campaigns._fetch_lead_fields", AsyncMock(return_value=_LEAD_FIELDS)):
+    with patch.dict("app.campaigns._AUDIENCE_FIELD_FETCHERS", {"LEAD": AsyncMock(return_value=_LEAD_FIELDS)}):
         rule = await build_audience_rule("lead", [{"field": "id", "operator": "equal", "value": 753407}],
                                          "Asia/Calcutta")
     assert rule["condition"] == "AND"
@@ -233,7 +233,7 @@ async def test_audience_uses_the_lead_search_filter_format():
 ])
 @pytest.mark.asyncio
 async def test_audience_rejects_bad_input(entity, filters, message):
-    with patch("app.campaigns._fetch_lead_fields", AsyncMock(return_value=_LEAD_FIELDS)):
+    with patch.dict("app.campaigns._AUDIENCE_FIELD_FETCHERS", {"LEAD": AsyncMock(return_value=_LEAD_FIELDS)}):
         with pytest.raises(ValueError, match=message):
             await build_audience_rule(entity, filters, "Asia/Calcutta")
 
