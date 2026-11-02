@@ -204,10 +204,13 @@ Not every bucket has every intent:
   - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
   - report: create, preview (report.create saves a report; report.preview shows its numbers without saving; build_payload needs entity="<entity>")
   - note: create (note.create — add notes to lead, contact, deal, company, meeting, call_log, task)
-  - campaign: READ-ONLY for now — search, get, analytics (marketing campaigns: campaign.search finds them,
-    campaign.get returns one with its activities, campaign.analytics gives engagement per day). campaign.lookup /
+  - campaign: search, get, analytics, lookup (campaign.currencies), create, update (marketing campaigns:
+    campaign.search finds them, campaign.get returns one with its activities, campaign.analytics gives engagement
+    per day). create/update are always TWO calls: a preview that writes nothing, then — only after the user says
+    Yes — the same call with confirm: true. campaign.lookup /
     campaign.activities in _meta are only report-filter helpers — use the campaign bucket to answer campaign questions.
-  - campaign_activity: READ-ONLY — search, get, analytics, plus search-intent recipients and generated_records
+  - campaign_activity: READ-ONLY for now — search, get, analytics, lookups (email_templates, whatsapp_accounts,
+    whatsapp_templates, check_utm), plus search-intent recipients and generated_records
     (the email/WhatsApp/call activities inside campaigns: campaign_activity.analytics gives the sent/delivered/read
     funnel or call outcomes, campaign_activity.recipients who received it and what each did). Every id but search
     takes activity_name, so the user never needs an id.
