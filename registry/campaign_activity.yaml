@@ -213,13 +213,6 @@
   example:
     activity_id: 713
 
-# ---------------------------------------------------------------------------
-# Lookups for creating / updating activities (Plan 2). Each answers at most 10
-# rows — pass query to narrow by name. Activity create/update also accept a
-# template or account by name directly, so these are mainly for showing the
-# user what exists.
-# ---------------------------------------------------------------------------
-
 - id: campaign_activity.email_templates
   bucket: campaign_activity
   intent: lookup
@@ -278,3 +271,98 @@
     available}. Activity create/update run this check themselves; use it to
     suggest a free value before asking the user to confirm.
   example: {utm_campaign: "diwali-whatsapp-2026"}
+
+- id: campaign_activity.create
+  bucket: campaign_activity
+  intent: create
+  method: POST
+  path: /v1/campaigns/{campaign_id}/activities
+  dynamic_fields: false
+  description: "Add an EMAIL or WHATSAPP activity to a campaign (as DRAFT — nothing is sent). Two calls: preview, then confirm."
+  usage_notes: >
+    Step 1 — preview (no confirm): nothing is written. The result shows every
+    detail, the recipients that match the audience right now (and whether
+    that count lets the activity start: 1 to 10,000), and who it runs as.
+    Show all of it and ask a Yes / No question (clickable choices if your app
+    offers them). Step 2 — only if the user says Yes: the same call again with
+    exactly the same details plus confirm: true. No: stop, make no other call.
+    If they want changes, preview again. Never say it was created until a call
+    returns executed: true.
+
+    campaign_id or campaign_name (several name matches return a choice — ask
+    first). type: EMAIL or WHATSAPP (CALL isn't supported here). entity: LEAD
+    or CONTACT. name (required). audience_filters (required, at least one):
+    the same filter format as lead.search / contact.search on that entity —
+    call build_payload("campaign_activity.create", entity="lead" or "contact")
+    to get the filterable fields. budget (required) and actual_expense
+    (default 0): numbers, always in the campaign's currency. start_date
+    (required) / end_date: the user's LOCAL date (plain start = 00:00, plain
+    end = 23:59:59) and both inside the campaign's dates. utm_campaign,
+    utm_source, utm_medium (required; utm_campaign must be unused by any other
+    activity — campaign_activity.check_utm), utm_content, utm_term.
+    EMAIL: email_template (name or id, a template for that entity), sent_to
+    PRIMARY_EMAIL (default) or ALL_EMAILS. The sending email account is set
+    by Kylas. WHATSAPP: whatsapp_account (name or business name, or id),
+    whatsapp_template (name or id — an APPROVED template of that account and
+    entity), sent_to PRIMARY_PHONE_NUMBER (default) or ALL_PHONE_NUMBERS,
+    retry_times 0 to 7 (optional).
+
+    Checked before the preview: at most 4 activities per campaign, the
+    campaign's activity budgets together not above its budget, dates inside
+    the campaign. Ask the user for anything required they didn't give —
+    don't invent UTM values or filters. Activities are created as DRAFT;
+    starting one sends real messages and is a separate step.
+  example:
+    campaign_name: "MCP Plan2 Test"
+    type: EMAIL
+    entity: LEAD
+    name: "Welcome email"
+    audience_filters:
+      - field: id
+        operator: equal
+        value: 753407
+    email_template: "Lead creation"
+    budget: 500
+    start_date: "2026-11-05"
+    utm_campaign: "mcp-plan2-email-1"
+    utm_source: "mcp"
+    utm_medium: "email"
+
+- id: campaign_activity.update
+  bucket: campaign_activity
+  intent: update
+  method: PUT
+  path: /v1/campaigns/{campaign_id}/activities/{activity_id}
+  dynamic_fields: false
+  description: "Change an EMAIL or WHATSAPP activity. Two calls: preview, then confirm."
+  usage_notes: >
+    Identify it with activity_id or activity_name (campaign_id optional;
+    several name matches return a choice — ask first). Send only what
+    changes; everything else keeps its current value.
+
+    What can change depends on the activity's status — this is what Kylas
+    actually saves: DRAFT or FAILED: everything below. Any other status
+    (QUEUED, IN_PROGRESS, PAUSED, PROCESSED, RETRYING, COMPLETED): only
+    budget, actual_expense and end_date — other fields are refused.
+
+    Changeable (DRAFT / FAILED): name, budget, actual_expense, start_date,
+    end_date (empty clears it), utm_* (utm_campaign must stay unique),
+    entity (then audience_filters must be given too, on that entity's
+    fields), audience_filters, sent_to, email_template (EMAIL),
+    whatsapp_account, whatsapp_template, retry_times (WHATSAPP) — with the
+    same rules as campaign_activity.create. type: switch EMAIL <-> WHATSAPP
+    (DRAFT / FAILED only, as in the web form) — then give the new type's
+    template (WHATSAPP also its whatsapp_account); the old template and
+    account are dropped, nothing carries over, and sent_to defaults to the
+    new type's primary email / phone. Changing the entity or the WhatsApp
+    account checks the template again.
+
+    Step 1 — preview (no confirm): nothing is written; shows each change as
+    before -> after, the activity after the update, the recipient count if
+    the audience changed, and who it runs as. Ask Yes / No (clickable
+    choices if your app offers them). Step 2 — only on Yes: the same call
+    with confirm: true. Never say it was updated until a call returns
+    executed: true.
+  example:
+    activity_name: "Welcome email"
+    budget: 800

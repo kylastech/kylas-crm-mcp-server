@@ -11,7 +11,13 @@ from app.server import mcp
 from app.client import KylasAPIError, _reset_api_call_count
 from app.helpers import OPERATOR_MAPPING, _build_search_json_rule
 from app.reports import REPORT_PREVIEW_SCHEMA, create_report_logic, preview_report_logic
-from app.campaigns import CAMPAIGN_BUCKETS, CAMPAIGN_ROUTERS, CAMPAIGN_SCHEMAS, unwired_campaign_ids
+from app.campaigns import (
+    CAMPAIGN_AUDIENCE_IDS,
+    CAMPAIGN_BUCKETS,
+    CAMPAIGN_ROUTERS,
+    CAMPAIGN_SCHEMAS,
+    unwired_campaign_ids,
+)
 from app.entities import (
     _build_call_log_search_json_rule,
     _build_company_search_json_rule,
@@ -795,10 +801,10 @@ def list_tool(
       numbers WITHOUT saving; both need entity="<entity>" in build_payload);
       campaign has search, get, analytics (campaign.analytics: engagement per
       day for one marketing campaign), lookup (campaign.currencies), create
-      and update (both two calls: preview, then confirm); campaign_activity is
-      READ-ONLY for now — search, get, analytics (funnel / call outcomes),
-      lookups for templates/accounts/UTM, plus recipients and
-      generated_records (search intent); _meta
+      and update (both two calls: preview, then confirm); campaign_activity has
+      search, get, analytics (funnel / call outcomes), lookups for
+      templates/accounts/UTM, create and update (EMAIL / WHATSAPP, two calls),
+      plus recipients and generated_records (search intent); _meta
       is bucket-less and has lookup entries only (user.lookup,
       product.lookup, pipeline.lookup, pipeline.details,
       datetime.parse_to_utc, team.lookup, campaign.lookup,
@@ -1133,8 +1139,10 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
       again naming that field. Re-calling is idempotent. NEVER guess a
       picklist option id or internal name to avoid the second call.
 
-    entity: REQUIRED for report ids (bucket "report"), ignored for every other
-      id. One of lead, deal, contact, company, task, meeting, call, email,
+    entity: REQUIRED for report ids (bucket "report"). Optional for
+      campaign_activity.create / .update: "lead" or "contact" folds that
+      entity's filterable fields in for audience_filters, as for lead.search.
+      Ignored for every other id. For reports: one of lead, deal, contact, company, task, meeting, call, email,
       quotation — the STANDARD type (call get_entity_labels() if the user used
       a renamed entity). The report reference (dimensions, metrics, date
       fields, filters and their options) is fetched live for that entity, so a
@@ -1234,6 +1242,22 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
                     # need no network access at all and are still genuinely useful on
                     # their own; only the live tenant field/picklist enrichment is missing.
                     live_fetch_error = e.message
+
+    if id in CAMPAIGN_AUDIENCE_IDS and entity:
+        # An activity's audience_filters use the lead / contact search filters,
+        # so fold that entity's filterable fields in exactly as for lead.search.
+        fetch_fields_fn = _BUCKET_FIELD_FETCHERS.get(entity.strip().lower())
+        if fetch_fields_fn is None or entity.strip().lower() not in ("lead", "contact"):
+            live_fetch_error = f"entity for {id} must be lead or contact, got '{entity}'."
+        else:
+            try:
+                schema = await _fold_field_metadata_into_schema(
+                    schema, fetch_fields_fn, for_search=True,
+                    requested_picklists=fields, bucket=entity.strip().lower(),
+                )
+                fetched_live = True
+            except KylasAPIError as e:
+                live_fetch_error = e.message
 
     result = {
         "id": entry["id"],

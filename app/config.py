@@ -209,8 +209,9 @@ Not every bucket has every intent:
     per day). create/update are always TWO calls: a preview that writes nothing, then — only after the user says
     Yes — the same call with confirm: true. campaign.lookup /
     campaign.activities in _meta are only report-filter helpers — use the campaign bucket to answer campaign questions.
-  - campaign_activity: READ-ONLY for now — search, get, analytics, lookups (email_templates, whatsapp_accounts,
-    whatsapp_templates, check_utm), plus search-intent recipients and generated_records
+  - campaign_activity: search, get, analytics, lookups (email_templates, whatsapp_accounts, whatsapp_templates,
+    check_utm), create, update (EMAIL / WHATSAPP; two calls like campaign create/update), plus search-intent
+    recipients and generated_records
     (the email/WhatsApp/call activities inside campaigns: campaign_activity.analytics gives the sent/delivered/read
     funnel or call outcomes, campaign_activity.recipients who received it and what each did). Every id but search
     takes activity_name, so the user never needs an id.

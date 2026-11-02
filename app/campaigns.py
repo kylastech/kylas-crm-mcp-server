@@ -93,10 +93,6 @@ CAMPAIGN_SORT_FIELDS = [
 MAX_PAGE_SIZE = 50
 MAX_ANALYTICS_DAYS = 366
 
-# ---------------------------------------------------------------------------
-# Analytics group_by (model-facing name -> API groupBy). Mirrors
-# CampaignFacade.strategyMap and sd-ui CampaignAnalyticsDimension.
-# ---------------------------------------------------------------------------
 
 CAMPAIGN_GROUP_BY: Dict[str, List[str]] = {
     "DAY": ["DAY"],
@@ -118,10 +114,6 @@ FUNNEL_ORDER = {
     "EMAIL": ["Sent", "Opened", "Clicked", "Failed"],
     "WHATSAPP": ["Sent", "Delivered", "Read", "Replied", "Failed"],
 }
-
-# ---------------------------------------------------------------------------
-# Activity search / recipient list allow-lists
-# ---------------------------------------------------------------------------
 
 # sd-campaign sorts activities on any Activity attribute; these are the useful ones.
 ACTIVITY_SORT_FIELDS = CAMPAIGN_SORT_FIELDS + ["type", "entity", "processedAt"]
@@ -155,10 +147,6 @@ RECIPIENT_SORT_FIELDS = {
 
 # Activities in these states have sent nothing, so their recipient list is empty.
 _NOT_SENT_STATUSES = {"DRAFT", "QUEUED", "FAILED"}
-
-# ---------------------------------------------------------------------------
-# HTTP
-# ---------------------------------------------------------------------------
 
 _EMPTY_403_MESSAGE = (
     "{op} was rejected by the campaign service (403 with an empty body). It returns this for an "
@@ -199,11 +187,7 @@ async def _campaign_call(
         return {}
     return await handle_api_response(response, op)
 
-
-# ---------------------------------------------------------------------------
-# Request builders
-# ---------------------------------------------------------------------------
-
+#Request builders
 
 def _number_value(value: Any, api_type: str, label: str, field: str) -> Any:
     """A filter value as the number sd-campaign compares against; "5000" -> 5000.0, "abc" -> ValueError."""
@@ -238,7 +222,6 @@ def _date_value(value: Any, tz_name: str, end_of_day: bool, label: str, field: s
     except (ValueError, OverflowError):
         raise ValueError(f"{label}: '{field}' needs a date (YYYY-MM-DD) or datetime, got {value!r}.")
     return _convert_date_value_to_utc(text, tz_name)
-
 
 # Operators whose (upper-bound) bare date means the END of that day.
 _END_OF_DAY_OPS = {"greater", "less_or_equal"}
@@ -329,11 +312,7 @@ def analytics_body(group_by: List[str], date_from: str, date_to: str, timezone: 
         "dateRange": [date_from, date_to],
     }
 
-
-# ---------------------------------------------------------------------------
-# Payload helpers
-# ---------------------------------------------------------------------------
-
+#Payload helpers
 
 def _require_id(payload: Dict[str, Any], key: str) -> int:
     value = payload.get(key)
@@ -377,12 +356,7 @@ def _page_params(
         raise ValueError(f"Sort direction must be 'asc' or 'desc', got '{direction}'.")
     return {"page": page, "size": size, "sort": f"{field.strip()},{direction}"}
 
-
-# ---------------------------------------------------------------------------
-# Response trimming — keep what answers questions, drop UI-only fields
-# (recordActions, bulkJobId, lastPaused/Resumed audit fields, ...).
-# ---------------------------------------------------------------------------
-
+# Response trimming
 
 async def _fetch_currencies() -> List[Dict[str, Any]]:
     """The tenant's currency rows — the same call sd-campaign's ForexService makes."""
@@ -551,12 +525,7 @@ def _generated_record(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Analytics dates — the model sends local calendar dates; sd-campaign wants a
-# UTC instant range and answers one row per local day, named by that day's
-# local midnight in UTC ("2026-10-12T18:30Z" is 13 Oct in Asia/Calcutta).
-# ---------------------------------------------------------------------------
-
+# Analytics dates 
 
 async def _resolve_timezone(requested: Optional[str]) -> str:
     tz_name = (requested or "").strip()
@@ -641,10 +610,7 @@ async def _filter_timezone(filters: List[Any], allowed: Dict[str, FilterSpec]) -
     return await _resolve_timezone(None) if needs_timezone else DEFAULT_TIMEZONE
 
 
-# ---------------------------------------------------------------------------
 # campaign.search / campaign.get / campaign.analytics
-# ---------------------------------------------------------------------------
-
 
 async def search_campaigns_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     """POST /v1/campaigns/search — what the campaign list page calls."""
@@ -735,10 +701,7 @@ async def campaign_analytics_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-# ---------------------------------------------------------------------------
 # campaign_activity.* — one activity (EMAIL / WHATSAPP / CALL) inside a campaign
-# ---------------------------------------------------------------------------
-
 
 def _add_search_term(body: Dict[str, Any], payload: Dict[str, Any]) -> None:
     """search_term -> sd-campaign's name search (lower(name) LIKE %term%), as the list pages send it."""
@@ -993,12 +956,7 @@ async def activity_generated_records_logic(payload: Dict[str, Any]) -> Dict[str,
         "records": [_generated_record(r) for r in data.get("content") or []],
     }
 
-
-# ---------------------------------------------------------------------------
-# Write helpers (Plan 2) — shared by campaign / activity create, update and
-# lifecycle. Nothing here writes on its own.
-# ---------------------------------------------------------------------------
-
+# Write helpers 
 
 def _write_date(value: Any, tz_name: str, end_of_day: bool, field: str) -> str:
     """start_date / end_date from the user's local time to the UTC instant sd-campaign stores.
@@ -1134,14 +1092,7 @@ async def count_audience(entity: str, json_rule: Dict[str, Any]) -> int:
         data = await handle_api_response(response, "Count audience")
     return int((data or {}).get("totalElements") or 0)
 
-
-# ---------------------------------------------------------------------------
-# Lookups for the create / update forms — the web form's dropdown sources
-# (sd-ui formLayout getFormLookupUrl). Each "lookup" call answers at most
-# 10 rows ({"content": [...]}, paging ignored), so a name is searched with
-# q=<name> and an id is fetched directly by id.
-# ---------------------------------------------------------------------------
-
+# Lookups for the create / update forms
 
 async def _kylas_get(path: str, op: str, params: Optional[Dict[str, Any]] = None, not_found: str = "") -> Any:
     """GET from another Kylas service (email, messages). A 404 becomes `not_found` when given."""
@@ -1362,21 +1313,34 @@ async def check_utm_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"utm_campaign": value, "available": not taken}
 
 
-# ---------------------------------------------------------------------------
-# Confirmation — every create / update is two calls (plan W7). The first (no
-# confirm) validates and builds the exact request body but writes nothing; it
-# returns a preview. Only a second call with the same details and
-# confirm: true writes — and it re-runs every check before writing. The code
-# enforces this; it doesn't rely on the model.
-# ---------------------------------------------------------------------------
-
-
+# Confirmation — every create / update
 async def _acting_user() -> Dict[str, Any]:
     """Who a write runs as — shown in every preview."""
     u = await _fetch_current_user()
     name = u.get("name") or f"{u.get('firstName') or ''} {u.get('lastName') or ''}".strip() or None
     return {"id": u.get("id"), "name": name, "tenant_id": u.get("tenantId"),
             "timezone": u.get("timezone") or DEFAULT_TIMEZONE}
+
+
+async def _confirmed(kind: str, read: Callable[[], Awaitable[Any]], record_id: Any) -> Dict[str, Any]:
+    """The reply to a confirmed write. The write already succeeded, so a failed read-back must not look
+    like a failed write — the model would retry it (and a retried create can't reuse its utm_campaign)."""
+    try:
+        return {"executed": True, kind: await read()}
+    except Exception as e:
+        logger.warning("%s %s was saved but reading it back failed: %r", kind, record_id, e)
+        return {"executed": True, kind: {"id": record_id},
+                "note": f"The {kind} WAS saved (id {record_id}), but reading it back failed. Do not retry the "
+                        f"write — tell the user it was saved; its details can be fetched with the {kind} get id."}
+
+
+# Update fields where null / empty means "clear it"; anywhere else null means "not given".
+_CLEARABLE_ON_UPDATE = {"end_date"}
+
+
+def _update_keys(payload: Dict[str, Any], fields: Iterable[str]) -> List[str]:
+    """The update fields the caller actually gave: a null value counts as not given, except for clearable ones."""
+    return [k for k in fields if k in payload and (payload[k] is not None or k in _CLEARABLE_ON_UPDATE)]
 
 
 def _preview_reply(op: str, details: Dict[str, Any], user: Dict[str, Any], what: str) -> Dict[str, Any]:
@@ -1391,10 +1355,7 @@ def _preview_reply(op: str, details: Dict[str, Any], user: Dict[str, Any], what:
                 "say it was done until a call returns executed: true.",
     }
 
-
-# ---------------------------------------------------------------------------
 # campaign.create / campaign.update
-# ---------------------------------------------------------------------------
 
 _TEXT_FIELDS = ("name", "description", "utm_campaign", "utm_source", "utm_medium", "utm_content", "utm_term")
 _REQUIRED_ON_CREATE = ("name", "utm_campaign", "utm_source", "utm_medium")
@@ -1414,17 +1375,20 @@ def _text_value(payload: Dict[str, Any], key: str, required: bool) -> Optional[s
     return text or None
 
 
-async def _budget_body(value: Any, default_currency_id: Optional[int]) -> Dict[str, Any]:
-    """budget as a number or {value, currency} -> {currencyId, value}. No currency: default_currency_id, else base."""
-    if isinstance(value, dict):
-        amount, currency = value.get("value"), value.get("currency")
-    else:
-        amount, currency = value, None
+def _amount(value: Any, field: str) -> Tuple[float, Any]:
+    """A money input given as a number or {value, currency} -> (value, currency as given or None)."""
+    amount, currency = (value.get("value"), value.get("currency")) if isinstance(value, dict) else (value, None)
     if amount in (None, ""):
-        raise ValueError("'budget' needs a value, e.g. {\"value\": 50000, \"currency\": \"INR\"}.")
-    number = _number_value(amount, "double", "budget", "value")
+        raise ValueError(f"'{field}' needs a value, e.g. 500 or {{\"value\": 500, \"currency\": \"INR\"}}.")
+    number = _number_value(amount, "double", field, "value")
     if number < 0:
-        raise ValueError("'budget' can't be negative.")
+        raise ValueError(f"'{field}' can't be negative.")
+    return number, currency
+
+
+async def _budget_body(value: Any, default_currency_id: Optional[int]) -> Dict[str, Any]:
+    """A campaign budget -> {currencyId, value}. No currency given: default_currency_id, else the base currency."""
+    number, currency = _amount(value, "budget")
     currency_id = await _resolve_currency(currency) if currency not in (None, "") else (
         default_currency_id or await _resolve_currency(None))
     return {"currencyId": currency_id, "value": number}
@@ -1478,14 +1442,24 @@ async def create_campaign_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     body = await _campaign_create_body(payload, tz_name)
     if payload.get("confirm") is True:
         created = await _campaign_call("POST", "/v1/campaigns", "Create campaign", body=body)
-        try:
-            campaign_detail = await get_campaign_logic({"campaign_id": created["id"]})
-        except Exception:
-            campaign_detail = {"id": created["id"]}  # Return minimal info so caller doesn't retry
-        return {"executed": True, "campaign": campaign_detail}
+        return await _confirmed("campaign", lambda: get_campaign_logic({"campaign_id": created["id"]}), created["id"])
 
     details = {**_campaign_details(body, await _currency_names(), tz_name), "status": "DRAFT (nothing is sent)"}
     return _preview_reply("campaign.create", details, user, "create this campaign")
+
+
+def _simple_changes(payload: Dict[str, Any], asked: List[str], text_fields: Iterable[str], required: Iterable[str],
+                    tz_name: str) -> Dict[str, Any]:
+    """The plain update fields (texts and dates) the user changes, checked and in API-ready form."""
+    changes: Dict[str, Any] = {}
+    for key in asked:
+        if key in text_fields:
+            changes[key] = _text_value(payload, key, key in required)
+        elif key == "start_date":
+            changes[key] = _write_date(payload[key], tz_name, False, key)
+        elif key == "end_date":  # empty clears it
+            changes[key] = _write_date(payload[key], tz_name, True, key) if payload.get(key) else None
+    return changes
 
 
 def _same(a: Any, b: Any) -> bool:
@@ -1496,22 +1470,11 @@ async def _campaign_update_body(
     payload: Dict[str, Any], current: Dict[str, Any], tz_name: str,
 ) -> Tuple[Dict[str, Any], Dict[str, Tuple[Any, Any]]]:
     """(full PUT body, {field: (before, after)}) for the fields the user changes — validated like sd-campaign."""
-    asked = [k for k in _CAMPAIGN_CHANGEABLE if k in payload]
+    asked = _update_keys(payload, _CAMPAIGN_CHANGEABLE)
     if not asked:
         raise ValueError(f"Nothing to change. Give any of: {', '.join(_CAMPAIGN_CHANGEABLE)}.")
-    status = current.get("status")
-    if status != "DRAFT" and set(asked) - _STARTED_CHANGEABLE:
-        raise ValueError(f"This campaign is {status}: only budget and end_date can change now (Kylas ignores the "
-                         f"rest once a campaign has started). Not allowed: {sorted(set(asked) - _STARTED_CHANGEABLE)}.")
 
-    changes: Dict[str, Any] = {}
-    for key in asked:
-        if key in _TEXT_FIELDS:
-            changes[key] = _text_value(payload, key, key in _REQUIRED_ON_CREATE)
-        elif key == "start_date":
-            changes[key] = _write_date(payload[key], tz_name, False, key)
-        elif key == "end_date":  # empty clears it
-            changes[key] = _write_date(payload[key], tz_name, True, key) if payload.get(key) else None
+    changes = _simple_changes(payload, asked, _TEXT_FIELDS, _REQUIRED_ON_CREATE, tz_name)
     body = merge_for_update(current, changes, _CAMPAIGN_FIELD_MAP, _CAMPAIGN_BODY_FIELDS)
     if "budget" in asked:
         body["estimatedBudget"] = await _budget_body(
@@ -1537,6 +1500,11 @@ async def _campaign_update_body(
             if not _same(current.get(api_names[k]), body.get(api_names[k]))}
     if not diff:
         raise ValueError("Those values are already set — nothing would change.")
+    # Only fields that really change count, so resending an unchanged value is fine.
+    status = current.get("status")
+    if status != "DRAFT" and set(diff) - _STARTED_CHANGEABLE:
+        raise ValueError(f"This campaign is {status}: only budget and end_date can change now (Kylas ignores the "
+                         f"rest once a campaign has started). Not allowed: {sorted(set(diff) - _STARTED_CHANGEABLE)}.")
     return body, diff
 
 
@@ -1555,7 +1523,7 @@ async def update_campaign_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     body, diff = await _campaign_update_body(payload, current, tz_name)
     if payload.get("confirm") is True:
         await _campaign_call("PUT", f"/v1/campaigns/{campaign_id}", "Update campaign", body=body)
-        return {"executed": True, "campaign": await get_campaign_logic({"campaign_id": campaign_id})}
+        return await _confirmed("campaign", lambda: get_campaign_logic({"campaign_id": campaign_id}), campaign_id)
 
     currencies = await _currency_names()
 
@@ -1571,6 +1539,308 @@ async def update_campaign_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
     return _preview_reply("campaign.update", details, user,
                           f"apply these changes to campaign '{current.get('name')}'")
+
+# campaign_activity.create / campaign_activity.update — EMAIL and WHATSAPP
+# activities, with the same preview-then-confirm flow as campaigns.
+
+_ACTIVITY_WRITE_TYPES = ("EMAIL", "WHATSAPP")
+_SENT_TO = {"EMAIL": ["PRIMARY_EMAIL", "ALL_EMAILS"], "WHATSAPP": ["PRIMARY_PHONE_NUMBER", "ALL_PHONE_NUMBERS"]}
+MAX_ACTIVITIES_PER_CAMPAIGN = 4
+MAX_RECIPIENTS = 10000  # an activity only starts with 1 to 10,000 recipients (isActivityRunnable)
+_ACTIVITY_EDITABLE_STATUSES = {"DRAFT", "FAILED"}
+_STARTED_ACTIVITY_CHANGEABLE = {"budget", "actual_expense", "end_date"}
+_ACTIVITY_TEXT_FIELDS = ("name", "utm_campaign", "utm_source", "utm_medium", "utm_content", "utm_term")
+_ACTIVITY_REQUIRED_TEXT = ("name", "utm_campaign", "utm_source", "utm_medium")
+_ACTIVITY_PAYLOAD_FIELDS = ("sent_to", "email_template", "whatsapp_account", "whatsapp_template", "retry_times")
+_ACTIVITY_CHANGEABLE = ("type",) + _ACTIVITY_TEXT_FIELDS + ("budget", "actual_expense", "start_date", "end_date",
+                                                           "entity", "audience_filters") + _ACTIVITY_PAYLOAD_FIELDS
+# The readable fields that come from an activity's payload; all of them change with its type.
+_PAYLOAD_VIEW_FIELDS = ("type", "sent_to", "email_template", "whatsapp_account", "whatsapp_template", "retry_times")
+CAMPAIGN_AUDIENCE_IDS = frozenset({"campaign_activity.create", "campaign_activity.update"})
+
+
+# The payload fields each type uses; any other one would be silently dropped, so it is refused.
+_TYPE_FIELDS = {"EMAIL": {"sent_to", "email_template"},
+                "WHATSAPP": {"sent_to", "whatsapp_account", "whatsapp_template", "retry_times"}}
+
+
+def _check_type_fields(payload: Dict[str, Any], activity_type: str) -> None:
+    given = {k for k in _ACTIVITY_PAYLOAD_FIELDS if payload.get(k) not in (None, "")}
+    wrong = sorted(given - _TYPE_FIELDS[activity_type])
+    if wrong:
+        raise ValueError(f"{', '.join(wrong)} {'does' if len(wrong) == 1 else 'do'} not apply to {activity_type} "
+                         f"activities. {activity_type} uses: {', '.join(sorted(_TYPE_FIELDS[activity_type]))}.")
+
+
+def _activity_type_arg(value: Any) -> str:
+    activity_type = str(value or "").strip().upper()
+    if activity_type == "CALL":
+        raise ValueError("CALL activities can't be created or changed here yet — only EMAIL and WHATSAPP.")
+    if activity_type not in _ACTIVITY_WRITE_TYPES:
+        raise ValueError("'type' must be EMAIL or WHATSAPP.")
+    return activity_type
+
+
+def _sent_to(value: Any, activity_type: str) -> str:
+    sent_to = str(value or "").strip().upper() or _SENT_TO[activity_type][0]
+    if sent_to not in _SENT_TO[activity_type]:
+        raise ValueError(f"'sent_to' for {activity_type} must be one of {_SENT_TO[activity_type]}.")
+    return sent_to
+
+
+def _retry_config(value: Any) -> Optional[Dict[str, int]]:
+    if value in (None, ""):
+        return None
+    times = _number_value(value, "long", "retry_times", "retry_times")
+    if not 0 <= times <= 7:
+        raise ValueError("'retry_times' must be between 0 and 7.")
+    return {"noOfTimes": times}
+
+
+async def _activity_money(value: Any, campaign_currency_id: int, field: str) -> Dict[str, Any]:
+    """An activity amount in its campaign's currency — Kylas rejects any other currency."""
+    number, currency = _amount(value, field)
+    if currency not in (None, "") and await _resolve_currency(currency) != campaign_currency_id:
+        raise ValueError(f"An activity's {field} is always in its campaign's currency — leave the currency out.")
+    return {"currencyId": campaign_currency_id, "value": number}
+
+
+def _check_activity_dates(start: str, end: Optional[str], campaign: Dict[str, Any], tz_name: str) -> None:
+    _check_date_order(start, end)
+    campaign_start, campaign_end = _instant(campaign.get("startDate")), _instant(campaign.get("endDate"))
+    for field, value in (("start_date", start), ("end_date", end)):
+        when = _instant(value)
+        if when and (when < campaign_start or (campaign_end and when > campaign_end)):
+            raise ValueError(
+                f"'{field}' {_local_text(value, tz_name)} is outside the campaign's dates "
+                f"({_local_text(campaign.get('startDate'), tz_name)} to "
+                f"{_local_text(campaign.get('endDate'), tz_name) or 'no end date'}).")
+
+
+def _check_activity_budget(value: float, campaign: Dict[str, Any], activity_id: Optional[int]) -> None:
+    """All the campaign's activity budgets together can't exceed the campaign budget."""
+    others = sum(((a.get("estimatedBudget") or {}).get("value") or 0)
+                 for a in campaign.get("activities") or [] if a.get("id") != activity_id)
+    limit = (campaign.get("estimatedBudget") or {}).get("value") or 0
+    if others + value > limit:
+        raise ValueError(f"The campaign's activities would then have budgets of {others + value:g} in total, more "
+                         f"than the campaign budget {limit:g} (the other activities already use {others:g}).")
+
+
+async def _activity_payload(
+    activity_type: str, entity: str, payload: Dict[str, Any], current: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """The activity's `payload` — what it sends and how — as (payload, None), or (None, choice).
+
+    EMAIL: {type, sentTo, emailTemplate}; WHATSAPP: {type, sentTo,
+    connectedAccount, whatsappTemplate, retryConfig}, as the web form sends
+    them. Anything not given keeps its value from `current` (on update), but
+    the template is always checked again, since the entity or account it
+    must match may have changed.
+    """
+    current = current or {}
+    sent_to = _sent_to(payload.get("sent_to") or current.get("sentTo"), activity_type)
+    if activity_type == "EMAIL":
+        value = payload.get("email_template") or (current.get("emailTemplate") or {}).get("id")
+        if value in (None, ""):
+            raise ValueError("'email_template' is required for an EMAIL activity (its name or id; "
+                             "campaign_activity.email_templates lists them).")
+        template, choice = await _resolve_email_template(value, entity)
+        if choice:
+            return None, choice
+        built = {"type": "EMAIL", "sentTo": sent_to, "emailTemplate": template}
+        if current.get("connectedEmailAccount"):
+            built["connectedEmailAccount"] = current["connectedEmailAccount"]
+        return built, None
+
+    if payload.get("whatsapp_account") not in (None, ""):
+        account, choice = await _resolve_whatsapp_account(payload["whatsapp_account"])
+        if choice:
+            return None, choice
+    elif current.get("connectedAccount"):
+        account = _account_body(current["connectedAccount"])
+    else:
+        raise ValueError("'whatsapp_account' is required for a WHATSAPP activity (its name or id; "
+                         "campaign_activity.whatsapp_accounts lists them).")
+    value = payload.get("whatsapp_template") or (current.get("whatsappTemplate") or {}).get("id")
+    if value in (None, ""):
+        raise ValueError("'whatsapp_template' is required for a WHATSAPP activity (its name or id; "
+                         "campaign_activity.whatsapp_templates lists the account's templates).")
+    template, choice = await _resolve_whatsapp_template(value, account["id"], entity)
+    if choice:
+        return None, choice
+    retry = _retry_config(payload["retry_times"]) if "retry_times" in payload else current.get("retryConfig")
+    return {"type": "WHATSAPP", "sentTo": sent_to, "connectedAccount": account,
+            "whatsappTemplate": template, "retryConfig": retry}, None
+
+
+def _activity_view(body: Dict[str, Any], currencies: Dict[int, str], tz_name: str) -> Dict[str, Any]:
+    """An activity body as the readable details the user confirms (model-facing names)."""
+    payload = body.get("payload") or {}
+    view = {
+        "name": body.get("name"),
+        "type": payload.get("type"),
+        "entity": body.get("entity"),
+        "sent_to": payload.get("sentTo"),
+        "audience_filters": _audience(body.get("filters")),
+        "budget": _money(body.get("estimatedBudget"), currencies),
+        "actual_expense": _money(body.get("actualExpense"), currencies),
+        "start_date": _local_text(body.get("startDate"), tz_name),
+        "end_date": _local_text(body.get("endDate"), tz_name) or "none",
+        **{f"utm_{k}": body.get(f"utm{k.title()}") for k in ("campaign", "source", "medium", "content", "term")},
+    }
+    if payload.get("type") == "EMAIL":
+        view["email_template"] = (payload.get("emailTemplate") or {}).get("name")
+    else:
+        view["whatsapp_account"] = (payload.get("connectedAccount") or {}).get("name")
+        view["whatsapp_template"] = (payload.get("whatsappTemplate") or {}).get("name")
+        view["retry_times"] = (payload.get("retryConfig") or {}).get("noOfTimes")
+    return view
+
+
+def _audience_note(recipients: int) -> str:
+    if recipients < 1:
+        return "No leads/contacts match these filters right now — the activity couldn't start until some do."
+    if recipients > MAX_RECIPIENTS:
+        return f"More than {MAX_RECIPIENTS:,} match — an activity can only start with at most {MAX_RECIPIENTS:,}."
+    return "Can start: within the 1 to 10,000 recipients an activity needs."
+
+
+async def create_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST /v1/campaigns/{cid}/activities — in two calls: preview (nothing written), then confirm: true."""
+    activity_type = _activity_type_arg(payload.get("type"))
+    _check_type_fields(payload, activity_type)
+    entity = _entity_arg(payload)
+    texts = {k: _text_value(payload, k, k in _ACTIVITY_REQUIRED_TEXT) for k in _ACTIVITY_TEXT_FIELDS}
+    for key in ("budget", "start_date"):
+        if payload.get(key) in (None, ""):
+            raise ValueError(f"'{key}' is required.")
+    user = await _acting_user()
+    tz_name = await _resolve_timezone(payload.get("timezone") or user["timezone"])
+    start = _write_date(payload["start_date"], tz_name, False, "start_date")
+    end = _write_date(payload["end_date"], tz_name, True, "end_date") if payload.get("end_date") else None
+
+    campaign_id, choice = await _resolve_campaign_id(payload)
+    if choice:
+        return choice
+    campaign = await _campaign_call("GET", f"/v1/campaigns/{campaign_id}", "Fetch campaign")
+    if len(campaign.get("activities") or []) >= MAX_ACTIVITIES_PER_CAMPAIGN:
+        raise ValueError(f"Campaign '{campaign.get('name')}' already has {MAX_ACTIVITIES_PER_CAMPAIGN} activities, "
+                         "the most a campaign can have.")
+    _check_activity_dates(start, end, campaign, tz_name)
+    currency_id = campaign["estimatedBudget"]["currencyId"]
+    budget = await _activity_money(payload["budget"], currency_id, "budget")
+    expense = await _activity_money(payload.get("actual_expense") or 0, currency_id, "actual_expense")
+    _check_activity_budget(budget["value"], campaign, None)
+    if await _utm_campaign_taken(texts["utm_campaign"]):
+        raise ValueError(f"utm_campaign '{texts['utm_campaign']}' is already used by another activity; it must be "
+                         "unique. Ask the user for another value (campaign_activity.check_utm checks one).")
+    activity_payload, choice = await _activity_payload(activity_type, entity, payload)
+    if choice:
+        return choice
+    json_rule = await build_audience_rule(entity, payload.get("audience_filters"), tz_name)
+
+    body = {
+        "name": texts["name"], "status": "DRAFT", "entity": entity,
+        "estimatedBudget": budget, "actualExpense": expense, "startDate": start, "endDate": end,
+        **{_ACTIVITY_FIELD_MAP[k]: v for k, v in texts.items() if k != "name"},
+        "filters": {"jsonRule": json_rule}, "payload": activity_payload,
+    }
+    if payload.get("confirm") is True:
+        created = await _campaign_call("POST", f"/v1/campaigns/{campaign_id}/activities", "Create campaign activity",
+                                       body=body)
+        return await _confirmed(
+            "activity", lambda: get_activity_logic({"activity_id": created["id"], "campaign_id": campaign_id}),
+            created["id"])
+
+    recipients = await count_audience(entity, json_rule)
+    details = {
+        "campaign": {"id": campaign_id, "name": campaign.get("name"), "status": campaign.get("status")},
+        **_activity_view(body, await _currency_names(), tz_name),
+        "recipients_now": recipients,
+        "recipients_note": _audience_note(recipients),
+        "status": "DRAFT (nothing is sent until it is started)",
+    }
+    return _preview_reply("campaign_activity.create", details, user,
+                          f"create this {activity_type} activity in campaign '{campaign.get('name')}'")
+
+
+async def update_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """PUT /v1/campaigns/{cid}/activities/{aid} (read-merge-write) — preview, then confirm: true."""
+    user = await _acting_user()
+    tz_name = await _resolve_timezone(payload.get("timezone") or user["timezone"])
+    current, choice = await _resolve_activity(payload)
+    if choice:
+        return choice
+    if current.get("type") not in _ACTIVITY_WRITE_TYPES:
+        raise ValueError(f"{current.get('type')} activities can't be changed here yet — only EMAIL and WHATSAPP.")
+    # The type can change while the activity is DRAFT or FAILED, as in the web form: it then
+    # gets a whole new payload (template / account for the new type), nothing carried over.
+    activity_type = _activity_type_arg(payload["type"]) if payload.get("type") not in (None, "") else current["type"]
+    type_changed = activity_type != current["type"]
+    asked = [k for k in _update_keys(payload, _ACTIVITY_CHANGEABLE) if k != "type" or type_changed]
+    if not asked:
+        raise ValueError(f"Nothing to change. Give any of: {', '.join(_ACTIVITY_CHANGEABLE)}.")
+    _check_type_fields(payload, activity_type)
+
+    campaign_id = (current.get("campaign") or {}).get("id")
+    campaign = await _campaign_call("GET", f"/v1/campaigns/{campaign_id}", "Fetch campaign")
+    changes = _simple_changes(payload, asked, _ACTIVITY_TEXT_FIELDS, _ACTIVITY_REQUIRED_TEXT, tz_name)
+    body = merge_for_update(current, changes, _ACTIVITY_FIELD_MAP, _ACTIVITY_BODY_FIELDS)
+
+    currency_id = campaign["estimatedBudget"]["currencyId"]
+    for key, api_field in (("budget", "estimatedBudget"), ("actual_expense", "actualExpense")):
+        if key in asked:
+            body[api_field] = await _activity_money(payload[key], currency_id, key)
+    entity = _entity_arg(payload) if "entity" in asked else current.get("entity")
+    if entity != current.get("entity") and "audience_filters" not in asked:
+        raise ValueError(f"Changing the entity to {entity} needs new audience_filters on {entity.lower()} fields.")
+    body["entity"] = entity
+    recipients = None
+    if "audience_filters" in asked:
+        json_rule = await build_audience_rule(entity, payload.get("audience_filters"), tz_name)
+        body["filters"] = {"jsonRule": json_rule}
+        if payload.get("confirm") is not True:  # only the preview shows it; a failed count mustn't block the write
+            recipients = await count_audience(entity, json_rule)
+    if type_changed or set(asked) & set(_ACTIVITY_PAYLOAD_FIELDS) or entity != current.get("entity"):
+        body["payload"], choice = await _activity_payload(
+            activity_type, entity, payload, None if type_changed else current.get("payload"))
+        if choice:
+            return choice
+
+    _check_activity_dates(body["startDate"], body.get("endDate"), campaign, tz_name)
+    _check_activity_budget(body["estimatedBudget"]["value"], campaign, current.get("id"))
+    if "utm_campaign" in asked and changes["utm_campaign"] != current.get("utmCampaign") \
+            and await _utm_campaign_taken(changes["utm_campaign"], current.get("id")):
+        raise ValueError(f"utm_campaign '{changes['utm_campaign']}' is already used by another activity; it must "
+                         "be unique.")
+
+    currencies = await _currency_names()
+    before, after = _activity_view(current, currencies, tz_name), _activity_view(body, currencies, tz_name)
+    shown = set(asked) | {"entity"} | (set(_PAYLOAD_VIEW_FIELDS) if type_changed else set())
+    diff = {k: {"before": before.get(k), "after": after.get(k)} for k in (*after, *before)
+            if k in shown and before.get(k) != after.get(k)}
+    if not diff:
+        raise ValueError("Those values are already set — nothing would change.")
+    # Only fields that really change count, so resending an unchanged value is fine.
+    status = current.get("status")
+    if status not in _ACTIVITY_EDITABLE_STATUSES and set(diff) - _STARTED_ACTIVITY_CHANGEABLE:
+        raise ValueError(
+            f"This activity is {status}: only budget, actual_expense and end_date can change now (Kylas applies "
+            f"everything else only while an activity is DRAFT or FAILED). Not allowed: "
+            f"{sorted(set(diff) - _STARTED_ACTIVITY_CHANGEABLE)}.")
+    if payload.get("confirm") is True:
+        await _campaign_call("PUT", f"/v1/campaigns/{campaign_id}/activities/{current['id']}",
+                             "Update campaign activity", body=body)
+        return await _confirmed(
+            "activity", lambda: get_activity_logic({"activity_id": current["id"], "campaign_id": campaign_id}),
+            current["id"])
+
+    details = {"activity": _activity_ref(current), "changes": diff, "after_update": after}
+    if recipients is not None:
+        details.update({"recipients_now": recipients, "recipients_note": _audience_note(recipients)})
+    return _preview_reply("campaign_activity.update", details, user,
+                          f"apply these changes to activity '{current.get('name')}'")
 
 
 # ---------------------------------------------------------------------------
@@ -1642,6 +1912,32 @@ _CAMPAIGN_WRITE_PROPERTIES = {
                  "description": "User's local date YYYY-MM-DD (end of that day) or datetime; empty clears it."},
     "timezone": {"type": "string", "description": "IANA timezone of the dates; defaults to the current user's."},
     **{f"utm_{k}": {"type": "string", "maxLength": 255} for k in ("campaign", "source", "medium", "content", "term")},
+}
+
+_ACTIVITY_WRITE_PROPERTIES = {
+    "name": {"type": "string", "maxLength": 255},
+    "entity": {"type": "string", "enum": ACTIVITY_ENTITIES, "description": "Who it targets: LEAD or CONTACT."},
+    "audience_filters": {
+        "type": "array",
+        "description": "Who receives it — the same filters as lead.search / contact.search for that entity "
+                       "(call build_payload with entity=lead or contact to see the fields). At least one.",
+        "items": {"type": "object", "properties": {"field": {"type": "string"}, "operator": {"type": "string"},
+                                                   "value": {}}, "required": ["field"]},
+    },
+    "budget": {"type": ["number", "object"], "description": "Estimated budget, in the campaign's currency."},
+    "actual_expense": {"type": ["number", "object"], "description": "Actual expense so far; defaults to 0."},
+    "start_date": {"type": "string", "description": "User's local date YYYY-MM-DD (start of that day) or datetime."},
+    "end_date": {"type": ["string", "null"],
+                 "description": "User's local date YYYY-MM-DD (end of that day) or datetime; empty clears it."},
+    "timezone": {"type": "string", "description": "IANA timezone of the dates; defaults to the current user's."},
+    **{f"utm_{k}": {"type": "string", "maxLength": 255} for k in ("campaign", "source", "medium", "content", "term")},
+    "sent_to": {"type": "string", "enum": _SENT_TO["EMAIL"] + _SENT_TO["WHATSAPP"],
+                "description": "EMAIL: PRIMARY_EMAIL (default) or ALL_EMAILS; WHATSAPP: PRIMARY_PHONE_NUMBER "
+                               "(default) or ALL_PHONE_NUMBERS."},
+    "email_template": {"type": ["string", "integer"], "description": "EMAIL: the template's name or id."},
+    "whatsapp_account": {"type": ["string", "integer"], "description": "WHATSAPP: the account's name or id."},
+    "whatsapp_template": {"type": ["string", "integer"], "description": "WHATSAPP: the template's name or id."},
+    "retry_times": {"type": "integer", "minimum": 0, "maximum": 7, "description": "WHATSAPP: retries, 0 to 7."},
 }
 
 _CONFIRM_PROPERTIES = {
@@ -1718,6 +2014,27 @@ CAMPAIGN_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
     },
     "campaign.currencies": {"type": "object", "properties": {}},
+    "campaign_activity.create": {
+        "type": "object",
+        "properties": {
+            "campaign_id": {"type": "integer", "description": "The campaign's id. Give this or campaign_name."},
+            "campaign_name": {"type": "string", "description": "The campaign's name; several matches return a choice."},
+            "type": {"type": "string", "enum": list(_ACTIVITY_WRITE_TYPES)},
+            **_ACTIVITY_WRITE_PROPERTIES,
+            **_CONFIRM_PROPERTIES,
+        },
+    },
+    "campaign_activity.update": {
+        "type": "object",
+        "properties": {
+            **_ACTIVITY_REF_PROPERTIES,
+            "type": {"type": "string", "enum": list(_ACTIVITY_WRITE_TYPES),
+                     "description": "Only to switch EMAIL <-> WHATSAPP (DRAFT / FAILED); give the new type's "
+                                    "template (and WhatsApp account) too."},
+            **_ACTIVITY_WRITE_PROPERTIES,
+            **_CONFIRM_PROPERTIES,
+        },
+    },
     "campaign.create": {"type": "object", "properties": {**_CAMPAIGN_WRITE_PROPERTIES, **_CONFIRM_PROPERTIES}},
     "campaign.update": {
         "type": "object",
@@ -1776,6 +2093,8 @@ CAMPAIGN_ROUTERS: Dict[str, CampaignRouter] = {
     "campaign.currencies": currencies_logic,
     "campaign.create": create_campaign_logic,
     "campaign.update": update_campaign_logic,
+    "campaign_activity.create": create_activity_logic,
+    "campaign_activity.update": update_activity_logic,
     "campaign_activity.email_templates": email_templates_logic,
     "campaign_activity.whatsapp_accounts": whatsapp_accounts_logic,
     "campaign_activity.whatsapp_templates": whatsapp_templates_logic,
