@@ -1,4 +1,4 @@
-"""Tests for app/campaigns.py and its registry wiring (Plan 1, phase R0).
+"""Tests for app/campaigns.py and its registry wiring.
 
 Request shapes asserted here were verified against sd-campaign on QA:
 campaign/activity search bodies, the analytics body sd-ui sends, and the

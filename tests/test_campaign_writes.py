@@ -1,10 +1,3 @@
-"""Tests for campaign writes (Plan 2).
-
-Phase C0 — write foundation: PUT / empty-body handling in _campaign_call,
-local write dates, read-merge-write, campaign name resolution, and the
-activity audience builder. Nothing here talks to Kylas (HTTP is mocked).
-"""
-
 from unittest.mock import AsyncMock, patch
 
 import httpx
