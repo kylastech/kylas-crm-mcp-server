@@ -138,7 +138,7 @@
     matches, list them and ask user to pick. Products — resolve
     product.lookup the same way; if multiple matches, list and ask.
 
-    Pagination: always use the largest page size available. Do NOT
+    Pagination: size 20 unless the user asks for a full list (max 100). Do NOT
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
     if the user wants more. If you receive a 429 error: stop, wait at least
     5 seconds, then retry once.

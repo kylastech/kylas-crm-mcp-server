@@ -121,7 +121,7 @@
     execute_request; not a standalone tool) with {entity_id, entity_type}
     instead of paging through call_log.search results one at a time.
 
-    Pagination: always use the largest page size available. Do NOT
+    Pagination: size 20 unless the user asks for a full list (max 100). Do NOT
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
     if the user wants more. If you receive a 429 error: stop, wait at least
     5 seconds, then retry once.

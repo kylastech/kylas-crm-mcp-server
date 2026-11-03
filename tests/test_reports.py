@@ -16,6 +16,14 @@ from app import reports
 from app.reports import build_report_body, get_report_config_instructions_logic
 from app.tools import build_payload, execute_request
 
+
+def _filter_operators(text, head):
+    """The operators a filter takes: the reference names an operator set on the
+    filter's line and lists each set once."""
+    line = next(l for l in text.splitlines() if head in l and " — operators: " in l)
+    name = line.split(" — operators: ")[1].strip()
+    return next(l.split(": ", 1)[1] for l in text.splitlines() if l.strip().startswith(f"{name}: "))
+
 METRICS = [
     {"type": "COUNT", "field": "id", "header": "Id"},
     {"type": "SUM", "field": "requirementBudget", "header": "Budget"},
@@ -115,12 +123,12 @@ def test_reference_trims_large_picklists_only_in_filters():
     assert "India" not in text and "Asia/Calcutta" not in text
     assert 'build_payload("report.create", entity="lead", fields=["country"])' in text
     # small picklists stay inline
-    assert "Google (id: 650646, name: 'GOOGLE')" in text
+    assert "Google (650646, 'GOOGLE')" in text
 
 
 def test_reference_requested_picklist_is_inlined():
     text = get_report_config_instructions_logic("lead", _config(), {"COUNTRY"}, "INR")
-    assert "India (id: 175, name: 'IN')" in text
+    assert "India (175, 'IN')" in text
     assert "Asia/Calcutta" not in text  # timezone still trimmed
 
 
@@ -298,7 +306,7 @@ def test_types_without_ui_input_only_take_valueless_operators():
     # UUID offers no value-less operator at all -> not usable
     assert reports.filter_support(_flt("uuid", "UUID", "UUID")) == (False, None)
     text = get_report_config_instructions_logic("lead", cfg, set(), "INR")
-    assert "'notes' Notes [PARAGRAPH_TEXT] — operators: is_empty, is_not_empty" in text
+    assert _filter_operators(text, "'notes' Notes [PARAGRAPH_TEXT]") == "is_empty, is_not_empty"
 
 
 def test_between_converts_local_dates_to_utc():
@@ -409,7 +417,7 @@ async def test_build_payload_returns_live_reference():
         result = json.loads(await build_payload("report.create", entity="leads", fields=["country"]))
     assert result["fetched_live"] is True
     assert result["schema"]["entity"] == "lead"
-    assert "India (id: 175, name: 'IN')" in result["schema"]["tenant_fields_reference"]
+    assert "India (175, 'IN')" in result["schema"]["tenant_fields_reference"]
     assert result["method"] == "POST" and result["path"] == "/v3/reports"
 
 
@@ -607,7 +615,8 @@ def test_quotation_approval_state_picklist_and_email_sender_unsupported():
     text = get_report_config_instructions_logic("email", email_cfg, set(), "INR")
     assert "'receivedBy' Received By [LOOK_UP] — NOT SUPPORTED" in text
     # sentBy: bare user id(s) via user.lookup, operators limited to equal/in for email
-    assert "'sentBy' Sent By [LOOK_UP] — operators: equal, in" in text and "resolve_via: user.lookup" in text
+    assert _filter_operators(text, "'sentBy' Sent By [LOOK_UP]") == "equal, in"
+    assert "resolve_via: user.lookup" in text
     body, _ = _build_cfg(email_cfg, _payload(group_by={"field": "user"}, filters=[
         {"field": "sentBy", "operator": "in", "value": [31800, "42"]}]), entity="email")
     rule = body["config"]["rules"][0]

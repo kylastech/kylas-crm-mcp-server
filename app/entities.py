@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.config import DEFAULT_TIMEZONE, logger
 from app.server import mcp
 from app.client import KylasAPIError, _reset_api_call_count, get_client, handle_api_response
+from app.references import resolve_references
 from app.helpers import (
     OPERATOR_MAPPING,
     OPERATOR_SYMBOL_MAP,
@@ -18,7 +19,6 @@ from app.helpers import (
     _get_filterable_fields_map,
     _is_stage_lock_error,
     _normalize_field_values,
-    resolve_picklist_values,
     _rule_type_for_value,
     _threshold_iso_days_ago,
     parse_datetime_to_utc_iso,
@@ -83,11 +83,9 @@ async def get_lead_field_instructions_logic(
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
 async def get_entity_labels() -> str:
     """
-    Returns the mapping of this tenant's custom entity display names to standard CRM entity types.
-    CALL THIS ONCE at the start of every session, before any other tool.
-    This tenant uses custom names (e.g. "animals" instead of contacts, "cars" instead of deals).
-    Without this, you will fail to recognize entity requests from users.
-    After calling this, when the user mentions a custom name, map it to the standard type for all tool calls.
+    This tenant's custom entity names mapped to the standard types (e.g.
+    "animals" for contacts). CALL ONCE per session, before any other tool, then
+    map any custom name the user uses to its standard type in every tool call.
     """
     labels = await _fetch_entity_labels()
     if not labels:
@@ -161,6 +159,18 @@ async def get_lead_field_instructions() -> str:
 # Tool 1b: Get current user (timezone, recordActions, etc.) – for date/datetime handling
 # ---------------------------------------------------------------------------
 
+def _today_in(tz: str) -> str:
+    """Today's date where the user is, e.g. "Tuesday, 3 Nov 2026"; UTC when the
+    timezone is unknown."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        now = datetime.now(ZoneInfo(tz))
+    except (ZoneInfoNotFoundError, ValueError):
+        now = datetime.now(ZoneInfo("UTC"))
+    return f"{now:%A}, {now.day} {now:%b %Y}"
+
+
 async def _fetch_current_user() -> Dict[str, Any]:
     """Fetch current user from GET /users/me. Returns full user object (timezone, recordActions, name, etc.)."""
     async with get_client() as client:
@@ -171,19 +181,19 @@ async def _fetch_current_user() -> Dict[str, Any]:
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
 async def get_current_user() -> str:
     """
-    Get the current authenticated user's profile from Kylas (GET /users/me).
-
-    MANDATORY: call this ONCE at the start of every session, before any other
-    tool, alongside get_entity_labels(). Then REUSE the result for the rest of
-    the session — do not call it again before individual date operations; the
-    answer does not change mid-session. Call again only if that first result is
-    no longer visible to you.
-
-    Returns id, timezone (IANA, e.g. Asia/Kolkata), recordActions (call, email, sms, etc.), name, and other profile fields.
-    - Displaying ANY date: every timestamp from every tool is UTC. Convert it to this timezone before showing it, and say which zone (e.g. "11 Sep 2026, 1:30 AM (Asia/Kolkata)"). Never show the user a raw UTC timestamp or a bare epoch number.
-    - For filtering (*.search, *.search_idle): pass this timezone as timeZone in date/datetime filters and keep the user's date/datetime as-is — do NOT convert filter values to UTC, the server does that itself.
-    - For create/update (*.create, *.update): when the user gives a datetime in their own words (e.g. "11th Feb 2026 at 7:30 AM"), interpret it in this timezone and convert it to UTC by resolving datetime.parse_to_utc (list_tool -> build_payload -> execute_request) with {local_datetime, timezone}, then put the returned UTC ISO string in the payload.
-    - For ownerId/createdBy referring to the current user (e.g. "assign to me", "create a lead owned by me"): use the returned id directly — do NOT call user.lookup/lookup_users to resolve yourself by name.
+    The current user's profile (GET /users/me): id, name, IANA timezone,
+    recordActions. MANDATORY: call ONCE per session, before any other tool,
+    alongside get_entity_labels(); reuse the result, call again only if it is
+    no longer visible.
+    - Showing a date: every timestamp is UTC — convert to this timezone and name
+      it ("11 Sep 2026, 1:30 AM (Asia/Kolkata)"); never a raw UTC value or epoch.
+    - Filters (*.search, *.search_idle): pass this timezone as timeZone and keep
+      the user's date as-is — do NOT convert filter values to UTC; the server does.
+    - Create/update: turn a datetime in the user's words into UTC with
+      datetime.parse_to_utc {local_datetime, timezone} (via execute_request),
+      and put the returned UTC ISO string in the payload.
+    - "me" as owner/createdBy ("assign to me"): use this id directly — don't
+      look yourself up with user.lookup.
     """
     try:
         _reset_api_call_count()
@@ -199,6 +209,9 @@ async def get_current_user() -> str:
             f"ID: {user_id}",
             f"Name: {name}",
             f"Timezone: {tz}",
+            # Day precision on purpose: "last 50 days" needs today, and a value
+            # that changes only once a day keeps a client's cached prompt intact.
+            f"Today: {_today_in(tz)} ({tz})",
             "",
             "recordActions (permissions):",
         ]
@@ -207,9 +220,10 @@ async def get_current_user() -> str:
             lines.append(f"  • {k}: {v}")
         lines.extend([
             "",
-            "Use this timezone for:",
-            "  - Date/datetime filters in search_leads: pass timeZone in each date filter; do not convert filter values to UTC.",
-            "  - create_lead with datetime fields: convert user's local datetime to UTC with parse_datetime_to_utc_iso, then send UTC ISO in field_values.",
+            "Use this timezone and date for:",
+            "  - Relative dates (\"last 50 days\", \"this month\"): count from Today above.",
+            "  - Date/datetime filters in *.search: pass timeZone in each date filter; do not convert filter values to UTC.",
+            "  - Datetime fields in *.create/*.update: convert the user's local datetime with datetime.parse_to_utc, then send the UTC ISO value.",
             f"Use this ID ({user_id}) directly for ownerId/createdBy when the action refers to the current user — no need for a separate user.lookup call.",
             "=" * 50,
         ])
@@ -830,6 +844,7 @@ async def create_lead_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
     id_to_name = await _get_custom_field_id_to_name() if has_custom_by_id else {}
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    payload = await resolve_references("lead", payload, _fetch_lead_fields)
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
     logger.info("📝 Creating lead with fields: %s", list(payload.keys()))
@@ -853,6 +868,7 @@ async def update_lead_logic(lead_id: int, field_values: Dict[str, Any]) -> Dict[
     has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
     id_to_name = await _get_custom_field_id_to_name() if has_custom_by_id else {}
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    payload = await resolve_references("lead", payload, _fetch_lead_fields)
     if not payload:
         raise KylasAPIError("field_values produced an empty payload.")
     logger.info("🔄 Updating lead %s with fields: %s", lead_id, list(payload.keys()))
@@ -1201,6 +1217,7 @@ async def create_contact_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
     id_to_name = await _get_custom_contact_field_id_to_name() if has_custom_by_id else {}
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    payload = await resolve_references("contact", payload, _fetch_contact_fields)
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
     logger.info("Creating contact with fields: %s", list(payload.keys()))
@@ -1220,6 +1237,7 @@ async def update_contact_logic(contact_id: int, field_values: Dict[str, Any]) ->
     has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
     id_to_name = await _get_custom_contact_field_id_to_name() if has_custom_by_id else {}
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    payload = await resolve_references("contact", payload, _fetch_contact_fields)
     if not payload:
         raise KylasAPIError("field_values produced an empty payload.")
     logger.info("Updating contact %s with fields: %s", contact_id, list(payload.keys()))
@@ -1517,7 +1535,7 @@ async def create_task_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
     # Kylas takes picklist option ids (status 38256, not "OPEN"); map names/labels here.
-    payload = resolve_picklist_values(payload, await _fetch_task_fields())
+    payload = await resolve_references("task", payload, _fetch_task_fields)
     logger.info("Creating task with fields: %s", list(payload.keys()))
     async with get_client() as client:
         response = await client.post("/v1/tasks", json=payload)
@@ -1537,7 +1555,7 @@ async def update_task_logic(task_id: int, field_values: Dict[str, Any]) -> Dict[
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
     if not payload:
         raise KylasAPIError("field_values produced an empty payload.")
-    payload = resolve_picklist_values(payload, await _fetch_task_fields())
+    payload = await resolve_references("task", payload, _fetch_task_fields)
     logger.info("Updating task %s with fields: %s", task_id, list(payload.keys()))
     async with get_client() as client:
         get_response = await client.get(f"/v1/tasks/{task_id}")
@@ -2147,6 +2165,7 @@ async def create_deal_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     id_to_name = await _get_deal_custom_field_id_to_name() if has_custom_by_id else {}
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
     payload = _normalize_deal_payload(payload)
+    payload = await resolve_references("deal", payload, _fetch_deal_fields)
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
 
@@ -2222,6 +2241,7 @@ async def update_deal_logic(deal_id: int, field_values: Dict[str, Any]) -> Dict[
         get_response = await client.get(f"/v1/deals/{deal_id}")
         existing = await handle_api_response(get_response, "Get deal")
         payload = _normalize_deal_payload(payload, existing=existing)
+        payload = await resolve_references("deal", payload, _fetch_deal_fields)
         merged = dict(existing)
         for key, value in payload.items():
             if key == "customFieldValues" and isinstance(value, dict):
@@ -2881,6 +2901,7 @@ async def create_company_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
     id_to_name = await _get_company_custom_field_id_to_name() if has_custom_by_id else {}
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    payload = await resolve_references("company", payload, _fetch_company_fields)
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
     logger.info("Creating company with fields: %s", list(payload.keys()))
@@ -2900,6 +2921,7 @@ async def update_company_logic(company_id: int, field_values: Dict[str, Any]) ->
     has_custom_by_id = any(str(k).isdigit() for k in fv if k != "customFieldValues")
     id_to_name = await _get_company_custom_field_id_to_name() if has_custom_by_id else {}
     payload = _normalize_field_values(fv, custom_field_id_to_name=id_to_name)
+    payload = await resolve_references("company", payload, _fetch_company_fields)
     if not payload:
         raise KylasAPIError("field_values produced an empty payload.")
     logger.info("Updating company %s with fields: %s", company_id, list(payload.keys()))
@@ -3421,6 +3443,7 @@ def _build_meeting_search_json_rule(
 async def create_meeting_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     """Create a meeting with the given field_values."""
     payload = dict(field_values)
+    payload = await resolve_references("meeting", payload, _fetch_meeting_fields)
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
     # Ensure required fields
@@ -3452,6 +3475,7 @@ async def update_meeting_logic(meeting_id: int, field_values: Dict[str, Any]) ->
     """GET the meeting first, merge field_values into it, then PUT the full body."""
     meeting_id = int(meeting_id)
     fv = dict(field_values)
+    fv = await resolve_references("meeting", fv, _fetch_meeting_fields)
     if not fv:
         raise KylasAPIError("field_values cannot be empty for update.")
     logger.info("Updating meeting %s with fields: %s", meeting_id, list(fv.keys()))
@@ -3914,6 +3938,7 @@ async def get_call_log_field_instructions() -> str:
 async def create_call_log_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     """Create a call log with the given field_values."""
     payload = dict(field_values)
+    payload = await resolve_references("call_log", payload, _fetch_call_log_fields)
     if not payload:
         raise KylasAPIError("field_values cannot be empty")
     if not payload.get("outcome"):
@@ -3927,7 +3952,16 @@ async def create_call_log_logic(field_values: Dict[str, Any]) -> Dict[str, Any]:
     if not payload.get("relatedTo"):
         raise KylasAPIError("relatedTo is required — specify which entity this call is for: {\"id\": <id>, \"entity\": \"lead|contact|deal\", \"phoneNumber\": \"...\"}")
 
-    logger.info("Creating call log: %s on %s", payload.get("callType"), payload.get("relatedTo", {}).get("entity", "?"))
+    # sd-call reads the number from relatedTo only (a top-level phoneNumber is
+    # dropped, and the create fails 422 02003001), so carry it over when missing.
+    related = payload["relatedTo"]
+    for item in related if isinstance(related, list) else [related]:
+        if isinstance(item, dict) and not item.get("phoneNumber") and not item.get("phoneId"):
+            item["phoneNumber"] = payload["phoneNumber"]
+
+    first = related[0] if isinstance(related, list) and related else related
+    logger.info("Creating call log: %s on %s", payload.get("callType"),
+                first.get("entity", "?") if isinstance(first, dict) else "?")
     async with get_client() as client:
         response = await client.post("/v1/call-logs/", json=payload)
         result = await handle_api_response(response, "Create call log")
@@ -3939,6 +3973,7 @@ async def update_call_log_logic(call_log_id: int, field_values: Dict[str, Any]) 
     """Update a call log via PUT (full replace)."""
     call_log_id = int(call_log_id)
     fv = dict(field_values)
+    fv = await resolve_references("call_log", fv, _fetch_call_log_fields)
     if not fv:
         raise KylasAPIError("field_values cannot be empty for update.")
     logger.info("Updating call log %s", call_log_id)
