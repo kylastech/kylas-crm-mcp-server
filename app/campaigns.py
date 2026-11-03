@@ -1669,7 +1669,9 @@ async def _activity_payload(
     template, choice = await _resolve_whatsapp_template(value, account["id"], entity)
     if choice:
         return None, choice
-    retry = _retry_config(payload["retry_times"]) if "retry_times" in payload else current.get("retryConfig")
+    # A null retry_times means "not given" (as for every update field), so the current retries stay.
+    retry = (_retry_config(payload["retry_times"]) if payload.get("retry_times") is not None
+             else current.get("retryConfig"))
     return {"type": "WHATSAPP", "sentTo": sent_to, "connectedAccount": account,
             "whatsappTemplate": template, "retryConfig": retry}, None
 

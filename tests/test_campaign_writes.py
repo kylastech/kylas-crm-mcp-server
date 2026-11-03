@@ -1186,3 +1186,30 @@ async def test_fields_of_the_other_activity_type_are_refused(fn, payload, messag
         with pytest.raises(ValueError, match=message):
             await (create_activity_logic if fn == "create" else update_activity_logic)({**payload, "confirm": confirm})
     assert api.writes() == []
+
+
+_WHATSAPP_800 = {**_ACTIVITY_800, "type": "WHATSAPP", "payload": {
+    "type": "WHATSAPP", "sentTo": "PRIMARY_PHONE_NUMBER",
+    "connectedAccount": {"id": 20, "name": "Kylas Devoloper", "businessName": "Kylas Devs"},
+    "whatsappTemplate": {"id": 1040, "name": "Please Reply copy"}, "retryConfig": {"noOfTimes": 3}}}
+
+
+@pytest.mark.asyncio
+async def test_null_retry_times_keeps_the_current_retries():
+    api, patched = _update(_WHATSAPP_800, {**_CAMPAIGN_449, "activities": [_WHATSAPP_800]})
+    with patched:
+        preview = await update_activity_logic({"activity_id": 800, "sent_to": "ALL_PHONE_NUMBERS", "retry_times": None})
+        await update_activity_logic({"activity_id": 800, "sent_to": "ALL_PHONE_NUMBERS", "retry_times": None,
+                                     "confirm": True})
+    assert set(preview["preview"]["changes"]) == {"sent_to"}
+    assert api.writes()[0]["body"]["payload"]["retryConfig"] == {"noOfTimes": 3}
+
+
+@pytest.mark.asyncio
+async def test_retry_times_given_still_changes_the_retries():
+    api, patched = _update(_WHATSAPP_800, {**_CAMPAIGN_449, "activities": [_WHATSAPP_800]})
+    with patched:
+        preview = await update_activity_logic({"activity_id": 800, "retry_times": 0})
+        await update_activity_logic({"activity_id": 800, "retry_times": 0, "confirm": True})
+    assert preview["preview"]["changes"]["retry_times"] == {"before": 3, "after": 0}
+    assert api.writes()[0]["body"]["payload"]["retryConfig"] == {"noOfTimes": 0}
