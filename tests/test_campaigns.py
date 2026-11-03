@@ -573,8 +573,8 @@ def test_campaign_bucket_lists_its_ids():
     from app.tools import list_tool
 
     ids = sorted(r["id"] for r in json.loads(list_tool(bucket="campaign"))["results"])
-    assert ids == ["campaign.analytics", "campaign.create", "campaign.currencies", "campaign.get", "campaign.search",
-                   "campaign.update"]
+    assert ids == ["campaign.analytics", "campaign.complete", "campaign.create", "campaign.currencies", "campaign.get",
+                   "campaign.pause", "campaign.resume", "campaign.search", "campaign.start", "campaign.update"]
 
 
 @pytest.mark.asyncio
@@ -1140,10 +1140,12 @@ def test_campaign_activity_bucket_lists_its_ids():
     from app.tools import list_tool
 
     ids = sorted(r["id"] for r in json.loads(list_tool(bucket="campaign_activity"))["results"])
-    assert ids == ["campaign_activity.analytics", "campaign_activity.check_utm", "campaign_activity.create",
-                   "campaign_activity.email_templates", "campaign_activity.generated_records", "campaign_activity.get",
-                   "campaign_activity.recipients", "campaign_activity.search", "campaign_activity.update",
-                   "campaign_activity.whatsapp_accounts", "campaign_activity.whatsapp_templates"]
+    assert ids == ["campaign_activity.analytics", "campaign_activity.check_utm", "campaign_activity.complete",
+                   "campaign_activity.create", "campaign_activity.email_templates",
+                   "campaign_activity.generated_records", "campaign_activity.get", "campaign_activity.pause",
+                   "campaign_activity.recipients", "campaign_activity.resume", "campaign_activity.search",
+                   "campaign_activity.start", "campaign_activity.update", "campaign_activity.whatsapp_accounts",
+                   "campaign_activity.whatsapp_templates"]
 
 
 @pytest.mark.asyncio

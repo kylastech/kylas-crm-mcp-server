@@ -42,4 +42,8 @@ intents:
   - cancel
   - delete
   - analytics
+  - start
+  - pause
+  - resume
+  - complete
 

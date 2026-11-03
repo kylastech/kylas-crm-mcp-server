@@ -1213,3 +1213,288 @@ async def test_retry_times_given_still_changes_the_retries():
         await update_activity_logic({"activity_id": 800, "retry_times": 0, "confirm": True})
     assert preview["preview"]["changes"]["retry_times"] == {"before": 3, "after": 0}
     assert api.writes()[0]["body"]["payload"]["retryConfig"] == {"noOfTimes": 0}
+
+
+# ---------------------------------------------------------------------------
+# Phase C3 — start / pause / resume / complete for campaigns and activities.
+# Preview first (nothing changes), then the same call with confirm: true.
+# Campaign 461 "MCP C2 Test" with DRAFT email activity 737 mirrors QA.
+# ---------------------------------------------------------------------------
+
+import app.campaigns as campaigns_module  # noqa: E402
+
+_ACT_737 = {
+    "id": 737, "name": "C2 Welcome email", "status": "DRAFT", "type": "EMAIL", "entity": "LEAD",
+    "campaign": {"id": 461, "name": "MCP C2 Test"},
+    "estimatedBudget": {"currencyId": 431, "value": 800.0},
+    "startDate": "2026-11-09T18:30:00.000Z", "endDate": "2026-11-20T18:29:59.999Z",
+    "filters": {"jsonRule": {"condition": "AND", "valid": True, "rules": [
+        {"id": "id", "field": "id", "type": "double", "operator": "equal", "value": 753407}]}},
+    "payload": {"type": "EMAIL", "sentTo": "ALL_EMAILS", "emailTemplate": {"id": 812, "name": "Lead creation"}},
+}
+_CAMPAIGN_461 = {"id": 461, "name": "MCP C2 Test", "status": "DRAFT",
+                 "estimatedBudget": {"currencyId": 431, "value": 5000.0}, "activities": [_ACT_737]}
+
+
+def _lifecycle_api(campaign=_CAMPAIGN_461, running=11):
+    return _FakeWriteApi({
+        ("GET", "/v1/campaigns/461"): campaign,
+        ("POST", "/v1/campaigns/search"): {"content": [], "totalElements": running, "last": True},
+    })
+
+
+def _run(level, action):
+    return campaigns_module.CAMPAIGN_ROUTERS[f"{level}.{action}"]
+
+
+def _posted(api):
+    return [c["path"] for c in api.writes()]
+
+
+# --- campaign.start -----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_campaign_start_preview_shows_what_will_be_sent_and_changes_nothing():
+    api = _lifecycle_api()
+    with _ActivityPatched(api):
+        result = await _run("campaign", "start")({"campaign_id": 461})
+    assert _posted(api) == [] and result["executed"] is False
+    p = result["preview"]
+    assert p["status"] == {"now": "DRAFT", "after": "IN_PROGRESS"} and p["running_campaigns"] == "11 of 15"
+    assert p["will_start"] == [{"id": 737, "name": "C2 Welcome email", "type": "EMAIL", "status": "DRAFT",
+                                "entity": "LEAD", "sent_to": "ALL_EMAILS", "email_template": "Lead creation",
+                                "recipients_now": 1}]
+    assert p["skipped"] == [] and p["total_recipients"] == 1
+    assert "SENDS REAL emails" in p["warning"]
+    # The running-campaigns count is a status filter on campaign search.
+    rules = next(c for c in api.calls if c["path"] == "/v1/campaigns/search")["body"]["jsonRule"]["rules"]
+    assert rules[0]["field"] == "status" and rules[0]["value"] == "IN_PROGRESS"
+
+
+@pytest.mark.asyncio
+async def test_campaign_start_confirm_posts_start_without_recounting():
+    api = _lifecycle_api()
+    patched = _ActivityPatched(api)
+    with patched:
+        result = await _run("campaign", "start")({"campaign_id": 461, "confirm": True})
+    assert _posted(api) == ["/v1/campaigns/461/start"]
+    assert patched.count.await_count == 0  # Kylas counts again itself when it starts
+    assert result == {"executed": True, "campaign": {"id": 461}}
+
+
+@pytest.mark.asyncio
+async def test_campaign_start_lists_activities_it_would_skip():
+    nobody = {**_ACT_737, "id": 738, "name": "Nobody email"}
+    api = _lifecycle_api({**_CAMPAIGN_461, "activities": [_ACT_737, nobody]})
+    patched = _ActivityPatched(api)
+    patched.count.side_effect = [1, 0]
+    with patched:
+        result = await _run("campaign", "start")({"campaign_id": 461})
+    p = result["preview"]
+    assert [a["id"] for a in p["will_start"]] == [737]
+    assert p["skipped"][0]["id"] == 738 and p["skipped"][0]["why"] == "no recipients match now"
+
+
+@pytest.mark.parametrize("campaign,running,recipients,message", [
+    ({**_CAMPAIGN_461, "status": "IN_PROGRESS"}, 11, 1, "Only a DRAFT campaign can be started"),
+    ({**_CAMPAIGN_461, "activities": []}, 11, 1, "has no activities"),
+    ({**_CAMPAIGN_461, "activities": [{**_ACT_737, "type": "CALL"}]}, 11, 1, "CALL activities aren't supported"),
+    ({**_CAMPAIGN_461, "activities": [{**_ACT_737, "status": "FAILED"}]}, 11, 1, "aren't DRAFT"),
+    (_CAMPAIGN_461, 15, 1, "already has 15 running campaigns"),
+    (_CAMPAIGN_461, 11, 0, "None of 'MCP C2 Test's activities can start"),
+    (_CAMPAIGN_461, 11, 10001, "None of 'MCP C2 Test's activities can start"),
+])
+@pytest.mark.asyncio
+async def test_campaign_start_is_refused_before_anything_happens(campaign, running, recipients, message):
+    api = _lifecycle_api(campaign, running)
+    with _ActivityPatched(api, recipients=recipients):
+        with pytest.raises(ValueError, match=message):
+            await _run("campaign", "start")({"campaign_id": 461})
+    assert _posted(api) == []
+
+
+# --- campaign.pause / resume / complete ----------------------------------------
+
+
+@pytest.mark.parametrize("action,campaign_status,activity_status", [
+    ("pause", "IN_PROGRESS", "IN_PROGRESS"), ("resume", "PAUSED", "PAUSED"), ("complete", "IN_PROGRESS", "PROCESSED"),
+])
+@pytest.mark.asyncio
+async def test_campaign_pause_resume_complete_run_in_one_call(action, campaign_status, activity_status):
+    # Only start asks for a Yes; the others run at once (their checks still refuse bad requests).
+    api = _lifecycle_api({**_CAMPAIGN_461, "status": campaign_status,
+                          "activities": [{**_ACT_737, "status": activity_status}]})
+    with _ActivityPatched(api):
+        result = await _run("campaign", action)({"campaign_id": 461})
+    assert result == {"executed": True, "campaign": {"id": 461}}
+    assert _posted(api) == [f"/v1/campaigns/461/{action}"]
+
+
+@pytest.mark.parametrize("action,status", [("pause", "IN_PROGRESS"), ("resume", "PAUSED"), ("complete", "PAUSED")])
+@pytest.mark.asyncio
+async def test_activity_pause_resume_complete_run_in_one_call(action, status):
+    api, patched = _activity_lifecycle_patch({**_ACT_737, "status": status}, {**_CAMPAIGN_461, "status": "PAUSED"})
+    with patched:
+        result = await _run("campaign_activity", action)({"activity_id": 737})
+    assert result["executed"] is True
+    assert _posted(api) == [f"/v1/campaigns/461/activities/737/{action}"]
+
+
+@pytest.mark.asyncio
+async def test_activity_start_still_previews_first():
+    api, patched = _activity_lifecycle_patch({**_ACT_737, "status": "DRAFT"})
+    with patched:
+        result = await _run("campaign_activity", "start")({"activity_id": 737})
+    assert result["executed"] is False and _posted(api) == []
+
+
+def test_only_start_has_a_confirm_field():
+    for level in ("campaign", "campaign_activity"):
+        assert "confirm" in campaigns_module.CAMPAIGN_SCHEMAS[f"{level}.start"]["properties"]
+        for action in ("pause", "resume", "complete"):
+            assert "confirm" not in campaigns_module.CAMPAIGN_SCHEMAS[f"{level}.{action}"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_campaign_resume_still_checks_the_running_limit():
+    paused = {**_CAMPAIGN_461, "status": "PAUSED", "activities": [{**_ACT_737, "status": "PAUSED"}]}
+    api = _lifecycle_api(paused, running=15)
+    with _ActivityPatched(api):
+        with pytest.raises(ValueError, match="already has 15 running campaigns"):
+            await _run("campaign", "resume")({"campaign_id": 461})
+    assert _posted(api) == []
+
+
+@pytest.mark.parametrize("level,action,status,message", [
+    ("campaign", "pause", "DRAFT", "Only an IN_PROGRESS campaign can be paused"),
+    ("campaign", "resume", "IN_PROGRESS", "Only a PAUSED campaign can be resumed"),
+    ("campaign", "complete", "COMPLETED", "already COMPLETED"),
+    # A DRAFT campaign with no activities passes Kylas's own check, so ours must refuse it.
+    ("campaign", "complete", "DRAFT", "Only a running, paused or processed campaign can be completed"),
+])
+@pytest.mark.asyncio
+async def test_campaign_actions_need_the_right_status(level, action, status, message):
+    api = _lifecycle_api({**_CAMPAIGN_461, "status": status})
+    with _ActivityPatched(api):
+        with pytest.raises(ValueError, match=message):
+            await _run(level, action)({"campaign_id": 461, "confirm": True})
+    assert _posted(api) == []
+
+
+@pytest.mark.asyncio
+async def test_empty_draft_campaign_is_never_completed():
+    api = _lifecycle_api({**_CAMPAIGN_461, "status": "DRAFT", "activities": []})
+    with _ActivityPatched(api):
+        with pytest.raises(ValueError, match="'MCP C2 Test' is DRAFT"):
+            await _run("campaign", "complete")({"campaign_id": 461})
+    assert _posted(api) == []
+
+
+@pytest.mark.parametrize("status", ["IN_PROGRESS", "PAUSED", "PROCESSED"])
+@pytest.mark.asyncio
+async def test_campaign_complete_allowed_statuses(status):
+    api = _lifecycle_api({**_CAMPAIGN_461, "status": status, "activities": [{**_ACT_737, "status": "PROCESSED"}]})
+    with _ActivityPatched(api):
+        await _run("campaign", "complete")({"campaign_id": 461})
+    assert _posted(api) == ["/v1/campaigns/461/complete"]
+
+
+@pytest.mark.asyncio
+async def test_campaign_complete_needs_every_activity_finished():
+    api = _lifecycle_api({**_CAMPAIGN_461, "status": "IN_PROGRESS",
+                          "activities": [{**_ACT_737, "status": "IN_PROGRESS"}]})
+    with _ActivityPatched(api):
+        with pytest.raises(ValueError, match=r"Still pending: C2 Welcome email \(IN_PROGRESS\)"):
+            await _run("campaign", "complete")({"campaign_id": 461})
+    assert _posted(api) == []
+
+
+# --- campaign_activity.start / pause / resume / complete ------------------------
+
+
+def _activity_lifecycle_patch(activity, campaign=_CAMPAIGN_461, **kw):
+    api = _lifecycle_api(campaign)
+    return api, _ActivityPatched(api, current=activity, **kw)
+
+
+@pytest.mark.asyncio
+async def test_activity_start_preview_warns_and_says_it_starts_the_campaign():
+    api, patched = _activity_lifecycle_patch(_ACT_737)
+    with patched:
+        result = await _run("campaign_activity", "start")({"activity_name": "C2 Welcome email"})
+    p = result["preview"]
+    assert _posted(api) == [] and result["executed"] is False
+    assert p["status"] == {"now": "DRAFT", "after": "QUEUED (then sending)"}
+    assert p["recipients_now"] == 1 and p["sends"]["email_template"] == "Lead creation"
+    assert "SENDS REAL emails" in p["warning"]
+    assert p["also"] == "Starting it also starts campaign 'MCP C2 Test' (now DRAFT)."
+
+
+@pytest.mark.asyncio
+async def test_activity_start_confirm_posts_start_without_recounting():
+    api, patched = _activity_lifecycle_patch(_ACT_737)
+    with patched:
+        result = await _run("campaign_activity", "start")({"activity_id": 737, "confirm": True})
+    assert _posted(api) == ["/v1/campaigns/461/activities/737/start"]
+    assert patched.count.await_count == 0
+    assert result == {"executed": True, "activity": {"id": 737}}
+
+
+@pytest.mark.parametrize("activity,recipients,message", [
+    ({**_ACT_737, "status": "IN_PROGRESS"}, 1, "Only a DRAFT or FAILED activity can be started"),
+    ({**_ACT_737, "type": "CALL"}, 1, "CALL activity"),
+    (_ACT_737, 0, "matches 0 records right now"),
+    (_ACT_737, 12000, "matches 12,000 records right now"),
+])
+@pytest.mark.asyncio
+async def test_activity_start_is_refused_before_anything_happens(activity, recipients, message):
+    api, patched = _activity_lifecycle_patch(activity, recipients=recipients)
+    with patched:
+        with pytest.raises(ValueError, match=message):
+            await _run("campaign_activity", "start")({"activity_id": 737})
+    assert _posted(api) == []
+
+
+@pytest.mark.parametrize("action,status,ok", [
+    ("pause", "IN_PROGRESS", True), ("pause", "QUEUED", True), ("pause", "DRAFT", False), ("pause", "PAUSED", False),
+    ("resume", "PAUSED", True), ("resume", "IN_PROGRESS", False),
+    ("complete", "PROCESSED", True), ("complete", "PAUSED", True), ("complete", "DRAFT", False),
+    ("complete", "COMPLETED", False),
+])
+@pytest.mark.asyncio
+async def test_activity_actions_follow_the_backend_status_rules(action, status, ok):
+    api, patched = _activity_lifecycle_patch({**_ACT_737, "status": status},
+                                             {**_CAMPAIGN_461, "status": "IN_PROGRESS"})
+    with patched:
+        if ok:
+            await _run("campaign_activity", action)({"activity_id": 737, "confirm": True})
+        else:
+            with pytest.raises(ValueError):
+                await _run("campaign_activity", action)({"activity_id": 737, "confirm": True})
+    assert _posted(api) == ([f"/v1/campaigns/461/activities/737/{action}"] if ok else [])
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_reports_success_when_the_read_back_fails():
+    api, patched = _activity_lifecycle_patch({**_ACT_737, "status": "IN_PROGRESS"})
+    patched.patches.append(patch("app.campaigns.get_activity_logic", AsyncMock(side_effect=_failing_read)))
+    with patched:
+        result = await _run("campaign_activity", "pause")({"activity_id": 737, "confirm": True})
+    assert result["executed"] is True and "WAS saved" in result["note"]
+    assert _posted(api) == ["/v1/campaigns/461/activities/737/pause"]
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_calls_tolerate_kylas_empty_200_reply():
+    # start / pause / resume / complete answer 200 with no body: the call must ask for allow_empty.
+    seen = []
+
+    async def fake_call(method, path, op, *, params=None, body=None, allow_empty=False):
+        seen.append((path, allow_empty))
+        return {("GET", "/v1/campaigns/461"): {**_CAMPAIGN_461, "status": "IN_PROGRESS"}}.get((method, path), {})
+
+    with _ActivityPatched(_FakeWriteApi(), current={**_ACT_737, "status": "IN_PROGRESS"}):
+        with patch("app.campaigns._campaign_call", fake_call):
+            await _run("campaign_activity", "pause")({"activity_id": 737, "confirm": True})
+    assert ("/v1/campaigns/461/activities/737/pause", True) in seen

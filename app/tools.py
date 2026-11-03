@@ -787,7 +787,8 @@ def list_tool(
     assuming an id exists, since not every bucket has every intent):
       buckets: lead, contact, deal, task, company, meeting, call_log, quotation, report, note, campaign,
       campaign_activity, _meta
-      intents: get, search, search_by_term, search_idle, create, update, lookup, preview, cancel, delete, analytics
+      intents: get, search, search_by_term, search_idle, create, update, lookup, preview, cancel, delete, analytics,
+      start, pause, resume, complete
       (lead/deal/company have all of get/search/search_by_term/search_idle/
       create/update; contact has the same 5 minus search_idle; meeting has
       the same 5 plus cancel, delete, and lookup (meeting.lookup_related);
@@ -800,10 +801,13 @@ def list_tool(
       report / chart; report.preview — runs the same report and returns its
       numbers WITHOUT saving; both need entity="<entity>" in build_payload);
       campaign has search, get, analytics (campaign.analytics: engagement per
-      day for one marketing campaign), lookup (campaign.currencies), create
-      and update (both two calls: preview, then confirm); campaign_activity has
+      day for one marketing campaign), lookup (campaign.currencies), create,
+      update, start, pause, resume and complete (create/update/start are two
+      calls: preview, then confirm; pause/resume/complete run at once;
+      start/resume send real messages); campaign_activity has
       search, get, analytics (funnel / call outcomes), lookups for
-      templates/accounts/UTM, create and update (EMAIL / WHATSAPP, two calls),
+      templates/accounts/UTM, create, update, start, pause, resume and
+      complete (EMAIL / WHATSAPP, same call rules as campaign),
       plus recipients and generated_records (search intent); _meta
       is bucket-less and has lookup entries only (user.lookup,
       product.lookup, pipeline.lookup, pipeline.details,
@@ -817,7 +821,8 @@ def list_tool(
       "_meta"). Omit to search
       every bucket.
     intent: restrict to one intent — "get", "search", "search_by_term",
-      "search_idle", "create", "update", "lookup", "preview" or "analytics". Omit to match any.
+      "search_idle", "create", "update", "lookup", "preview", "analytics", "start", "pause",
+      "resume" or "complete". Omit to match any.
 
     Example: list_tool(bucket="lead") returns all lead.* rows (get/search/
     search_by_term/search_idle/create/update), each with its own id and

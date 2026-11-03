@@ -1845,9 +1845,211 @@ async def update_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
                           f"apply these changes to activity '{current.get('name')}'")
 
 
+# start / pause / resume / complete, for campaigns and
+# activities. Start uses the two calls of every write (a preview that changes
+# nothing, then the same call with confirm: true); pause, resume and complete
+# run at once. Start and resume SEND real emails / WhatsApp messages.
+# The checks mirror sd-campaign's Campaign / Activity
+# start / pause / resume / complete; CALL activities aren't supported yet.
 # ---------------------------------------------------------------------------
-# Input schemas (what build_payload returns for each id)
-# ---------------------------------------------------------------------------
+
+MAX_RUNNING_CAMPAIGNS = 15  # per tenant (CampaignFacade.validateNoOfCampaignThatCanBeRun)
+_ACTIVITY_STARTABLE = {"DRAFT", "FAILED"}
+_ACTIVITY_PAUSABLE = {"IN_PROGRESS", "QUEUED"}
+_ACTIVITY_COMPLETABLE = {"IN_PROGRESS", "QUEUED", "PAUSED", "PROCESSED", "RETRYING"}
+_CAMPAIGN_COMPLETE_READY = {"PROCESSED", "COMPLETED"}
+_CAMPAIGN_COMPLETABLE = {"IN_PROGRESS", "PAUSED", "PROCESSED"}
+_NEW_STATUS = {"start": "IN_PROGRESS", "pause": "PAUSED", "resume": "IN_PROGRESS", "complete": "COMPLETED"}
+# Only start previews first and needs confirm: true (it begins sending to a new audience).
+# Pause, resume and complete run straight away; their status / limit checks still refuse bad requests.
+_LIFECYCLE_NEEDS_CONFIRM = {"start"}
+_SENDS_WARNING = ("Confirming SENDS REAL {what} right away to the recipients listed — this can't be undone. "
+                  "Only confirm after the user explicitly says Yes to sending.")
+
+
+async def _running_campaigns() -> int:
+    """How many of the tenant's campaigns are IN_PROGRESS (Kylas allows at most 15)."""
+    body = build_campaign_json_rule([{"field": "status", "operator": "equal", "value": "IN_PROGRESS"}],
+                                    CAMPAIGN_FILTER_FIELDS)
+    data = await _campaign_call("POST", "/v1/campaigns/search", "Search campaigns",
+                                params={"page": 0, "size": 1, "sort": "updatedAt,desc"}, body=body)
+    return int((data or {}).get("totalElements") or 0)
+
+
+async def _check_running_limit(what: str) -> int:
+    running = await _running_campaigns()
+    if running >= MAX_RUNNING_CAMPAIGNS:
+        raise ValueError(f"This tenant already has {running} running campaigns, the most Kylas allows "
+                         f"({MAX_RUNNING_CAMPAIGNS}), so it can't {what}. Complete or pause another campaign first.")
+    return running
+
+
+def _refuse_call_activities(activities: List[Dict[str, Any]], what: str) -> None:
+    calls = [a.get("name") for a in activities if a.get("type") == "CALL"]
+    if calls:
+        raise ValueError(f"Can't {what} through the MCP: it has CALL activities ({', '.join(map(str, calls))}), and "
+                         "CALL activities aren't supported here yet. Do it from the Kylas web app.")
+
+
+def _sending_summary(activity: Dict[str, Any]) -> Dict[str, Any]:
+    """What an activity sends and from where — shown before it starts or resumes."""
+    payload = activity.get("payload") or {}
+    summary = {"id": activity.get("id"), "name": activity.get("name"), "type": activity.get("type"),
+               "status": activity.get("status"), "entity": activity.get("entity"), "sent_to": payload.get("sentTo")}
+    if activity.get("type") == "EMAIL":
+        summary["email_template"] = (payload.get("emailTemplate") or {}).get("name")
+    elif activity.get("type") == "WHATSAPP":
+        summary["whatsapp_account"] = (payload.get("connectedAccount") or {}).get("name")
+        summary["whatsapp_template"] = (payload.get("whatsappTemplate") or {}).get("name")
+    return summary
+
+
+async def _recipients(activity: Dict[str, Any]) -> int:
+    """How many records the activity's audience matches now — the count sd-campaign checks (isActivityRunnable)."""
+    rule = (activity.get("filters") or {}).get("jsonRule")
+    return await count_audience(activity.get("entity") or "LEAD", rule) if rule else 0
+
+
+def _what_is_sent(activities: List[Dict[str, Any]]) -> str:
+    kinds = {"EMAIL": "emails", "WHATSAPP": "WhatsApp messages"}
+    return " and ".join(sorted({kinds.get(a.get("type"), "messages") for a in activities})) or "messages"
+
+
+async def _campaign_for_lifecycle(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    campaign_id, choice = await _resolve_campaign_id(payload)
+    if choice:
+        return None, choice
+    return await _campaign_call("GET", f"/v1/campaigns/{campaign_id}", "Fetch campaign"), None
+
+
+async def _campaign_lifecycle(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """campaign.start / .pause / .resume / .complete — POST /v1/campaigns/{id}/{action}."""
+    campaign, choice = await _campaign_for_lifecycle(payload)
+    if choice:
+        return choice
+    status, name = campaign.get("status"), campaign.get("name")
+    activities = campaign.get("activities") or []
+    confirm = action not in _LIFECYCLE_NEEDS_CONFIRM or payload.get("confirm") is True
+    details: Dict[str, Any] = {
+        "campaign": {"id": campaign.get("id"), "name": name},
+        "status": {"now": status, "after": _NEW_STATUS[action]},
+    }
+
+    if action == "start":
+        if status != "DRAFT":
+            raise ValueError(f"Only a DRAFT campaign can be started; '{name}' is {status}.")
+        if not activities:
+            raise ValueError(f"'{name}' has no activities — add one before starting it.")
+        _refuse_call_activities(activities, f"start '{name}'")
+        not_draft = [a.get("name") for a in activities if a.get("status") != "DRAFT"]
+        if not_draft:
+            raise ValueError(f"Can't start '{name}': these activities aren't DRAFT: {', '.join(map(str, not_draft))}.")
+        details["running_campaigns"] = f"{await _check_running_limit(f'start {name}')} of {MAX_RUNNING_CAMPAIGNS}"
+        if not confirm:  # Kylas counts again when it starts; a failed count mustn't block the confirmed start
+            will_start, skipped = [], []
+            for a in activities:
+                n = await _recipients(a)
+                row = {**_sending_summary(a), "recipients_now": n}
+                (will_start if 1 <= n <= MAX_RECIPIENTS else skipped).append(row)
+            if not will_start:
+                raise ValueError(f"None of '{name}'s activities can start: each needs 1 to {MAX_RECIPIENTS:,} "
+                                 "recipients right now.")
+            for row in skipped:
+                row["why"] = "no recipients match now" if row["recipients_now"] < 1 else \
+                    f"more than {MAX_RECIPIENTS:,} recipients"
+            details.update({
+                "will_start": will_start, "skipped": skipped,
+                "total_recipients": sum(r["recipients_now"] for r in will_start),
+                "warning": _SENDS_WARNING.format(what=_what_is_sent(will_start)),
+            })
+    elif action == "pause":
+        if status != "IN_PROGRESS":
+            raise ValueError(f"Only an IN_PROGRESS campaign can be paused; '{name}' is {status}.")
+    elif action == "resume":
+        if status != "PAUSED":
+            raise ValueError(f"Only a PAUSED campaign can be resumed; '{name}' is {status}.")
+        paused = [a for a in activities if a.get("status") == "PAUSED"]
+        _refuse_call_activities(paused, f"resume '{name}'")
+        await _check_running_limit(f"resume {name}")
+    else:  # complete
+        if status == "COMPLETED":
+            raise ValueError(f"'{name}' is already COMPLETED.")
+        # sd-campaign doesn't check the campaign's own status, and "every activity finished" is true for a
+        # campaign with none — so without this a DRAFT campaign would be closed for good before it ever ran.
+        if status not in _CAMPAIGN_COMPLETABLE:
+            raise ValueError(f"Only a running, paused or processed campaign can be completed; '{name}' is {status}.")
+        pending = [f"{a.get('name')} ({a.get('status')})" for a in activities
+                   if a.get("status") not in _CAMPAIGN_COMPLETE_READY]
+        if pending:
+            raise ValueError(f"Can't complete '{name}' yet: every activity must be PROCESSED or COMPLETED first. "
+                             f"Still pending: {', '.join(pending)}. Complete or let those activities finish first.")
+
+    if confirm:
+        await _campaign_call("POST", f"/v1/campaigns/{campaign['id']}/{action}", f"{action.title()} campaign",
+                             allow_empty=True)
+        return await _confirmed("campaign", lambda: get_campaign_logic({"campaign_id": campaign["id"]}),
+                                campaign["id"])
+    return _preview_reply(f"campaign.{action}", details, await _acting_user(), f"{action} campaign '{name}'")
+
+
+async def _activity_lifecycle(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """campaign_activity.start / .pause / .resume / .complete — POST /v1/campaigns/{cid}/activities/{aid}/{action}."""
+    activity, choice = await _resolve_activity(payload)
+    if choice:
+        return choice
+    status, name = activity.get("status"), activity.get("name")
+    if activity.get("type") == "CALL":
+        raise ValueError(f"'{name}' is a CALL activity; starting, pausing, resuming or completing CALL activities "
+                         "isn't supported here yet. Do it from the Kylas web app.")
+    campaign_id = (activity.get("campaign") or {}).get("id")
+    confirm = action not in _LIFECYCLE_NEEDS_CONFIRM or payload.get("confirm") is True
+    details: Dict[str, Any] = {
+        "activity": _activity_ref(activity),
+        "status": {"now": status, "after": "QUEUED (then sending)" if action == "start" else _NEW_STATUS[action]},
+    }
+
+    if action == "start":
+        if status not in _ACTIVITY_STARTABLE:
+            raise ValueError(f"Only a DRAFT or FAILED activity can be started; '{name}' is {status}.")
+        campaign = await _campaign_call("GET", f"/v1/campaigns/{campaign_id}", "Fetch campaign")
+        if campaign.get("status") in ("DRAFT", "PAUSED"):
+            details["also"] = (f"Starting it also {'starts' if campaign.get('status') == 'DRAFT' else 'resumes'} "
+                               f"campaign '{campaign.get('name')}' (now {campaign.get('status')}).")
+        if not confirm:
+            n = await _recipients(activity)
+            if not 1 <= n <= MAX_RECIPIENTS:
+                raise ValueError(f"'{name}' can't start: its audience matches {n:,} records right now, and an "
+                                 f"activity needs 1 to {MAX_RECIPIENTS:,}.")
+            details.update({"sends": _sending_summary(activity), "recipients_now": n,
+                            "warning": _SENDS_WARNING.format(what=_what_is_sent([activity]))})
+    elif action == "pause":
+        if status not in _ACTIVITY_PAUSABLE:
+            raise ValueError(f"Only an IN_PROGRESS or QUEUED activity can be paused; '{name}' is {status}.")
+    elif action == "resume":
+        if status != "PAUSED":
+            raise ValueError(f"Only a PAUSED activity can be resumed; '{name}' is {status}.")
+    else:  # complete
+        if status not in _ACTIVITY_COMPLETABLE:
+            raise ValueError(f"'{name}' can't be completed while it is {status} (it must be running, queued, "
+                             "paused, processed or retrying).")
+
+    if confirm:
+        await _campaign_call("POST", f"/v1/campaigns/{campaign_id}/activities/{activity['id']}/{action}",
+                             f"{action.title()} campaign activity", allow_empty=True)
+        return await _confirmed(
+            "activity", lambda: get_activity_logic({"activity_id": activity["id"], "campaign_id": campaign_id}),
+            activity["id"])
+    return _preview_reply(f"campaign_activity.{action}", details, await _acting_user(), f"{action} activity '{name}'")
+
+
+def _lifecycle_router(level: str, action: str) -> Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]:
+    run = _campaign_lifecycle if level == "campaign" else _activity_lifecycle
+
+    async def router(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return await run(action, payload)
+
+    router.__name__ = f"{level}_{action}_logic"
+    return router
 
 _ALL_FILTER_OPERATORS = sorted(set(_ID_OPS + _TEXT_OPS + _NUMBER_OPS + _DATE_OPS))
 
@@ -2016,6 +2218,19 @@ CAMPAIGN_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
     },
     "campaign.currencies": {"type": "object", "properties": {}},
+    **{f"campaign.{action}": {
+        "type": "object",
+        "properties": {
+            "campaign_id": {"type": "integer", "description": "The campaign's id. Give this or campaign_name."},
+            "campaign_name": {"type": "string", "description": "The campaign's name; several matches return a choice."},
+            **(_CONFIRM_PROPERTIES if action in _LIFECYCLE_NEEDS_CONFIRM else {}),
+        },
+    } for action in ("start", "pause", "resume", "complete")},
+    **{f"campaign_activity.{action}": {
+        "type": "object",
+        "properties": {**_ACTIVITY_REF_PROPERTIES,
+                       **(_CONFIRM_PROPERTIES if action in _LIFECYCLE_NEEDS_CONFIRM else {})},
+    } for action in ("start", "pause", "resume", "complete")},
     "campaign_activity.create": {
         "type": "object",
         "properties": {
@@ -2093,6 +2308,8 @@ CAMPAIGN_ROUTERS: Dict[str, CampaignRouter] = {
     "campaign_activity.recipients": activity_recipients_logic,
     "campaign_activity.generated_records": activity_generated_records_logic,
     "campaign.currencies": currencies_logic,
+    **{f"{level}.{action}": _lifecycle_router(level, action)
+       for level in ("campaign", "campaign_activity") for action in ("start", "pause", "resume", "complete")},
     "campaign.create": create_campaign_logic,
     "campaign.update": update_campaign_logic,
     "campaign_activity.create": create_activity_logic,
