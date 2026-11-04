@@ -161,10 +161,17 @@
     datetime.parse_to_utc); participants (required — resolve via
     meeting.lookup_related with entity_type="invitee", pick the row
     with the correct entity type); related entities (optional — resolve IDs
-    first via the same meeting.lookup_related id); location and allDay
-    (optional). Both datetime.parse_to_utc and meeting.lookup_related are
-    resolved via list_tool -> build_payload -> execute_request, not called
-    as standalone tools.
+    first via the same meeting.lookup_related id); allDay (optional). Both
+    datetime.parse_to_utc and meeting.lookup_related are resolved via
+    list_tool -> build_payload -> execute_request, not called as standalone
+    tools.
+
+    Defaults — don't ask for these: medium "OFFLINE" ("GOOGLE" for Google
+    Meet or "MICROSOFT" for Outlook only if the user says so), status
+    "scheduled", owner = the current user; the server fills any you leave
+    out. location: many tenants require it — if the user gave none, use
+    "Office" for an offline meeting and say so in your confirmation; never
+    block on it.
 
     CRITICAL RULES FOR INVITEES: only leads/contacts with a VALID EMAIL can
     be added as invitees (check the emails array from the lookup result).
@@ -178,7 +185,7 @@
     "timezone": {"id": <tz_picklist_id>, "name": "Asia/Calcutta"},
     "participants": [{"id": <user_id>, "entity": "user|lead|contact|external"}],
     "relatedTo": [{"id": <entity_id>, "entity": "lead|contact|deal|company"}],
-    "location": "Office", "description": "..."}
+    "medium": "OFFLINE", "location": "Office", "description": "..."}
 
     Resolving entity IDs — never guess: Meeting owner/conductor (CRM
     users/sales reps) — always resolve user.lookup (list_tool ->

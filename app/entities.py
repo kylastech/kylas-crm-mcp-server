@@ -172,7 +172,7 @@ def _today_in(tz: str) -> str:
 
 
 async def _fetch_current_user() -> Dict[str, Any]:
-    """Fetch current user from GET /users/me. Returns full user object (timezone, recordActions, name, etc.)."""
+    """Fetch current user from GET /users/me. Returns full user object (timezone, name, etc.)."""
     async with get_client() as client:
         response = await client.get("/v1/users/me")
         return await handle_api_response(response, "Fetch current user")
@@ -181,8 +181,8 @@ async def _fetch_current_user() -> Dict[str, Any]:
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
 async def get_current_user() -> str:
     """
-    The current user's profile (GET /users/me): id, name, IANA timezone,
-    recordActions. MANDATORY: call ONCE per session, before any other tool,
+    The current user's profile (GET /users/me): id, name, IANA timezone and
+    today's date. MANDATORY: call ONCE per session, before any other tool,
     alongside get_entity_labels(); reuse the result, call again only if it is
     no longer visible.
     - Showing a date: every timestamp is UTC — convert to this timezone and name
@@ -213,12 +213,6 @@ async def get_current_user() -> str:
             # that changes only once a day keeps a client's cached prompt intact.
             f"Today: {_today_in(tz)} ({tz})",
             "",
-            "recordActions (permissions):",
-        ]
-        ra = user.get("recordActions") or {}
-        for k, v in sorted(ra.items()):
-            lines.append(f"  • {k}: {v}")
-        lines.extend([
             "",
             "Use this timezone and date for:",
             "  - Relative dates (\"last 50 days\", \"this month\"): count from Today above.",
@@ -226,7 +220,7 @@ async def get_current_user() -> str:
             "  - Datetime fields in *.create/*.update: convert the user's local datetime with datetime.parse_to_utc, then send the UTC ISO value.",
             f"Use this ID ({user_id}) directly for ownerId/createdBy when the action refers to the current user — no need for a separate user.lookup call.",
             "=" * 50,
-        ])
+        ]
         return "\n".join(lines)
     except KylasAPIError as e:
         return f"Error: {e.message}"
