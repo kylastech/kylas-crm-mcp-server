@@ -1,3 +1,4 @@
+import json
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -685,3 +686,530 @@ async def test_update_can_clear_the_end_date():
         await update_campaign_logic({"campaign_id": 440, "end_date": None, "confirm": True})
     assert preview["preview"]["changes"]["end_date"]["after"] == "none"
     assert api.writes()[0]["body"]["endDate"] is None
+
+
+# ---------------------------------------------------------------------------
+# Phase C2 — campaign_activity.create / campaign_activity.update (EMAIL and
+# WHATSAPP): preview first, then the same details with confirm: true.
+# Campaign 449 "MCP Plan2 Test" is the real QA campaign created in C1.
+# ---------------------------------------------------------------------------
+
+from app.campaigns import create_activity_logic, update_activity_logic  # noqa: E402
+
+_CAMPAIGN_449 = {
+    "id": 449, "name": "MCP Plan2 Test", "status": "DRAFT",
+    "estimatedBudget": {"currencyId": 431, "value": 2000.0},
+    "startDate": "2026-10-31T18:30:00.000Z", "endDate": "2026-11-30T18:29:59.999Z", "activities": [],
+}
+_RULE_753407 = {"field": "id", "operator": "equal", "value": 753407}
+
+_EMAIL_CREATE = {
+    "campaign_id": 449, "type": "email", "entity": "lead", "name": "Welcome email",
+    "audience_filters": [_RULE_753407], "email_template": "Lead creation", "budget": 500,
+    "start_date": "2026-11-05", "utm_campaign": "mcp-plan2-email-1", "utm_source": "mcp", "utm_medium": "email",
+}
+_WHATSAPP_CREATE = {
+    "campaign_id": 449, "type": "WHATSAPP", "entity": "LEAD", "name": "Welcome WhatsApp",
+    "audience_filters": [_RULE_753407], "whatsapp_account": "Kylas Devs", "whatsapp_template": "Please Reply copy",
+    "retry_times": 2, "budget": 300, "start_date": "2026-11-05", "end_date": "2026-11-10",
+    "utm_campaign": "mcp-plan2-wa-1", "utm_source": "mcp", "utm_medium": "whatsapp",
+}
+
+
+def _kylas_lookups():
+    return _FakeKylasGet({
+        "/v1/email-templates/lookup": lambda params: {"content": [r for r in _EMAIL_LOOKUP["content"]
+                                                                   if params["q"].lower() in r["name"].lower()]},
+        "/v1/email-templates/812": _EMAIL_812,
+        "/v1/email-templates/772": _EMAIL_772,
+        "/v1/messages/connected-accounts/lookup": _account_lookup,
+        "/v1/messages/whatsapp-templates/lookup": {"content": [{"id": 1040, "name": "Please Reply copy"}]},
+        "/v1/messages/whatsapp-templates/1040": _WA_1040,
+    })
+
+
+class _ActivityPatched(_Patched):
+    """C1's doubles plus template/account lookups, lead fields, the audience count and the final activity.get."""
+
+    def __init__(self, api, recipients=1, current=None):
+        super().__init__(api)
+        self.count = AsyncMock(return_value=recipients)
+        self.patches += [
+            patch("app.campaigns._kylas_get", _kylas_lookups()),
+            patch("app.campaigns._fetch_lead_fields", AsyncMock(return_value=_LEAD_FIELDS)),
+            patch("app.campaigns.count_audience", self.count),
+            patch("app.campaigns.get_activity_logic", AsyncMock(side_effect=lambda p: {"id": p["activity_id"]})),
+        ]
+        if current is not None:
+            self.patches.append(patch("app.campaigns._resolve_activity", AsyncMock(return_value=(current, None))))
+
+
+def _activity_api(campaign=_CAMPAIGN_449, duplicate=False):
+    return _FakeWriteApi({
+        ("GET", "/v1/campaigns/449"): campaign,
+        ("GET", "/v1/campaigns/activities/has-duplicates"): {"duplicate": duplicate},
+        ("POST", "/v1/campaigns/449/activities"): {"id": 800},
+        ("PUT", "/v1/campaigns/449/activities/800"): {"id": 800},
+    })
+
+
+# --- campaign_activity.create -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_activity_create_preview_writes_nothing_and_shows_everything():
+    api = _activity_api()
+    with _ActivityPatched(api):
+        result = await create_activity_logic(dict(_EMAIL_CREATE))
+    assert api.writes() == [] and result["executed"] is False
+    preview = result["preview"]
+    assert preview["campaign"] == {"id": 449, "name": "MCP Plan2 Test", "status": "DRAFT"}
+    assert (preview["type"], preview["entity"], preview["sent_to"]) == ("EMAIL", "LEAD", "PRIMARY_EMAIL")
+    assert preview["email_template"] == "Lead creation"
+    assert preview["audience_filters"] == [{"field": "id", "operator": "equal", "value": 753407}]
+    assert preview["recipients_now"] == 1 and preview["recipients_note"].startswith("Can start")
+    # Same money shape as activity reads and campaign previews.
+    assert preview["budget"] == {"value": 500.0, "currency": "INR", "currency_id": 431}
+    assert preview["actual_expense"] == {"value": 0.0, "currency": "INR", "currency_id": 431}
+    assert preview["start_date"] == "05 Nov 2026, 12:00:00 AM (Asia/Calcutta)" and preview["end_date"] == "none"
+    assert preview["status"].startswith("DRAFT")
+    assert "NOTHING WAS WRITTEN" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_activity_create_confirm_posts_the_web_form_body():
+    api = _activity_api()
+    with _ActivityPatched(api) as _:
+        result = await create_activity_logic({**_EMAIL_CREATE, "confirm": True})
+    (post,) = api.writes()
+    assert post["path"] == "/v1/campaigns/449/activities"
+    body = post["body"]
+    assert body["status"] == "DRAFT" and body["entity"] == "LEAD" and body["name"] == "Welcome email"
+    assert body["estimatedBudget"] == {"currencyId": 431, "value": 500.0}
+    assert body["actualExpense"] == {"currencyId": 431, "value": 0.0}
+    assert (body["startDate"], body["endDate"]) == ("2026-11-04T18:30:00.000Z", None)
+    assert (body["utmCampaign"], body["utmSource"], body["utmMedium"]) == ("mcp-plan2-email-1", "mcp", "email")
+    assert body["payload"] == {"type": "EMAIL", "sentTo": "PRIMARY_EMAIL", "emailTemplate": {"id": 812, "name": "Lead creation"}}
+    assert body["filters"]["jsonRule"]["condition"] == "AND"
+    assert [(r["field"], r["value"]) for r in body["filters"]["jsonRule"]["rules"]] == [("id", 753407)]
+    assert result == {"executed": True, "activity": {"id": 800}}
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_activity_payload_has_account_template_and_retries():
+    api = _activity_api()
+    with _ActivityPatched(api):
+        await create_activity_logic({**_WHATSAPP_CREATE, "confirm": True})
+    body = api.writes()[0]["body"]
+    assert body["payload"] == {
+        "type": "WHATSAPP", "sentTo": "PRIMARY_PHONE_NUMBER",
+        "connectedAccount": {"id": 20, "name": "Kylas Devoloper", "businessName": "Kylas Devs"},
+        "whatsappTemplate": {"id": 1040, "name": "Please Reply copy"}, "retryConfig": {"noOfTimes": 2},
+    }
+    assert body["endDate"] == "2026-11-10T18:29:59.999Z"
+
+
+@pytest.mark.parametrize("payload,campaign,message", [
+    ({**_EMAIL_CREATE, "type": "CALL"}, _CAMPAIGN_449, "CALL activities can't"),
+    ({**_EMAIL_CREATE, "type": None}, _CAMPAIGN_449, "'type' must be EMAIL or WHATSAPP"),
+    ({**_EMAIL_CREATE, "entity": "deal"}, _CAMPAIGN_449, "'entity' must be one of"),
+    ({**_EMAIL_CREATE, "name": ""}, _CAMPAIGN_449, "'name' is required"),
+    ({**_EMAIL_CREATE, "utm_medium": None}, _CAMPAIGN_449, "'utm_medium' is required"),
+    ({**_EMAIL_CREATE, "budget": None}, _CAMPAIGN_449, "'budget' is required"),
+    ({**_EMAIL_CREATE, "start_date": None}, _CAMPAIGN_449, "'start_date' is required"),
+    ({**_EMAIL_CREATE, "start_date": "2026-10-20"}, _CAMPAIGN_449, "outside the campaign's dates"),
+    ({**_EMAIL_CREATE, "end_date": "2026-12-05"}, _CAMPAIGN_449, "outside the campaign's dates"),
+    ({**_EMAIL_CREATE, "end_date": "2026-11-01"}, _CAMPAIGN_449, "on or after 'start_date'"),
+    (_EMAIL_CREATE, {**_CAMPAIGN_449, "activities": [{"id": i} for i in range(4)]}, "already has 4 activities"),
+    ({**_EMAIL_CREATE, "budget": 600},
+     {**_CAMPAIGN_449, "activities": [{"id": 1, "estimatedBudget": {"value": 1500.0}}]},
+     "budgets of 2100 in total, more than the campaign budget 2000"),
+    ({**_EMAIL_CREATE, "budget": {"value": 100, "currency": "USD"}}, _CAMPAIGN_449, "always in its campaign's currency"),
+    ({**_EMAIL_CREATE, "actual_expense": -1}, _CAMPAIGN_449, "can't be negative"),
+    ({**_EMAIL_CREATE, "email_template": None}, _CAMPAIGN_449, "'email_template' is required"),
+    ({**_EMAIL_CREATE, "email_template": 772}, _CAMPAIGN_449, "is for CONTACTs, not LEADs"),
+    ({**_EMAIL_CREATE, "sent_to": "ALL_PHONE_NUMBERS"}, _CAMPAIGN_449, "'sent_to' for EMAIL must be one of"),
+    ({**_WHATSAPP_CREATE, "whatsapp_template": None}, _CAMPAIGN_449, "'whatsapp_template' is required"),
+    ({**_WHATSAPP_CREATE, "retry_times": 9}, _CAMPAIGN_449, "between 0 and 7"),
+    ({**_EMAIL_CREATE, "audience_filters": []}, _CAMPAIGN_449, "needs at least one filter"),
+])
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.asyncio
+async def test_activity_create_is_validated_before_anything_is_written(payload, campaign, message, confirm):
+    api = _activity_api(campaign)
+    with _ActivityPatched(api):
+        with pytest.raises(ValueError, match=message):
+            await create_activity_logic({**payload, "confirm": confirm})
+    assert api.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_activity_create_refuses_a_used_utm_campaign():
+    api = _activity_api(duplicate=True)
+    with _ActivityPatched(api):
+        with pytest.raises(ValueError, match="'mcp-plan2-email-1' is already used by another activity"):
+            await create_activity_logic({**_EMAIL_CREATE, "confirm": True})
+    assert api.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_activity_create_with_an_ambiguous_template_asks_first():
+    api = _activity_api()
+    with _ActivityPatched(api):
+        result = await create_activity_logic({**_EMAIL_CREATE, "email_template": "lead", "confirm": True})
+    assert result["note"].startswith("STOP") and len(result["matches"]) == 3
+    assert api.writes() == []
+
+
+@pytest.mark.parametrize("recipients,note", [(0, "No leads/contacts match"), (10001, "More than 10,000 match")])
+@pytest.mark.asyncio
+async def test_activity_preview_warns_when_it_could_not_start(recipients, note):
+    with _ActivityPatched(_activity_api(), recipients=recipients):
+        result = await create_activity_logic(dict(_EMAIL_CREATE))
+    assert result["preview"]["recipients_now"] == recipients and result["preview"]["recipients_note"].startswith(note)
+
+
+# --- campaign_activity.update -----------------------------------------------------
+
+_ACTIVITY_800 = {
+    "id": 800, "name": "Welcome email", "status": "DRAFT", "type": "EMAIL", "entity": "LEAD",
+    "campaign": {"id": 449, "name": "MCP Plan2 Test"},
+    "estimatedBudget": {"currencyId": 431, "value": 500.0}, "actualExpense": {"currencyId": 431, "value": 0.0},
+    "startDate": "2026-11-04T18:30:00.000Z", "endDate": None,
+    "utmCampaign": "mcp-plan2-email-1", "utmSource": "mcp", "utmMedium": "email", "utmContent": None, "utmTerm": None,
+    "filters": {"jsonRule": {"condition": "AND", "valid": True, "rules": [
+        {"id": "id", "field": "id", "type": "double", "operator": "equal", "value": 753407}]}},
+    "payload": {"type": "EMAIL", "sentTo": "PRIMARY_EMAIL", "emailTemplate": {"id": 812, "name": "Lead creation"},
+                "connectedEmailAccount": "qa.kylas@gmail.com"},
+    "totalEngagement": 0, "recordActions": {"update": True}, "bulkJobId": None,
+}
+_CAMPAIGN_449_WITH_800 = {**_CAMPAIGN_449, "activities": [_ACTIVITY_800]}
+
+
+def _update(activity=_ACTIVITY_800, campaign=_CAMPAIGN_449_WITH_800, **kw):
+    api = _activity_api(campaign)
+    return api, _ActivityPatched(api, current=activity, **kw)
+
+
+@pytest.mark.asyncio
+async def test_activity_update_preview_shows_before_and_after():
+    api, patched = _update()
+    with patched:
+        result = await update_activity_logic({"activity_name": "Welcome email", "budget": 800, "name": "Welcome mail"})
+    assert api.writes() == [] and result["executed"] is False
+    changes = result["preview"]["changes"]
+    assert changes == {"name": {"before": "Welcome email", "after": "Welcome mail"},
+                       "budget": {"before": {"value": 500.0, "currency": "INR", "currency_id": 431},
+                                  "after": {"value": 800.0, "currency": "INR", "currency_id": 431}}}
+    assert result["preview"]["activity"]["id"] == 800
+
+
+@pytest.mark.asyncio
+async def test_activity_update_confirm_puts_the_merged_body():
+    api, patched = _update()
+    with patched:
+        result = await update_activity_logic({"activity_id": 800, "budget": 800, "confirm": True})
+    (put,) = api.writes()
+    body = put["body"]
+    assert put["path"] == "/v1/campaigns/449/activities/800"
+    assert body["estimatedBudget"] == {"currencyId": 431, "value": 800.0}
+    assert body["payload"] == _ACTIVITY_800["payload"] and body["filters"] == _ACTIVITY_800["filters"]
+    assert body["status"] == "DRAFT" and body["utmCampaign"] == "mcp-plan2-email-1"
+    assert "recordActions" not in body and "totalEngagement" not in body and "campaign" not in body
+    assert result == {"executed": True, "activity": {"id": 800}}
+
+
+@pytest.mark.asyncio
+async def test_activity_update_template_keeps_the_sending_account():
+    api, patched = _update()
+    with patched:
+        await update_activity_logic({"activity_id": 800, "email_template": 812, "sent_to": "ALL_EMAILS", "confirm": True})
+    assert api.writes()[0]["body"]["payload"] == {
+        "type": "EMAIL", "sentTo": "ALL_EMAILS", "emailTemplate": {"id": 812, "name": "Lead creation"},
+        "connectedEmailAccount": "qa.kylas@gmail.com"}
+
+
+@pytest.mark.asyncio
+async def test_activity_update_new_audience_is_counted_and_replaced():
+    api, patched = _update()
+    with patched:
+        preview = await update_activity_logic({"activity_id": 800,
+                                               "audience_filters": [{"field": "firstName", "operator": "contains",
+                                                                     "value": "Atharva"}]})
+        await update_activity_logic({"activity_id": 800, "confirm": True,
+                                     "audience_filters": [{"field": "firstName", "operator": "contains", "value": "Atharva"}]})
+    assert preview["preview"]["recipients_now"] == 1
+    assert preview["preview"]["changes"]["audience_filters"]["after"] == [
+        {"field": "firstName", "operator": "contains", "value": "Atharva"}]
+    assert api.writes()[0]["body"]["filters"]["jsonRule"]["rules"][0]["field"] == "firstName"
+
+
+@pytest.mark.parametrize("status", ["IN_PROGRESS", "PAUSED", "COMPLETED", "QUEUED", "PROCESSED"])
+@pytest.mark.asyncio
+async def test_started_activity_only_takes_budget_expense_and_end_date(status):
+    started = {**_ACTIVITY_800, "status": status}
+    api, patched = _update(started, {**_CAMPAIGN_449, "activities": [started]})
+    with patched:
+        with pytest.raises(ValueError, match=rf"This activity is {status}: only budget, actual_expense and end_date"):
+            await update_activity_logic({"activity_id": 800, "name": "New name", "budget": 700})
+        result = await update_activity_logic({"activity_id": 800, "budget": 700, "actual_expense": 120,
+                                              "end_date": "2026-11-20"})
+    assert set(result["preview"]["changes"]) == {"budget", "actual_expense", "end_date"}
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"type": "WHATSAPP"}, "'whatsapp_account' is required"),
+    ({"type": "WHATSAPP", "whatsapp_account": "Kylas Devs"}, "'whatsapp_template' is required"),
+    ({"type": "CALL"}, "CALL activities can't"),
+    ({"entity": "CONTACT"}, "needs new audience_filters"),
+    ({}, "Nothing to change"),
+    ({"budget": 500}, "already set"),
+    ({"budget": 2500}, "budgets of 2500 in total, more than the campaign budget 2000"),
+    ({"start_date": "2026-10-01"}, "outside the campaign's dates"),
+    ({"email_template": 772}, "is for CONTACTs, not LEADs"),
+])
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.asyncio
+async def test_activity_update_is_validated_before_anything_is_written(change, message, confirm):
+    api, patched = _update()
+    with patched:
+        with pytest.raises(ValueError, match=message):
+            await update_activity_logic({"activity_id": 800, **change, "confirm": confirm})
+    assert api.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_account_change_rechecks_the_template():
+    whatsapp = {**_ACTIVITY_800, "type": "WHATSAPP", "payload": {
+        "type": "WHATSAPP", "sentTo": "PRIMARY_PHONE_NUMBER",
+        "connectedAccount": {"id": 20, "name": "Kylas Devoloper", "businessName": "Kylas Devs"},
+        "whatsappTemplate": {"id": 1040, "name": "Please Reply copy"}, "retryConfig": None}}
+    api, patched = _update(whatsapp, {**_CAMPAIGN_449, "activities": [whatsapp]})
+    patched.patches.append(patch("app.campaigns._resolve_whatsapp_account",
+                                 AsyncMock(return_value=({"id": 77, "name": "Acme", "businessName": "Acme Biz"}, None))))
+    with patched:
+        with pytest.raises(ValueError, match="belongs to another WhatsApp account"):
+            await update_activity_logic({"activity_id": 800, "whatsapp_account": "Acme", "confirm": True})
+    assert api.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_build_payload_folds_lead_fields_for_activity_create():
+    from app.tools import build_payload
+
+    with patch("app.tools._fold_field_metadata_into_schema",
+               AsyncMock(side_effect=lambda schema, *a, **k: {**schema, "tenant_fields_reference": "lead fields"})) as fold:
+        result = json.loads(await build_payload("campaign_activity.create", entity="lead"))
+        plain = json.loads(await build_payload("campaign_activity.create"))
+        wrong = json.loads(await build_payload("campaign_activity.create", entity="deal"))
+    assert result["fetched_live"] is True and result["schema"]["tenant_fields_reference"] == "lead fields"
+    assert fold.await_args.kwargs["bucket"] == "lead" and fold.await_args.kwargs["for_search"] is True
+    assert plain["fetched_live"] is False and "tenant_fields_reference" not in plain["schema"]
+    assert "must be lead or contact" in wrong["live_fetch_error"]
+
+
+@pytest.mark.asyncio
+async def test_draft_email_activity_can_become_whatsapp():
+    api, patched = _update()
+    with patched:
+        preview = await update_activity_logic({"activity_id": 800, "type": "whatsapp", "whatsapp_account": "Kylas Devs",
+                                               "whatsapp_template": "Please Reply copy"})
+        await update_activity_logic({"activity_id": 800, "type": "WHATSAPP", "whatsapp_account": "Kylas Devs",
+                                     "whatsapp_template": "Please Reply copy", "confirm": True})
+    changes = preview["preview"]["changes"]
+    assert changes["type"] == {"before": "EMAIL", "after": "WHATSAPP"}
+    assert changes["email_template"] == {"before": "Lead creation", "after": None}
+    assert changes["whatsapp_template"] == {"before": None, "after": "Please Reply copy"}
+    assert changes["sent_to"] == {"before": "PRIMARY_EMAIL", "after": "PRIMARY_PHONE_NUMBER"}
+    body = api.writes()[0]["body"]
+    # A whole new payload: nothing from the email payload (template, sending account) carries over.
+    assert body["payload"] == {
+        "type": "WHATSAPP", "sentTo": "PRIMARY_PHONE_NUMBER",
+        "connectedAccount": {"id": 20, "name": "Kylas Devoloper", "businessName": "Kylas Devs"},
+        "whatsappTemplate": {"id": 1040, "name": "Please Reply copy"}, "retryConfig": None}
+    assert body["name"] == "Welcome email" and body["filters"] == _ACTIVITY_800["filters"]
+
+
+@pytest.mark.asyncio
+async def test_draft_whatsapp_activity_can_become_email():
+    whatsapp = {**_ACTIVITY_800, "type": "WHATSAPP", "payload": {
+        "type": "WHATSAPP", "sentTo": "ALL_PHONE_NUMBERS",
+        "connectedAccount": {"id": 20, "name": "Kylas Devoloper", "businessName": "Kylas Devs"},
+        "whatsappTemplate": {"id": 1040, "name": "Please Reply copy"}, "retryConfig": {"noOfTimes": 2}}}
+    api, patched = _update(whatsapp, {**_CAMPAIGN_449, "activities": [whatsapp]})
+    with patched:
+        await update_activity_logic({"activity_id": 800, "type": "EMAIL", "email_template": "Lead creation",
+                                     "confirm": True})
+    assert api.writes()[0]["body"]["payload"] == {
+        "type": "EMAIL", "sentTo": "PRIMARY_EMAIL", "emailTemplate": {"id": 812, "name": "Lead creation"}}
+
+
+@pytest.mark.asyncio
+async def test_same_type_given_again_is_not_a_change():
+    api, patched = _update()
+    with patched:
+        result = await update_activity_logic({"activity_id": 800, "type": "EMAIL", "budget": 900})
+    assert set(result["preview"]["changes"]) == {"budget"}
+
+
+@pytest.mark.parametrize("status", ["IN_PROGRESS", "PAUSED", "COMPLETED", "QUEUED"])
+@pytest.mark.asyncio
+async def test_started_activity_type_cannot_change(status):
+    started = {**_ACTIVITY_800, "status": status}
+    api, patched = _update(started, {**_CAMPAIGN_449, "activities": [started]})
+    with patched:
+        with pytest.raises(ValueError, match=r"only budget, actual_expense and end_date.*Not allowed: .*'type'"):
+            await update_activity_logic({"activity_id": 800, "type": "WHATSAPP", "whatsapp_account": "Kylas Devs",
+                                         "whatsapp_template": "Please Reply copy", "confirm": True})
+    assert api.writes() == []
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: read-back after a write, nulls / unchanged values on update,
+# no audience count on confirm, fields of the other activity type refused.
+# ---------------------------------------------------------------------------
+
+
+def _failing_read(*_args, **_kwargs):
+    raise KylasAPIError("Fetch campaign activity failed: 504", status_code=504)
+
+
+@pytest.mark.parametrize("call,payload,patched_get", [
+    ("activity_create", {**_EMAIL_CREATE, "confirm": True}, "get_activity_logic"),
+    ("activity_update", {"activity_id": 800, "budget": 900, "confirm": True}, "get_activity_logic"),
+])
+@pytest.mark.asyncio
+async def test_activity_write_still_reports_success_when_the_read_back_fails(call, payload, patched_get):
+    if call == "activity_create":
+        api = _activity_api()
+        patched = _ActivityPatched(api)
+        fn = create_activity_logic
+    else:
+        api, patched = _update()
+        fn = update_activity_logic
+    patched.patches.append(patch(f"app.campaigns.{patched_get}", AsyncMock(side_effect=_failing_read)))
+    with patched:
+        result = await fn(payload)
+    assert result["executed"] is True and result["activity"] == {"id": 800}
+    assert "WAS saved" in result["note"] and "Do not retry" in result["note"]
+    assert len(api.writes()) == 1
+
+
+@pytest.mark.parametrize("payload,api_responses", [
+    ({**_CREATE, "confirm": True}, {("POST", "/v1/campaigns"): {"id": 500}}),
+    ({"campaign_id": 440, "budget": 75000, "confirm": True}, None),
+])
+@pytest.mark.asyncio
+async def test_campaign_write_still_reports_success_when_the_read_back_fails(payload, api_responses):
+    api = _FakeWriteApi(api_responses) if api_responses else _update_api()
+    patched = _Patched(api)
+    patched.patches[-1] = patch("app.campaigns.get_campaign_logic", AsyncMock(side_effect=_failing_read))
+    fn = create_campaign_logic if api_responses else update_campaign_logic
+    with patched:
+        result = await fn(payload)
+    assert result["executed"] is True and "WAS saved" in result["note"]
+    assert result["campaign"]["id"] in (500, 440) and len(api.writes()) == 1
+
+
+@pytest.mark.asyncio
+async def test_activity_update_treats_nulls_as_not_given():
+    current = {**_ACTIVITY_800, "utmContent": "banner"}
+    api, patched = _update(current, {**_CAMPAIGN_449, "activities": [current]})
+    with patched:
+        preview = await update_activity_logic({"activity_id": 800, "budget": 900, "name": None, "utm_content": None,
+                                               "retry_times": None, "sent_to": None, "audience_filters": None})
+        await update_activity_logic({"activity_id": 800, "budget": 900, "name": None, "utm_content": None,
+                                     "confirm": True})
+    assert set(preview["preview"]["changes"]) == {"budget"}
+    body = api.writes()[0]["body"]
+    assert body["name"] == "Welcome email" and body["utmContent"] == "banner"
+
+
+@pytest.mark.asyncio
+async def test_campaign_update_treats_nulls_as_not_given():
+    with _Patched(_update_api()):
+        result = await update_campaign_logic({"campaign_id": 440, "budget": 40000, "name": None, "description": None})
+    assert set(result["preview"]["changes"]) == {"budget"}
+
+
+@pytest.mark.asyncio
+async def test_started_activity_accepts_unchanged_values_resent():
+    started = {**_ACTIVITY_800, "status": "IN_PROGRESS"}
+    api, patched = _update(started, {**_CAMPAIGN_449, "activities": [started]})
+    with patched:
+        result = await update_activity_logic({"activity_id": 800, "entity": "LEAD", "name": "Welcome email",
+                                              "utm_campaign": "mcp-plan2-email-1", "budget": 700})
+    assert set(result["preview"]["changes"]) == {"budget"}
+
+
+@pytest.mark.asyncio
+async def test_started_campaign_accepts_unchanged_values_resent():
+    started = {**_CURRENT, "status": "IN_PROGRESS"}
+    with _Patched(_update_api(started)):
+        result = await update_campaign_logic({"campaign_id": 440, "name": "Diwali Offer", "utm_source": "kylas",
+                                              "budget": 40000})
+    assert set(result["preview"]["changes"]) == {"budget"}
+
+
+@pytest.mark.asyncio
+async def test_activity_update_counts_the_audience_only_on_the_preview():
+    new_audience = [{"field": "firstName", "operator": "contains", "value": "Atharva"}]
+    api, patched = _update()
+    with patched:
+        await update_activity_logic({"activity_id": 800, "audience_filters": new_audience})
+        assert patched.count.await_count == 1
+        await update_activity_logic({"activity_id": 800, "audience_filters": new_audience, "confirm": True})
+    assert patched.count.await_count == 1  # not again on confirm
+    assert len(api.writes()) == 1
+
+
+@pytest.mark.parametrize("fn,payload,message", [
+    ("create", {**_EMAIL_CREATE, "retry_times": 2}, "retry_times does not apply to EMAIL activities"),
+    ("create", {**_EMAIL_CREATE, "whatsapp_account": "Kylas Devs", "whatsapp_template": "x"},
+     "whatsapp_account, whatsapp_template do not apply to EMAIL"),
+    ("create", {**_WHATSAPP_CREATE, "email_template": "Lead creation"}, "email_template does not apply to WHATSAPP"),
+    ("update", {"activity_id": 800, "whatsapp_template": "Please Reply copy"}, "whatsapp_template does not apply to EMAIL"),
+    ("update", {"activity_id": 800, "retry_times": 3}, "retry_times does not apply to EMAIL"),
+    ("update", {"activity_id": 800, "type": "WHATSAPP", "whatsapp_account": "Kylas Devs",
+                "whatsapp_template": "Please Reply copy", "email_template": "Lead creation"},
+     "email_template does not apply to WHATSAPP"),
+])
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.asyncio
+async def test_fields_of_the_other_activity_type_are_refused(fn, payload, message, confirm):
+    if fn == "create":
+        api = _activity_api()
+        patched = _ActivityPatched(api)
+    else:
+        api, patched = _update()
+    with patched:
+        with pytest.raises(ValueError, match=message):
+            await (create_activity_logic if fn == "create" else update_activity_logic)({**payload, "confirm": confirm})
+    assert api.writes() == []
+
+
+_WHATSAPP_800 = {**_ACTIVITY_800, "type": "WHATSAPP", "payload": {
+    "type": "WHATSAPP", "sentTo": "PRIMARY_PHONE_NUMBER",
+    "connectedAccount": {"id": 20, "name": "Kylas Devoloper", "businessName": "Kylas Devs"},
+    "whatsappTemplate": {"id": 1040, "name": "Please Reply copy"}, "retryConfig": {"noOfTimes": 3}}}
+
+
+@pytest.mark.asyncio
+async def test_null_retry_times_keeps_the_current_retries():
+    api, patched = _update(_WHATSAPP_800, {**_CAMPAIGN_449, "activities": [_WHATSAPP_800]})
+    with patched:
+        preview = await update_activity_logic({"activity_id": 800, "sent_to": "ALL_PHONE_NUMBERS", "retry_times": None})
+        await update_activity_logic({"activity_id": 800, "sent_to": "ALL_PHONE_NUMBERS", "retry_times": None,
+                                     "confirm": True})
+    assert set(preview["preview"]["changes"]) == {"sent_to"}
+    assert api.writes()[0]["body"]["payload"]["retryConfig"] == {"noOfTimes": 3}
+
+
+@pytest.mark.asyncio
+async def test_retry_times_given_still_changes_the_retries():
+    api, patched = _update(_WHATSAPP_800, {**_CAMPAIGN_449, "activities": [_WHATSAPP_800]})
+    with patched:
+        preview = await update_activity_logic({"activity_id": 800, "retry_times": 0})
+        await update_activity_logic({"activity_id": 800, "retry_times": 0, "confirm": True})
+    assert preview["preview"]["changes"]["retry_times"] == {"before": 3, "after": 0}
+    assert api.writes()[0]["body"]["payload"]["retryConfig"] == {"noOfTimes": 0}
