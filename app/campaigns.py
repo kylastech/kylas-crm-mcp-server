@@ -21,6 +21,7 @@ service shape the helpers below:
     bare 403.
 """
 
+import asyncio
 from datetime import date, datetime, time, timedelta, timezone as dt_timezone
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -2051,6 +2052,410 @@ def _lifecycle_router(level: str, action: str) -> Callable[[Dict[str, Any]], Awa
     router.__name__ = f"{level}_{action}_logic"
     return router
 
+
+# ---------------------------------------------------------------------------
+# campaign.performance — rank the tenant's past campaigns and show what worked
+# in them, so a new campaign can be built from the best ones. Read-only.
+# Everything comes from the campaign search (each campaign carries its
+# activities with engagement, expense, dates, template and saved audience),
+# plus the user's timezone, the currency names and the lead / contact field
+# list (to rebuild the saved audiences as campaign_activity.create input).
+
+PERFORMANCE_WEIGHTS = {"engagement": 0.45, "cost": 0.40, "speed": 0.15}
+PERFORMANCE_RANK_BY = ["balanced", "engagement", "cost", "speed"]
+PERFORMANCE_DEFAULT_TOP = 5
+PERFORMANCE_MAX_TOP = 10
+# The search fills engagement for EMAIL (opens) and WHATSAPP (reads) only; CALL results stay empty there.
+_SCORED_TYPES = ("EMAIL", "WHATSAPP")
+_STARTED_CAMPAIGN_STATUSES = ["IN_PROGRESS", "PAUSED", "PROCESSED", "COMPLETED"]
+_MIN_SPEED_DAYS = 7  # so a campaign one day old doesn't count as "6 engagements a day"
+_NEUTRAL_PART = 50.0  # a part that can't be measured: neither rewarded nor punished
+_PERFORMANCE_MAX_PAGES = 10  # 500 campaigns
+_AUDIENCE_DATE_TYPES = {"DATETIME_PICKER", "DATE", "DATE_PICKER"}
+
+
+def _money_value(money: Optional[Dict[str, Any]]) -> float:
+    return float((money or {}).get("value") or 0)
+
+
+def _days_running(started_at: Optional[str], ended_at: Optional[str], now: datetime) -> float:
+    """Days actually running: started -> ended, or -> now while it still runs."""
+    start = _instant(started_at)
+    end = _instant(ended_at) or now
+    return max((end - start).total_seconds() / 86400, 0.0)
+
+
+def _performance_numbers(record: Dict[str, Any], activities: List[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
+    """Engagement, expense, days running, cost per engagement and engagement per day of a campaign or activity."""
+    engagement = sum(int(a.get("totalEngagement") or 0) for a in activities)
+    expense = sum(_money_value(a.get("actualExpense")) for a in activities)
+    days = _days_running(record.get("startedAt"), record.get("endedAt"), now)
+    return {
+        "engagement": engagement,
+        "expense": expense,
+        "days": days,
+        "cost_per_engagement": expense / engagement if expense > 0 and engagement > 0 else None,
+        "per_day": engagement / max(days, _MIN_SPEED_DAYS),
+    }
+
+
+def _performance_candidates(
+    campaigns: List[Dict[str, Any]], channel: Optional[str], now: datetime,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """The campaigns that can be compared, each with the activities that count.
+
+    An activity counts when it is EMAIL / WHATSAPP (of `channel`, if given) and
+    actually ran; DRAFT activities and their expense are left out, and CALL
+    activities are listed as not scored.
+    """
+    entries: List[Dict[str, Any]] = []
+    skipped = {"never_started": 0, "nothing_to_score": 0}
+    for c in campaigns:
+        if not c.get("startedAt"):
+            skipped["never_started"] += 1
+            continue
+        scored, not_scored = [], []
+        for a in c.get("activities") or []:
+            if channel and a.get("type") != channel:
+                continue
+            if a.get("type") not in _SCORED_TYPES:
+                not_scored.append(f"{a.get('type')} activity '{a.get('name')}': call results aren't in this data")
+            elif a.get("status") == "DRAFT" or not a.get("startedAt"):
+                not_scored.append(f"{a.get('type')} activity '{a.get('name')}': never ran ({a.get('status')})")
+            else:
+                scored.append(a)
+        if not scored:
+            skipped["nothing_to_score"] += 1
+            continue
+        entries.append({
+            "record": c, "activities": scored, "not_scored": not_scored,
+            "currency_id": (c.get("estimatedBudget") or {}).get("currencyId"),
+            **_performance_numbers(c, scored, now),
+        })
+    return entries, skipped
+
+
+def _position_scores(values: List[Optional[float]], higher_is_better: bool = True,
+                     alone: float = 100.0) -> List[Optional[float]]:
+    """0-100 by position among the known values: best 100, worst 0, ties share. None stays None."""
+    known = [v for v in values if v is not None]
+    scores: List[Optional[float]] = []
+    for v in values:
+        if v is None:
+            scores.append(None)
+        elif len(known) < 2:
+            scores.append(alone)
+        else:
+            beaten = sum(1 for o in known if (o < v if higher_is_better else o > v))
+            tied = sum(1 for o in known if o == v) - 1
+            scores.append(round((beaten + tied / 2) / (len(known) - 1) * 100, 1))
+    return scores
+
+
+def _score(entries: List[Dict[str, Any]]) -> None:
+    """Balanced score, in place: engagement 45% + cost per engagement 40% + engagement per day 15%.
+
+    Cost is compared only between entries in the same currency. No cost data
+    (expense 0, or no engagement) -> the cost part counts as neutral 50 and the
+    score is marked partial.
+    """
+    engagement = _position_scores([e["engagement"] for e in entries])
+    speed = _position_scores([e["per_day"] for e in entries])
+    cost: List[Optional[float]] = [None] * len(entries)
+    by_currency: Dict[Any, List[int]] = {}
+    for i, e in enumerate(entries):
+        by_currency.setdefault(e.get("currency_id"), []).append(i)
+    for indexes in by_currency.values():
+        values = [entries[i]["cost_per_engagement"] for i in indexes]
+        for i, s in zip(indexes, _position_scores(values, higher_is_better=False, alone=_NEUTRAL_PART)):
+            cost[i] = s
+    for e, eng, cst, spd in zip(entries, engagement, cost, speed):
+        e["parts"] = {"engagement": eng, "cost": cst, "speed": spd}
+        e["score"] = round(eng * PERFORMANCE_WEIGHTS["engagement"]
+                           + (cst if cst is not None else _NEUTRAL_PART) * PERFORMANCE_WEIGHTS["cost"]
+                           + spd * PERFORMANCE_WEIGHTS["speed"], 1)
+        if cst is not None:
+            e["score_quality"] = "full"
+        elif not e["engagement"]:
+            e["score_quality"] = "partial: no engagement"
+        else:
+            e["score_quality"] = "partial: no cost data (actual expense is 0)"
+
+
+_PERFORMANCE_ORDER: Dict[str, Callable[[Dict[str, Any]], Any]] = {
+    "balanced": lambda e: (-e["score"], -e["engagement"], e["record"].get("id") or 0),
+    "engagement": lambda e: (-e["engagement"], -e["score"], e["record"].get("id") or 0),
+    "cost": lambda e: (e["cost_per_engagement"] is None, e["cost_per_engagement"] or 0, -e["engagement"],
+                       e["record"].get("id") or 0),
+    "speed": lambda e: (-e["per_day"], -e["engagement"], e["record"].get("id") or 0),
+}
+
+
+def _number_or_text(value: Any) -> Any:
+    """A saved numeric rule value as a number ("297933" -> 297933); anything else unchanged."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return value
+    try:
+        number = float(value)
+    except ValueError:
+        return value
+    return int(number) if number.is_integer() else number
+
+
+def _local_datetime(value: Any, tz_name: str) -> str:
+    """A saved date value (epoch millis or a UTC instant) as the user's local datetime the create input takes."""
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        instant = datetime.fromtimestamp(value / 1000, dt_timezone.utc)
+    else:
+        instant = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=dt_timezone.utc)
+    return instant.astimezone(ZoneInfo(tz_name)).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _readable_value(meta: Dict[str, Any], value: Any) -> Any:
+    """Picklist option ids as their names; anything else unchanged."""
+    picklist = meta.get("picklist") or {}
+    options = picklist.get("values") or picklist.get("picklistValues") or []
+    names = {o.get("id"): o.get("displayName") or o.get("name") for o in options}
+
+    def one(v: Any) -> Any:  # a map-radius value is a dict, so it can't be looked up
+        return names.get(v, v) if isinstance(v, (str, int, float)) else v
+
+    if isinstance(value, list):
+        return ", ".join(str(one(v)) for v in value)
+    return one(value)
+
+
+def rebuild_audience(entity: str, rules: List[Dict[str, Any]], fields: List[Dict[str, Any]],
+                     tz_name: str) -> Dict[str, Any]:
+    """An activity's saved audience rules, rebuilt as campaign_activity.create `audience_filters`.
+
+    Nothing is copied raw: each rule becomes the {field, operator, value} input
+    a user would give (custom fields by their own name, dates as the user's
+    local time, "a, b" lists as lists) and is checked exactly as
+    campaign_activity.create checks it. Rules that can't be rebuilt (map
+    radius, search-box text, fields no longer filterable) are listed with the
+    reason instead, so the user can choose a replacement.
+    """
+    filterable = _get_filterable_fields_map(fields)
+    meta_by_name = {f.get("name"): f for f in fields if f.get("name")}
+    internal = _BUCKET_PICKLIST_RULES.get(entity.lower(), {}).get("internal_name", set())
+    result: Dict[str, Any] = {"audience_filters": [], "readable": [], "cannot_reuse": [], "warnings": []}
+    for rule in rules:
+        field = str(rule.get("field") or "")
+        operator = str(rule.get("operator") or "equal").strip().lower()
+        value = rule.get("value")
+        name = field.split(".", 1)[1] if field.startswith("customFieldValues.") else field
+        meta = meta_by_name.get(name) or {}
+        label = meta.get("displayName") or name
+        said = f"{label} {operator.replace('_', ' ')}" + ("" if value is None else f" {_readable_value(meta, value)}")
+
+        if field == "multi_field" or operator == "multi_field":
+            result["cannot_reuse"].append({
+                "condition": f"search text '{value}'",
+                "why": "Search-box text can't be set here; use a field condition instead "
+                       "(e.g. first name contains it)."})
+            continue
+        if operator == "range_within":
+            area = value if isinstance(value, dict) else {}
+            result["cannot_reuse"].append({
+                "condition": f"{label} within {area.get('radius')} {str(area.get('unit') or '').lower()} of "
+                             f"{area.get('address') or 'a map point'}",
+                "why": "Map-radius conditions can't be set here; use a city or address condition instead."})
+            continue
+        if name not in filterable:
+            result["cannot_reuse"].append({"condition": said,
+                                           "why": f"'{name}' isn't a filterable {entity.lower()} field any more."})
+            continue
+
+        is_date = filterable[name]["type"] in _AUDIENCE_DATE_TYPES
+        try:
+            if operator in _LIST_OPS and isinstance(value, str):
+                value = [v.strip() for v in value.split(",") if v.strip()]
+            if rule.get("type") in ("long", "double"):
+                value = [_number_or_text(v) for v in value] if isinstance(value, list) else _number_or_text(value)
+            if is_date and value is not None:
+                value = ([_local_datetime(v, tz_name) for v in value] if isinstance(value, list)
+                         else _local_datetime(value, tz_name))
+        except (TypeError, ValueError, OverflowError):
+            result["cannot_reuse"].append({"condition": said, "why": "Its saved value couldn't be read."})
+            continue
+
+        candidate = {"field": name, "operator": operator, "value": value}
+        _, error = _build_search_json_rule([candidate], filterable, default_timezone=tz_name,
+                                           internal_name_fields=internal)
+        if error:
+            result["cannot_reuse"].append({"condition": said, "why": error.replace("Filter #1: ", "")})
+            continue
+        if is_date and value is not None:
+            said = f"{label} {operator.replace('_', ' ')} {', '.join(value) if isinstance(value, list) else value}"
+            result["warnings"].append(f"'{said}' uses a fixed date; for a new campaign a newer date or a relative "
+                                      "one (e.g. last_thirty_days) may fit better.")
+        if name == "id":
+            result["warnings"].append(f"'{said}' targets specific records by id, so it reaches only those people.")
+        result["audience_filters"].append(candidate)
+        result["readable"].append(said)
+    if not result["audience_filters"]:
+        result["warnings"].append("Nothing here can be reused as is: ask the user for the new audience.")
+    return result
+
+
+def _activity_setup(activity: Dict[str, Any], campaign: Dict[str, Any], audience: Dict[str, Any]) -> Dict[str, Any]:
+    """What an activity sent and to whom: the parts campaign_activity.create needs to build one like it."""
+    payload = activity.get("payload") or {}
+    budget = _money_value(activity.get("estimatedBudget"))
+    campaign_budget = _money_value(campaign.get("estimatedBudget"))
+    setup: Dict[str, Any] = {
+        "id": activity.get("id"), "name": activity.get("name"), "type": activity.get("type"),
+        "status": activity.get("status"), "entity": activity.get("entity"),
+        "engagement": int(activity.get("totalEngagement") or 0),
+        "actual_expense": _money_value(activity.get("actualExpense")),
+        "budget": budget, "budget_share": f"{budget / campaign_budget:.0%}" if campaign_budget else None,
+        "sent_to": payload.get("sentTo"),
+    }
+    if activity.get("type") == "EMAIL":
+        setup["email_template"] = payload.get("emailTemplate")
+    else:
+        account = payload.get("connectedAccount") or {}
+        setup["whatsapp_account"] = {"id": account.get("id"), "name": account.get("name"),
+                                     "business_name": account.get("businessName")}
+        setup["whatsapp_template"] = payload.get("whatsappTemplate")
+        setup["retry_times"] = (payload.get("retryConfig") or {}).get("noOfTimes")
+    setup["audience"] = audience
+    return setup
+
+
+def _performance_row(entry: Dict[str, Any], currencies: Dict[int, str]) -> Dict[str, Any]:
+    record = entry["record"]
+    cost = entry["cost_per_engagement"]
+    return {
+        "id": record.get("id"), "name": record.get("name"), "status": record.get("status"),
+        "score": entry["score"], "score_quality": entry["score_quality"], "parts": entry["parts"],
+        "engagement": entry["engagement"],
+        "actual_expense": {"value": round(entry["expense"], 2), "currency": currencies.get(entry["currency_id"])},
+        "cost_per_engagement": round(cost, 2) if cost is not None else None,
+        "days_running": round(entry["days"], 1),
+        "engagement_per_day": round(entry["per_day"], 2),
+        "started_at": record.get("startedAt"), "ended_at": record.get("endedAt"),
+    }
+
+
+async def _started_campaigns(payload: Dict[str, Any], tz_name: str) -> Tuple[List[Dict[str, Any]], int]:
+    """Every campaign that left DRAFT (optionally started in a local date range): (rows, total in Kylas)."""
+    filters: List[Dict[str, Any]] = [{"field": "status", "operator": "in", "value": _STARTED_CAMPAIGN_STATUSES}]
+    for key, operator in (("started_from", "greater_or_equal"), ("started_to", "less_or_equal")):
+        if payload.get(key):
+            filters.append({"field": "startedAt", "operator": operator,
+                            "value": _parse_local_date(payload[key], key).isoformat()})
+    body = build_campaign_json_rule(filters, CAMPAIGN_FILTER_FIELDS, tz_name)
+
+    async def page(number: int) -> Dict[str, Any]:
+        return await _campaign_call("POST", "/v1/campaigns/search", "Search campaigns",
+                                    params={"page": number, "size": MAX_PAGE_SIZE, "sort": "id,asc"}, body=body) or {}
+
+    first = await page(0)
+    total = int(first.get("totalElements") or 0)
+    pages = min(-(-total // MAX_PAGE_SIZE), _PERFORMANCE_MAX_PAGES)
+    rest = await asyncio.gather(*(page(n) for n in range(1, pages)))
+    return [c for data in (first, *rest) for c in data.get("content") or []], total
+
+
+def _performance_args(payload: Dict[str, Any]) -> Tuple[Optional[str], str, int]:
+    channel = str(payload.get("channel") or "").strip().upper() or None
+    if channel and channel not in _SCORED_TYPES:
+        raise ValueError("'channel' must be EMAIL or WHATSAPP (call results aren't in this data), or left out.")
+    rank_by = str(payload.get("rank_by") or "balanced").strip().lower()
+    if rank_by not in PERFORMANCE_RANK_BY:
+        raise ValueError(f"'rank_by' must be one of {PERFORMANCE_RANK_BY}.")
+    top = payload.get("top", PERFORMANCE_DEFAULT_TOP)
+    if isinstance(top, bool) or not isinstance(top, (int, str)) or not str(top).strip().isdigit() \
+            or not 1 <= int(top) <= PERFORMANCE_MAX_TOP:
+        raise ValueError(f"'top' must be a whole number from 1 to {PERFORMANCE_MAX_TOP}.")
+    dates = {k: _parse_local_date(payload[k], k) for k in ("started_from", "started_to") if payload.get(k)}
+    if len(dates) == 2 and dates["started_from"] > dates["started_to"]:
+        raise ValueError("'started_from' must be on or before 'started_to'.")
+    return channel, rank_by, int(top)
+
+
+async def campaign_performance_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Rank past campaigns (balanced score) and show the setup of the best ones' activities. Read-only."""
+    channel, rank_by, top = _performance_args(payload)
+    tz_name = await _resolve_timezone(payload.get("timezone"))
+    campaigns, total = await _started_campaigns(payload, tz_name)
+    now = datetime.now(dt_timezone.utc)
+    entries, skipped = _performance_candidates(campaigns, channel, now)
+    result: Dict[str, Any] = {
+        "ranked_by": ("balanced: engagement 45%, cost per engagement 40%, engagement per day 15% — each part "
+                      "scored 0-100 by position among the compared campaigns") if rank_by == "balanced" else rank_by,
+        "channel": channel or "EMAIL and WHATSAPP",
+        "compared": len(entries),
+        "skipped": {k: v for k, v in skipped.items() if v},
+    }
+    if total > len(campaigns):
+        result["only_first"] = f"Compared the first {len(campaigns)} of {total} started campaigns."
+    if not entries:
+        result.update({"top": [], "note": "No started campaign has EMAIL or WHATSAPP activities that ran, so "
+                                          "there is nothing to compare. Tell the user that plainly."})
+        return result
+
+    _score(entries)
+    ranked = sorted(entries, key=_PERFORMANCE_ORDER[rank_by])
+    chosen = ranked[:top]
+
+    # The best activity of each channel, scored the same way among that channel's activities.
+    best: Dict[str, Dict[str, Any]] = {}
+    for activity_type in ([channel] if channel else _SCORED_TYPES):
+        group = [{"record": a, "campaign": e["record"], "currency_id": e["currency_id"],
+                  **_performance_numbers(a, [a], now)}
+                 for e in entries for a in e["activities"] if a.get("type") == activity_type]
+        if group:
+            _score(group)
+            winner = next((g for g in sorted(group, key=_PERFORMANCE_ORDER[rank_by]) if g["engagement"] > 0), None)
+            if winner:
+                best[activity_type] = winner
+
+    # One field-list call per entity whose audiences are shown, to rebuild them as create input.
+    shown = [a for e in chosen for a in e["activities"]] + [w["record"] for w in best.values()]
+    entities = sorted({str(a.get("entity") or "").upper() for a in shown} & set(_AUDIENCE_FIELD_FETCHERS))
+    fetched = await asyncio.gather(*(_AUDIENCE_FIELD_FETCHERS[x]() for x in entities), return_exceptions=True)
+    fields = {x: None if isinstance(f, BaseException) else f for x, f in zip(entities, fetched)}
+    currencies = await _currency_names()
+
+    def audience(activity: Dict[str, Any]) -> Dict[str, Any]:
+        entity = str(activity.get("entity") or "").upper()
+        rules = ((activity.get("filters") or {}).get("jsonRule") or {}).get("rules") or []
+        if not fields.get(entity):
+            return {"audience_filters": [], "readable": [], "cannot_reuse": [],
+                    "warnings": [f"The {entity.lower() or 'audience'} field list couldn't be read, so this audience "
+                                 "can't be rebuilt: ask the user for the audience."]}
+        return rebuild_audience(entity, rules, fields[entity], tz_name)
+
+    result["top"] = [
+        {"rank": i, **_performance_row(e, currencies),
+         "activities": [_activity_setup(a, e["record"], audience(a)) for a in e["activities"]],
+         **({"not_scored": e["not_scored"]} if e["not_scored"] else {})}
+        for i, e in enumerate(chosen, 1)
+    ]
+    result["recommended_campaign_id"] = next((e["record"].get("id") for e in ranked if e["engagement"] > 0), None)
+    result["best_activity_per_channel"] = {
+        t: {**_performance_row(w, currencies),
+            "campaign": {"id": w["campaign"].get("id"), "name": w["campaign"].get("name")},
+            "setup": _activity_setup(w["record"], w["campaign"], audience(w["record"]))}
+        for t, w in best.items()
+    }
+    if len({e["currency_id"] for e in entries}) > 1:
+        result["currencies_note"] = "Campaigns use different currencies; cost was only compared within one currency."
+    result["not_measured"] = ("Open / read / delivery rates, conversions and call results aren't in this data, so "
+                              "they aren't part of the score. Totals favour campaigns with bigger audiences.")
+    if result["recommended_campaign_id"] is None:
+        result["note"] = ("None of these campaigns has any engagement yet, so none can be recommended. Show the "
+                          "table and tell the user that plainly.")
+    return result
+
+
 _ALL_FILTER_OPERATORS = sorted(set(_ID_OPS + _TEXT_OPS + _NUMBER_OPS + _DATE_OPS))
 
 
@@ -2218,6 +2623,22 @@ CAMPAIGN_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
     },
     "campaign.currencies": {"type": "object", "properties": {}},
+    "campaign.performance": {
+        "type": "object",
+        "properties": {
+            "channel": {"type": "string", "enum": list(_SCORED_TYPES),
+                        "description": "Compare only this channel's activities; leave out for both."},
+            "started_from": {"type": "string", "format": "date",
+                             "description": "Only campaigns started on or after this local date YYYY-MM-DD."},
+            "started_to": {"type": "string", "format": "date",
+                           "description": "Only campaigns started on or before this local date YYYY-MM-DD."},
+            "rank_by": {"type": "string", "enum": PERFORMANCE_RANK_BY, "default": "balanced",
+                        "description": "Leave out (balanced) unless the user asks to rank by one measure."},
+            "top": {"type": "integer", "minimum": 1, "maximum": PERFORMANCE_MAX_TOP,
+                    "default": PERFORMANCE_DEFAULT_TOP, "description": "How many campaigns to return in detail."},
+            "timezone": {"type": "string", "description": "IANA timezone; defaults to the current user's."},
+        },
+    },
     **{f"campaign.{action}": {
         "type": "object",
         "properties": {
@@ -2308,6 +2729,7 @@ CAMPAIGN_ROUTERS: Dict[str, CampaignRouter] = {
     "campaign_activity.recipients": activity_recipients_logic,
     "campaign_activity.generated_records": activity_generated_records_logic,
     "campaign.currencies": currencies_logic,
+    "campaign.performance": campaign_performance_logic,
     **{f"{level}.{action}": _lifecycle_router(level, action)
        for level in ("campaign", "campaign_activity") for action in ("start", "pause", "resume", "complete")},
     "campaign.create": create_campaign_logic,

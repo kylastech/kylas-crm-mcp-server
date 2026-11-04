@@ -207,7 +207,9 @@ Not every bucket has every intent:
   - campaign: search, get, analytics, lookup (campaign.currencies), create, update, start, pause, resume,
     complete (marketing campaigns:
     campaign.search finds them, campaign.get returns one with its activities, campaign.analytics gives engagement
-    per day). create/update/start are always TWO calls: a preview that changes nothing,
+    per day, campaign.performance ranks past campaigns and shows what the best ones sent and to whom — use it in
+    ONE call for "best / top performing campaigns" and before creating a campaign "based on my previous ones").
+    create/update/start are always TWO calls: a preview that changes nothing,
     then — only after the user says Yes — the same call with confirm: true. START sends real emails /
     WhatsApp messages: never confirm it without the user's explicit Yes. PAUSE, RESUME and COMPLETE are ONE
     call that runs straight away (RESUME sends real messages again; COMPLETE is final), so call them only when

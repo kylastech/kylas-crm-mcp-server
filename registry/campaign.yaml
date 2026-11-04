@@ -138,6 +138,52 @@
     date_from: "2026-10-01"
     date_to: "2026-10-31"
 
+- id: campaign.performance
+  bucket: campaign
+  intent: analytics
+  method: POST
+  path: /v1/campaigns/search
+  dynamic_fields: false
+  description: "Rank past campaigns by performance and show what the best ones sent and to whom — for 'which campaigns did best' and 'create a new campaign like my best one'. Read-only."
+  usage_notes: >
+    Use this — one call — for any "best / top / most engaging / performing"
+    campaign question, and before building a new campaign "based on my
+    previous campaigns". Never call campaign.get or campaign.analytics for
+    each campaign to compare them.
+
+    It compares every campaign that has started (DRAFT ones never ran).
+    Only EMAIL and WHATSAPP activities that ran count: engagement is email
+    opens + WhatsApp reads; CALL results aren't in this data. Balanced
+    score (default): engagement 45% + cost per engagement 40% + engagement
+    per day 15%, each part 0-100 by position among the compared campaigns
+    (cost only within the same currency). Actual expense 0 gives a
+    "partial" score with a neutral cost part. New campaigns are included;
+    for speed their days count as at least 7.
+
+    Inputs (all optional): channel EMAIL / WHATSAPP; started_from /
+    started_to (local dates); rank_by balanced (default) / engagement /
+    cost / speed — only when the user asks for one measure; top (default 5,
+    max 10).
+
+    Returns top[] (score, parts, engagement, cost per engagement, days
+    running, and each counted activity's setup: type, entity, sent_to,
+    template / account, retry_times, budget share and audience),
+    recommended_campaign_id and best_activity_per_channel. audience has
+    audience_filters already in campaign_activity.create format, readable
+    (to show the user), cannot_reuse (conditions that can't be rebuilt, with
+    why) and warnings (fixed dates, specific records).
+
+    Then: show a table, say why #1 leads, recommend one and let the user
+    choose (a campaign, or up to 4 activities). To build the new one:
+    campaign.create, then campaign_activity.create per chosen activity with
+    audience.audience_filters as given — each with its own preview and Yes.
+    Ask about every cannot_reuse condition and say the same audience reaches
+    the same people again. Describe what worked; don't claim a condition
+    causes engagement. Never start the new campaign unless the user asks.
+  example:
+    channel: WHATSAPP
+    started_from: "2026-08-01"
+
 - id: campaign.currencies
   bucket: campaign
   intent: lookup
@@ -153,7 +199,7 @@
   example: {}
 
 # ---------------------------------------------------------------------------
-# Writes (Plan 2). Every write is TWO calls: a preview that writes nothing, then
+#Every write is TWO calls: a preview that writes nothing, then
 # — only after the user says Yes — the same call with confirm: true. The server
 # enforces this.
 # ---------------------------------------------------------------------------

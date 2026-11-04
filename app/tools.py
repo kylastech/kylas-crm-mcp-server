@@ -801,7 +801,8 @@ def list_tool(
       report / chart; report.preview — runs the same report and returns its
       numbers WITHOUT saving; both need entity="<entity>" in build_payload);
       campaign has search, get, analytics (campaign.analytics: engagement per
-      day for one marketing campaign), lookup (campaign.currencies), create,
+      day for one marketing campaign; campaign.performance: ranks past
+      campaigns and shows the best ones' setup), lookup (campaign.currencies), create,
       update, start, pause, resume and complete (create/update/start are two
       calls: preview, then confirm; pause/resume/complete run at once;
       start/resume send real messages); campaign_activity has
