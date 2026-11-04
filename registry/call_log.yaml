@@ -198,10 +198,6 @@
     "outgoing", "startTime": "2026-05-10T08:00:00.000Z", "phoneNumber":
     "9876543210", "relatedTo": {"id": <lead_id>, "entity": "lead",
     "phoneNumber": "9876543210"}}.
-
-    Same picklist-internal-name and never-guess-IDs rules as call_log.create
-    apply — see call_log.create's usage_notes for the full rules; not
-    repeated verbatim here to avoid duplicating the same text twice.
   example:
     entity_id: 321
     outcome: "connected"

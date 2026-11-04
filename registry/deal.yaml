@@ -305,11 +305,4 @@
     "associatedContacts": [{"id": 4942095, "name": "Alice"}], "products":
     [{"id": 245208, "quantity": 2}]} — existing products/contacts are
     preserved, new ones are merged (duplicates by ID skipped).
-
-    All the same rules as deal.create apply to any other field being
-    changed here (monetary field wrapping, picklist Option ID exceptions,
-    customFieldValues internal-name rule, date/datetime UTC conversion,
-    never guessing ownedBy) — see deal.create's usage_notes for the full
-    rules; not repeated verbatim here to avoid duplicating the same text
-    twice.
   example: {entity_id: 12345, pipelineStage: 67890}
