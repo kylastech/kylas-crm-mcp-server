@@ -620,6 +620,7 @@ def resolve_picklist_values(
     wrap: bool = False,
     name_fields: Optional[set] = None,
     wrap_name: bool = False,
+    only: Optional[set] = None,
 ) -> Dict[str, Any]:
     """Send picklist fields as Kylas wants them on create/update.
 
@@ -635,6 +636,8 @@ def resolve_picklist_values(
       wrap=True   {"id": id} (companies, deals, meetings, call logs); multi -> [{"id": id}]
                   plus "name" with wrap_name (meetings store it on the lookup)
       An object that already holds an id is sent exactly as given (wrap=True).
+      only: when given, the picklists to resolve; every other field is sent
+                  exactly as the caller wrote it.
       name_fields / an `internal` custom field: the option's internal name
                   (lead/contact companyIndustry, country, timezone, ...)
     """
@@ -643,6 +646,8 @@ def resolve_picklist_values(
     by_name: Dict[str, bool] = {}
     for field in fields or []:
         if field.get("type") not in ("PICK_LIST", "MULTI_PICKLIST") or not field.get("name"):
+            continue
+        if only is not None and field["name"] not in only:
             continue
         picklist = field.get("picklist") or {}
         options = picklist.get("values") or picklist.get("picklistValues") or []

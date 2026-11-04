@@ -14,9 +14,14 @@ sd-call):
     contact    plain id         ownerId: n           -
     company    {id}             ownedBy: {id}        -
     deal       {id}             ownedBy: {id}        {id, stage: {id}} / [{id, ...}]
-    meeting    {id}             owner: {id}          -
+    meeting    {id, name}       owner: {id}          -
     call_log   {id}             ownerId: n           -
     task       plain id         (unchanged)          -
+
+Only these picklists are resolved: every picklist of a lead, contact,
+company or deal (their create notes document the shape for all of them);
+task status/priority/type/reminder; meeting timezone; call log
+callDisposition/customerEmotion. Any other field is sent as written.
 
 Lead/contact companyIndustry, companyBusinessType, country, timezone,
 companyCountry and requirementCurrency take the option's internal NAME, as
@@ -46,9 +51,18 @@ _RULES: Dict[str, Dict[str, Any]] = {
                  "owner": ("ownerId", False)},
     "company":  {"wrap": True, "owner": ("ownedBy", True)},
     "deal":     {"wrap": True, "owner": ("ownedBy", True), "pipeline": "DEAL", "products": True},
-    "meeting":  {"wrap": True, "wrap_name": True, "owner": ("owner", True)},
-    "call_log": {"wrap": True, "owner": ("ownerId", False)},
-    "task":     {"wrap": False},
+    # "picklists": the only picklists resolved from a name — those whose shape
+    # is documented in the entity's create notes and checked against the
+    # service. Any other field goes out exactly as written (as before this
+    # resolver existed): a field list cannot tell a picklist taking {"id": n}
+    # from one the service stores as text, e.g. sd-call's overallSentiment is a
+    # PICK_LIST on older tenants yet an {"id": n} there is silently dropped.
+    # No "picklists" key (lead, contact, company, deal): every picklist, as
+    # their create notes give the shape for all of them.
+    "meeting":  {"wrap": True, "wrap_name": True, "owner": ("owner", True), "picklists": {"timezone"}},
+    "call_log": {"wrap": True, "owner": ("ownerId", False), "picklists": {"callDisposition", "customerEmotion"}},
+    "task":     {"wrap": False, "name_fields": {"reminder"},
+                 "picklists": {"status", "priority", "type", "reminder"}},
 }
 
 # An entity's field metadata changes on an admin's edit, not per call: held
@@ -111,7 +125,8 @@ def _pick(kind: str, wanted: str, rows: List[Dict[str, Any]], field: str) -> int
     if len(chosen) == 1 and chosen[0].get("id") is not None:
         return int(chosen[0]["id"])
     if not chosen:
-        raise ValueError(f"No {kind} named '{wanted}' for {field}. Check the name, or send its id.")
+        raise ValueError(f"No {kind} named '{wanted}' among the {len(rows)} {kind}(s) the lookup returned "
+                         f"for {field}. Find it with {kind}.lookup and send its id.")
     names = ", ".join(f"{r.get('name') or r.get('displayName')}={r.get('id')}" for r in chosen[:15])
     raise ValueError(f"'{wanted}' matches several {kind}s for {field}: {names}. "
                      f"Ask which one is meant and send its id.")
@@ -246,14 +261,18 @@ async def resolve_references(entity: str, payload: Dict[str, Any],
             logger.warning("Could not read %s fields to resolve picklists; sending them as given: %s", entity, e)
             fields = []
         options = dict(wrap=rules.get("wrap", False), name_fields=set(rules.get("name_fields") or ()),
-                       wrap_name=rules.get("wrap_name", False))
+                       wrap_name=rules.get("wrap_name", False), only=rules.get("picklists"))
         try:
             resolved = resolve_picklist_values(resolved, fields, **options)
-        except ValueError:
+        except ValueError as not_an_option:
             # The held field list may predate an option an admin just added:
             # read it again once before saying a value is not an option.
             _FIELDS.pop((entity, _caller()), None)
-            resolved = resolve_picklist_values(resolved, await _fields(entity, fetch_fields), **options)
+            try:
+                fresh = await _fields(entity, fetch_fields)
+            except Exception:  # noqa: BLE001 - the value's own problem is the one to report
+                raise not_an_option from None
+            resolved = resolve_picklist_values(resolved, fresh, **options)
     if rules.get("owner"):
         await _owner(resolved, *rules["owner"])
     if rules.get("pipeline"):

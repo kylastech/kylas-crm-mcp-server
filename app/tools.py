@@ -1091,8 +1091,9 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
     if create_entry and create_entry.get("usage_notes"):
         # Update notes say "the same rules as <bucket>.create apply"; a caller on
         # the update step never fetches those, so they are given here in full.
-        usage_notes = (f"{usage_notes}\n\nRules from {create_entry['id']} (they apply to every "
-                       f"field you change here):\n{create_entry['usage_notes']}")
+        usage_notes = (f"{usage_notes}\n\nRules from {create_entry['id']} for the fields you change "
+                       f"here (its required fields and what to ask before creating are for a new record, "
+                       f"not for this update):\n{create_entry['usage_notes']}")
     # method/path/dynamic_fields are not sent: execute_request knows how to
     # call the endpoint, and "fetched_live" already says whether live fields came.
     for key in ("tenant_fields_reference",):
