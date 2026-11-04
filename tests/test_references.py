@@ -57,8 +57,8 @@ async def test_a_lead_custom_multi_picklist_takes_a_list_of_ids():
 
 @pytest.mark.fields
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entity", ["deal", "company", "meeting", "call_log"])
-async def test_deal_company_meeting_and_call_log_picklists_take_an_object(entity):
+@pytest.mark.parametrize("entity", ["deal", "company", "call_log"])
+async def test_deal_company_and_call_log_picklists_take_an_object(entity):
     out = await resolve_references(entity, {"source": "Google", "cfMultiPick": ["Pick two"]}, _fields)
     assert out["source"] == {"id": 11}
     assert out["cfMultiPick"] == [{"id": 71}]
@@ -121,7 +121,8 @@ async def test_an_owner_given_by_id_is_not_looked_up():
     lookup = AsyncMock()
     with patch("app.references._lookup", new=lookup):
         assert (await resolve_references("lead", {"ownerId": "4010"}))["ownerId"] == 4010
-        assert (await resolve_references("deal", {"ownedBy": {"id": 4010, "name": "x"}}))["ownedBy"] == {"id": 4010}
+        # An object that already has an id is sent as given, as before.
+        assert (await resolve_references("deal", {"ownedBy": {"id": 4010, "name": "x"}}))["ownedBy"] == {"id": 4010, "name": "x"}
     lookup.assert_not_called()
 
 
@@ -276,3 +277,55 @@ async def test_create_call_log_puts_the_number_in_related_to(related):
 
     sent = client.post.call_args.kwargs["json"]["relatedTo"]
     assert (sent[0] if isinstance(sent, list) else sent)["phoneNumber"] == "+919823289813"
+
+
+# --- what was already right goes out exactly as before -------------------------
+
+# sd-meetings' timezone is a plain PICK_LIST (is_internal: false), unlike a lead's.
+MEETING_TIMEZONE = _picklist("timezone", [(501, "Asia/Calcutta", "(GMT+05:30) Kolkata")])
+
+
+async def _meeting_fields():
+    return [SOURCE, MEETING_TIMEZONE]
+
+
+@pytest.mark.fields
+@pytest.mark.asyncio
+async def test_a_meeting_picklist_named_by_label_carries_its_name():
+    """sd-meetings stores the name on the timezone lookup it creates."""
+    out = await resolve_references("meeting", {"timezone": "(GMT+05:30) Kolkata"}, _meeting_fields)
+    assert out["timezone"] == {"id": 501, "name": "Asia/Calcutta"}
+
+
+@pytest.mark.fields
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entity, payload", [
+    ("deal", {"source": {"id": 11, "name": "GOOGLE"}, "ownedBy": {"id": 8238, "name": "Akash"},
+              "pipeline": {"id": 3, "name": "Sales", "stage": {"id": 9, "name": "Open"}},
+              "products": [{"id": 4, "name": "Pen", "quantity": 2}]}),
+    ("company", {"source": {"id": 12}, "ownedBy": {"id": 8238, "name": "Akash"}}),
+    ("meeting", {"timezone": {"id": 501, "name": "Asia/Calcutta"}, "owner": {"id": 8238, "entity": "user"},
+                 "medium": "OFFLINE", "status": "scheduled", "location": "Office"}),
+    ("call_log", {"source": {"id": 11}, "ownerId": 8238, "callType": "outgoing", "outcome": "connected"}),
+    ("lead", {"source": 11, "ownerId": 8238, "timezone": "Asia/Calcutta",
+              "pipeline": {"id": 3, "stage": {"id": 9}}, "firstName": "A"}),
+    ("contact", {"source": 12, "ownerId": 8238, "lastName": "B"}),
+    ("task", {"source": 11, "name": "Call back"}),
+])
+async def test_a_payload_already_in_kylas_shape_is_sent_unchanged(entity, payload):
+    """The resolver only fills in names; ids and objects the old server sent
+    as given still go out byte for byte."""
+    with patch.object(references, "_lookup", AsyncMock(side_effect=AssertionError("no lookup"))):
+        out = await resolve_references(entity, payload, _meeting_fields if entity == "meeting" else _fields)
+    assert out == payload
+
+
+@pytest.mark.asyncio
+async def test_unreadable_fields_do_not_block_the_write():
+    references.forget_fields()
+
+    async def broken():
+        raise RuntimeError("403 on fields")
+
+    out = await resolve_references("deal", {"source": {"id": 11}, "name": "D"}, broken)
+    assert out == {"source": {"id": 11}, "name": "D"}

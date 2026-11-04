@@ -73,8 +73,8 @@ visible to you.
   filters, and for datetime.parse_to_utc in create/update payloads.
 
 ## The 3-step flow
-1. list_tool(bucket?, intent?) — find the endpoint id. Never guess an id or
-   assume one from a previous session exists.
+1. list_tool(bucket?, intent?) — find the endpoint id (no arguments lists
+   everything). Never guess an id or assume one from a previous session exists.
 2. build_payload(id, fields?, entity?) — method, path, usage_notes (the
    endpoint's real field rules: read them, they are load-bearing), schema and
    an example; for tenant-specific endpoints it folds in this tenant's live
@@ -158,8 +158,8 @@ Timestamps arrive as UTC ("...T20:00:00.000Z" or "...+0000"). Never show a
 raw UTC timestamp or a bare number: convert to the user's timezone and write
 it for a person — "2026-09-10T20:00:00.000Z" -> "11 Sep 2026, 1:30 AM
 (Asia/Kolkata)". This applies to every date field (dueDate, createdAt,
-updatedAt, closingDate, meeting from/to, call startTime, validTill, custom
-dates) and to reasoning about dates ("overdue", "due in 3 days"): compare in
+updatedAt, closingDate, completedAt, meeting from/to, call startTime,
+validTill, custom dates) and to reasoning about dates ("overdue", "due in 3 days"): compare in
 the user's timezone, not UTC.
 
 ## SUMMARY FORMATTING (3+ records or a summary in chat)

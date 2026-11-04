@@ -27,12 +27,15 @@ be — the caller fixes it in one retry rather than guessing.
 """
 
 import hashlib
+import logging
 import json
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from app.client import _resolve_auth_headers, get_client, handle_api_response
 from app.helpers import PICKLIST_FIELDS_USE_INTERNAL_NAME, resolve_picklist_values
+
+logger = logging.getLogger(__name__)
 
 FieldsFetcher = Callable[[], Awaitable[List[Dict[str, Any]]]]
 
@@ -43,7 +46,7 @@ _RULES: Dict[str, Dict[str, Any]] = {
                  "owner": ("ownerId", False)},
     "company":  {"wrap": True, "owner": ("ownedBy", True)},
     "deal":     {"wrap": True, "owner": ("ownedBy", True), "pipeline": "DEAL", "products": True},
-    "meeting":  {"wrap": True, "owner": ("owner", True)},
+    "meeting":  {"wrap": True, "wrap_name": True, "owner": ("owner", True)},
     "call_log": {"wrap": True, "owner": ("ownerId", False)},
     "task":     {"wrap": False},
 }
@@ -172,6 +175,8 @@ async def _owner(payload: Dict[str, Any], field: str, wrap: bool) -> None:
     if field not in payload or payload[field] in (None, ""):
         return
     value = payload[field]
+    if wrap and isinstance(value, dict) and _id_of(value) is not None:
+        return                            # already {"id": ...}: sent as given
     owner_id = _id_of(value)
     if owner_id is None:
         name = _name_of(value)
@@ -185,6 +190,9 @@ async def _pipeline(payload: Dict[str, Any], entity_type: str) -> None:
     value = payload.get("pipeline")
     if value in (None, "", {}):
         return
+    if isinstance(value, dict) and _id_of(value) is not None and (
+            value.get("stage") in (None, "", {}) or _id_of(value["stage"]) is not None):
+        return                            # ids already given: sent as given
     if not isinstance(value, dict):
         value = {"id": value} if _is_id(value) else {"name": value}
     pipeline_id = _id_of(value)
@@ -230,9 +238,14 @@ async def resolve_references(entity: str, payload: Dict[str, Any],
     rules = _RULES.get(entity, {})
     resolved = dict(payload)
     if fetch_fields is not None:
+        try:
+            fields = await _fields(entity, fetch_fields)
+        except Exception as e:  # noqa: BLE001 - not being able to read the fields must not block a write
+            logger.warning("Could not read %s fields to resolve picklists; sending them as given: %s", entity, e)
+            fields = []
         resolved = resolve_picklist_values(
-            resolved, await _fields(entity, fetch_fields),
-            wrap=rules.get("wrap", False), name_fields=set(rules.get("name_fields") or ()))
+            resolved, fields, wrap=rules.get("wrap", False),
+            name_fields=set(rules.get("name_fields") or ()), wrap_name=rules.get("wrap_name", False))
     if rules.get("owner"):
         await _owner(resolved, *rules["owner"])
     if rules.get("pipeline"):

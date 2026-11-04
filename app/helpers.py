@@ -618,6 +618,7 @@ def resolve_picklist_values(
     fields: List[Dict[str, Any]],
     wrap: bool = False,
     name_fields: Optional[set] = None,
+    wrap_name: bool = False,
 ) -> Dict[str, Any]:
     """Send picklist fields as Kylas wants them on create/update.
 
@@ -631,6 +632,8 @@ def resolve_picklist_values(
     What is sent depends on the entity (see the core services):
       wrap=False  the plain id (leads, contacts, tasks); multi -> [id, ...]
       wrap=True   {"id": id} (companies, deals, meetings, call logs); multi -> [{"id": id}]
+                  plus "name" with wrap_name (meetings store it on the lookup)
+      An object that already holds an id is sent exactly as given (wrap=True).
       name_fields / an `internal` custom field: the option's internal name
                   (lead/contact companyIndustry, country, timezone, ...)
     """
@@ -686,10 +689,17 @@ def resolve_picklist_values(
     def _one(name: str, value: Any) -> Any:
         if value is None or isinstance(value, bool):
             return value
+        if (wrap and not by_name[name] and isinstance(value, dict)
+                and str(value.get("id", "")).strip().isdigit()):
+            return value                  # already Kylas's shape: sent as before, extra keys kept
         option = _option(name, value)
         if by_name[name]:
             return option.get("name") if option.get("name") is not None else value
-        return {"id": int(option["id"])} if wrap else int(option["id"])
+        if not wrap:
+            return int(option["id"])
+        if wrap_name and option.get("name") is not None:
+            return {"id": int(option["id"]), "name": option["name"]}
+        return {"id": int(option["id"])}
 
     def _resolve(name: str, value: Any) -> Any:
         if isinstance(value, list):
