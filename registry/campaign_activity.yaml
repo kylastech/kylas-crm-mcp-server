@@ -366,3 +366,67 @@
   example:
     activity_name: "Welcome email"
     budget: 800
+
+- id: campaign_activity.start
+  bucket: campaign_activity
+  intent: start
+  method: POST
+  path: /v1/campaigns/{campaign_id}/activities/{activity_id}/start
+  dynamic_fields: false
+  description: "Start one DRAFT / FAILED activity — SENDS REAL messages. Two calls: preview, then confirm."
+  usage_notes: >
+    activity_id or activity_name (campaign_id optional; several matches
+    return a choice — ask first). Step 1 — preview (no confirm): nothing
+    happens; it shows what it sends (template / account), recipients_now
+    and a warning — and if its campaign is DRAFT or PAUSED, that starting
+    the activity also starts / resumes the campaign. Show all of it, say it
+    sends real messages, ask Yes / No. Step 2 — only after an explicit Yes:
+    the same call with confirm: true. Refused: not DRAFT / FAILED, a CALL
+    activity, or its audience doesn't match 1 to 10,000 records now.
+  example: {activity_name: "C2 Welcome email"}
+
+- id: campaign_activity.pause
+  bucket: campaign_activity
+  intent: pause
+  method: POST
+  path: /v1/campaigns/{campaign_id}/activities/{activity_id}/pause
+  dynamic_fields: false
+  description: "Pause a running or queued activity. One call — runs straight away, no preview."
+  usage_notes: >
+    activity_id or activity_name. Only IN_PROGRESS or QUEUED activities can
+    be paused (not CALL). Pause only stops sending and can be resumed, so it
+    runs at once with no preview and no confirm. If the name matches several
+    activities, ask which one first.
+  example: {activity_name: "C2 Welcome email"}
+
+- id: campaign_activity.resume
+  bucket: campaign_activity
+  intent: resume
+  method: POST
+  path: /v1/campaigns/{campaign_id}/activities/{activity_id}/resume
+  dynamic_fields: false
+  description: "Resume a PAUSED activity — SENDS REAL messages again. One call — runs straight away, no preview."
+  usage_notes: >
+    activity_id or activity_name. Only a PAUSED activity can be resumed; it
+    sends to the people it hasn't reached yet, and resumes its campaign too
+    if that is PAUSED. It runs at once with no preview and no confirm, so
+    call it only when the user clearly asks to resume this activity. If the
+    name matches several activities, ask which one first.
+  example: {activity_name: "C2 Welcome email"}
+
+- id: campaign_activity.complete
+  bucket: campaign_activity
+  intent: complete
+  method: POST
+  path: /v1/campaigns/{campaign_id}/activities/{activity_id}/complete
+  dynamic_fields: false
+  description: "Complete (stop for good) an activity. One call — runs straight away, no preview."
+  usage_notes: >
+    activity_id or activity_name. Possible while it is IN_PROGRESS, QUEUED,
+    PAUSED, PROCESSED or RETRYING. Final: anything not sent yet won't be
+    sent, and it can't be restarted. A campaign can only be completed once
+    all its activities are PROCESSED or COMPLETED. It runs at once with no
+    preview and no confirm, so call it only when the user clearly asks to
+    complete this activity. If the name matches several activities, ask
+    which one first.
+  example: {activity_name: "C2 Welcome email"}

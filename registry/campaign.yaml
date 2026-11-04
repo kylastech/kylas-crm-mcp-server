@@ -138,6 +138,52 @@
     date_from: "2026-10-01"
     date_to: "2026-10-31"
 
+- id: campaign.performance
+  bucket: campaign
+  intent: analytics
+  method: POST
+  path: /v1/campaigns/search
+  dynamic_fields: false
+  description: "Rank past campaigns by performance and show what the best ones sent and to whom — for 'which campaigns did best' and 'create a new campaign like my best one'. Read-only."
+  usage_notes: >
+    Use this — one call — for any "best / top / most engaging / performing"
+    campaign question, and before building a new campaign "based on my
+    previous campaigns". Never call campaign.get or campaign.analytics for
+    each campaign to compare them.
+
+    It compares every campaign that has started (DRAFT ones never ran).
+    Only EMAIL and WHATSAPP activities that ran count: engagement is email
+    opens + WhatsApp reads; CALL results aren't in this data. Balanced
+    score (default): engagement 45% + cost per engagement 40% + engagement
+    per day 15%, each part 0-100 by position among the compared campaigns
+    (cost only within the same currency). Actual expense 0 gives a
+    "partial" score with a neutral cost part. New campaigns are included;
+    for speed their days count as at least 7.
+
+    Inputs (all optional): channel EMAIL / WHATSAPP; started_from /
+    started_to (local dates); rank_by balanced (default) / engagement /
+    cost / speed — only when the user asks for one measure; top (default 5,
+    max 10).
+
+    Returns top[] (score, parts, engagement, cost per engagement, days
+    running, and each counted activity's setup: type, entity, sent_to,
+    template / account, retry_times, budget share and audience),
+    recommended_campaign_id and best_activity_per_channel. audience has
+    audience_filters already in campaign_activity.create format, readable
+    (to show the user), cannot_reuse (conditions that can't be rebuilt, with
+    why) and warnings (fixed dates, specific records).
+
+    Then: show a table, say why #1 leads, recommend one and let the user
+    choose (a campaign, or up to 4 activities). To build the new one:
+    campaign.create, then campaign_activity.create per chosen activity with
+    audience.audience_filters as given — each with its own preview and Yes.
+    Ask about every cannot_reuse condition and say the same audience reaches
+    the same people again. Describe what worked; don't claim a condition
+    causes engagement. Never start the new campaign unless the user asks.
+  example:
+    channel: WHATSAPP
+    started_from: "2026-08-01"
+
 - id: campaign.currencies
   bucket: campaign
   intent: lookup
@@ -153,7 +199,7 @@
   example: {}
 
 # ---------------------------------------------------------------------------
-# Writes (Plan 2). Every write is TWO calls: a preview that writes nothing, then
+#Every write is TWO calls: a preview that writes nothing, then
 # — only after the user says Yes — the same call with confirm: true. The server
 # enforces this.
 # ---------------------------------------------------------------------------
@@ -233,3 +279,77 @@
   example:
     campaign_name: "Diwali Offer"
     budget: {value: 75000}
+
+# Lifecycle START is two calls like create/update: a preview
+- id: campaign.start
+  bucket: campaign
+  intent: start
+  method: POST
+  path: /v1/campaigns/{campaign_id}/start
+  dynamic_fields: false
+  description: "Start a DRAFT campaign — SENDS REAL emails / WhatsApp messages. Two calls: preview, then confirm."
+  usage_notes: >
+    campaign_id or campaign_name (several name matches return a choice —
+    ask first). Step 1 — preview (no confirm): nothing happens. It shows
+    will_start (each activity, what it sends, its template/account and how
+    many recipients match now), skipped (activities that won't start: 0 or
+    more than 10,000 recipients), total_recipients, running_campaigns and a
+    warning. Show ALL of it, say clearly that confirming sends real messages
+    to those people, and ask a Yes / No question. Step 2 — only if the user
+    explicitly says Yes: the same call with confirm: true. No: stop.
+    Never start without that Yes in this conversation.
+
+    Refused before anything happens: the campaign isn't DRAFT, it has no
+    activities, any activity isn't DRAFT, it has CALL activities (not
+    supported here), no activity has 1 to 10,000 recipients, or the tenant
+    already runs 15 campaigns (Kylas's limit).
+  example: {campaign_name: "MCP C2 Test"}
+
+- id: campaign.pause
+  bucket: campaign
+  intent: pause
+  method: POST
+  path: /v1/campaigns/{campaign_id}/pause
+  dynamic_fields: false
+  description: "Pause an IN_PROGRESS campaign (its running activities stop sending). One call — runs straight away, no preview."
+  usage_notes: >
+    campaign_id or campaign_name. Only an IN_PROGRESS campaign can be
+    paused; its running / queued EMAIL and WHATSAPP activities pause too.
+    Pause only stops sending and can be resumed, so it runs at once with
+    no preview and no confirm — when the user asks to pause, just call it.
+    If the name matches several campaigns, ask which one first.
+  example: {campaign_name: "MCP C2 Test"}
+
+- id: campaign.resume
+  bucket: campaign
+  intent: resume
+  method: POST
+  path: /v1/campaigns/{campaign_id}/resume
+  dynamic_fields: false
+  description: "Resume a PAUSED campaign — SENDS REAL messages again. One call — runs straight away, no preview."
+  usage_notes: >
+    campaign_id or campaign_name. Only a PAUSED campaign can be resumed;
+    its PAUSED activities start sending again to the people they haven't
+    reached yet. It runs at once with no preview and no confirm, so call it
+    only when the user clearly asks to resume this campaign. If the name
+    matches several campaigns, ask which one first. Refused if the tenant
+    already runs 15 campaigns, or if a paused activity is CALL.
+  example: {campaign_name: "MCP C2 Test"}
+
+- id: campaign.complete
+  bucket: campaign
+  intent: complete
+  method: POST
+  path: /v1/campaigns/{campaign_id}/complete
+  dynamic_fields: false
+  description: "Complete (close) a campaign for good. One call — runs straight away, no preview."
+  usage_notes: >
+    campaign_id or campaign_name. Only an IN_PROGRESS, PAUSED or PROCESSED
+    campaign can be completed (never a DRAFT one), and only once every
+    activity is PROCESSED or COMPLETED — otherwise refused with the pending ones
+    (complete those activities first with campaign_activity.complete).
+    Final: a completed campaign can't be started or resumed again. It runs
+    at once with no preview and no confirm, so call it only when the user
+    clearly asks to complete this campaign. If the name matches several
+    campaigns, ask which one first.
+  example: {campaign_name: "MCP C2 Test"}

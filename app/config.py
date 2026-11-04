@@ -204,13 +204,20 @@ Not every bucket has every intent:
   - quotation: READ-ONLY — get, search, search_by_term, search_idle only (no create/update)
   - report: create, preview (report.create saves a report; report.preview shows its numbers without saving; build_payload needs entity="<entity>")
   - note: create (note.create — add notes to lead, contact, deal, company, meeting, call_log, task)
-  - campaign: search, get, analytics, lookup (campaign.currencies), create, update (marketing campaigns:
+  - campaign: search, get, analytics, lookup (campaign.currencies), create, update, start, pause, resume,
+    complete (marketing campaigns:
     campaign.search finds them, campaign.get returns one with its activities, campaign.analytics gives engagement
-    per day). create/update are always TWO calls: a preview that writes nothing, then — only after the user says
-    Yes — the same call with confirm: true. campaign.lookup /
+    per day, campaign.performance ranks past campaigns and shows what the best ones sent and to whom — use it in
+    ONE call for "best / top performing campaigns" and before creating a campaign "based on my previous ones").
+    create/update/start are always TWO calls: a preview that changes nothing,
+    then — only after the user says Yes — the same call with confirm: true. START sends real emails /
+    WhatsApp messages: never confirm it without the user's explicit Yes. PAUSE, RESUME and COMPLETE are ONE
+    call that runs straight away (RESUME sends real messages again; COMPLETE is final), so call them only when
+    the user clearly asks for that action on that campaign / activity. campaign.lookup /
     campaign.activities in _meta are only report-filter helpers — use the campaign bucket to answer campaign questions.
   - campaign_activity: search, get, analytics, lookups (email_templates, whatsapp_accounts, whatsapp_templates,
-    check_utm), create, update (EMAIL / WHATSAPP; two calls like campaign create/update), plus search-intent
+    check_utm), create, update, start, pause, resume, complete (EMAIL / WHATSAPP; create/update/start are two
+    calls like campaign writes, pause/resume/complete run at once; start/resume send real messages), plus search-intent
     recipients and generated_records
     (the email/WhatsApp/call activities inside campaigns: campaign_activity.analytics gives the sent/delivered/read
     funnel or call outcomes, campaign_activity.recipients who received it and what each did). Every id but search
