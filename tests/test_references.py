@@ -57,8 +57,8 @@ async def test_a_lead_custom_multi_picklist_takes_a_list_of_ids():
 
 @pytest.mark.fields
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entity", ["deal", "company", "call_log"])
-async def test_deal_company_and_call_log_picklists_take_an_object(entity):
+@pytest.mark.parametrize("entity", ["deal", "company"])
+async def test_deal_and_company_picklists_take_an_object(entity):
     out = await resolve_references(entity, {"source": "Google", "cfMultiPick": ["Pick two"]}, _fields)
     assert out["source"] == {"id": 11}
     assert out["cfMultiPick"] == [{"id": 71}]
@@ -144,7 +144,7 @@ async def test_an_exact_name_wins_over_partial_matches():
 @pytest.mark.asyncio
 async def test_an_unknown_owner_says_so():
     with patch("app.references._lookup", new=_lookup_by_name(USERS)), \
-            pytest.raises(ValueError, match="No user named 'Nobody' for ownerId"):
+            pytest.raises(ValueError, match="No user named 'Nobody' among the 0 user\(s\) the lookup returned for ownerId"):
         await resolve_references("lead", {"ownerId": "Nobody"})
 
 
@@ -383,3 +383,56 @@ async def test_an_option_added_after_the_fields_were_held_is_found():
     assert (await resolve_references("lead", {"source": "Google"}, fetch))["source"] == 11
     assert (await resolve_references("lead", {"source": "Expo"}, fetch))["source"] == 13
     assert len(calls) == 2
+
+
+# Shaped like QA's /v1/call-logs/fields: overallSentiment is a plain PICK_LIST
+# there, but sd-call's overall_sentiment is a Rails enum taking the string.
+CALL_LOG_FIELDS = [
+    _picklist("overallSentiment", [(38240, "positive", "Positive"), (38241, "negative", "Negative")]),
+    _picklist("callDisposition", [(56182, "interested", "Interested")]),
+    _picklist("customerEmotion", [(38243, "interested", "Interested")], multi=True),
+]
+
+
+async def _call_log_fields():
+    return CALL_LOG_FIELDS
+
+
+@pytest.mark.fields
+@pytest.mark.asyncio
+async def test_call_log_resolves_only_disposition_and_emotion():
+    """overallSentiment is a PICK_LIST on older tenants, but sd-call drops an
+    {"id": n} there without an error: it is sent exactly as written."""
+    out = await resolve_references("call_log", {"overallSentiment": "positive", "callDisposition": "Interested",
+                                                "customerEmotion": ["interested"]}, _call_log_fields)
+    assert out["overallSentiment"] == "positive"
+    assert out["callDisposition"] == {"id": 56182}
+    assert out["customerEmotion"] == [{"id": 38243}]
+
+
+@pytest.mark.fields
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entity, payload", [
+    ("call_log", {"overallSentiment": "Positive", "outcome": "connected", "callType": "outgoing"}),
+    ("meeting", {"status": "scheduled", "medium": "OFFLINE", "source": "Google"}),
+    ("task", {"source": "Google", "cfMultiPick": ["Pick two"]}),
+])
+async def test_picklists_off_the_allow_list_go_out_as_written(entity, payload):
+    """A field not checked against its service is never rewritten."""
+    assert await resolve_references(entity, payload, _fields) == payload
+
+
+@pytest.mark.fields
+@pytest.mark.asyncio
+async def test_a_failed_reread_still_reports_the_value_not_the_fetch():
+    references.forget_fields()
+    calls = []
+
+    async def fetch():
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("429 on fields")
+        return [_picklist("source", [(11, "GOOGLE", "Google")])]
+
+    with pytest.raises(ValueError, match="'Fax' is not an option of picklist field 'source'"):
+        await resolve_references("lead", {"source": "Fax"}, fetch)
