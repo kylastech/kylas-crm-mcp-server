@@ -173,7 +173,7 @@ def test_format_field_standard():
     assert len(lines) == 1
     assert "[STANDARD]" in lines[0]
     assert "'First Name'" in lines[0]
-    assert "API Name: 'firstName'" in lines[0]
+    assert "[STANDARD] firstName 'First Name' TEXT_FIELD" in lines[0]
     assert "*REQUIRED*" in lines[0]
 
 
@@ -193,10 +193,9 @@ def test_format_field_custom_with_picklist():
     }
     lines = _format_field(field)
     assert "[CUSTOM]" in lines[0]
-    assert "Field ID: '57300'" in lines[0]
-    assert "Options" in lines[1]
-    assert "Small (internal name: ''),(ID: 12345)" in lines[2]
-    assert "Large (internal name: ''),(ID: 67890)" in lines[3]
+    assert "companySize (customFieldValues; field id 57300)" in lines[0]
+    assert len(lines) == 2   # every option on one line
+    assert "(use ID in search): Small=12345; Large=67890" in lines[1]
 
 
 def test_format_field_omits_large_picklist_options():
@@ -305,10 +304,67 @@ def test_normalize_field_values_phone_numbers_single_primary():
 
 
 def test_normalize_field_values_phone_numbers_array_requires_country_code():
-    """phoneNumbers array without top-level phone_country_code must raise (do not assume India)."""
-    fv = {"phoneNumbers": [{"type": "MOBILE", "code": "IN", "value": "7447631718", "primary": True}]}
+    """A phone with no country anywhere must raise (do not assume India)."""
+    fv = {"phoneNumbers": [{"type": "MOBILE", "value": "7447631718", "primary": True}]}
     with pytest.raises(ValueError, match="country.*dial code"):
         _normalize_field_values(fv)
+
+
+def test_normalize_field_values_a_code_on_the_entry_alone_is_not_enough():
+    """As on dev: a "code" the model put on an entry may be a guess, so the
+    user must have been asked (top-level phone_country_code)."""
+    for entry in ({"type": "mobile", "code": "+91", "value": "7447631718"},
+                  {"phone": "7888108842", "phone_country_code": "IN"}):
+        with pytest.raises(ValueError, match="country/dial code was not"):
+            _normalize_field_values({"phoneNumbers": [entry]})
+
+
+def test_normalize_field_values_phone_numbers_keep_their_own_code():
+    fv = {"phone_country_code": "IN", "phoneNumbers": [{"type": "mobile", "code": "+1", "value": "4155550132"}]}
+    payload = _normalize_field_values(fv)
+    assert payload["phoneNumbers"] == [
+        {"type": "MOBILE", "code": "US", "value": "4155550132", "primary": True}]
+
+
+def test_normalize_field_values_phone_entries_in_the_shapes_models_send():
+    """The shape that failed six times: phone + phone_country_code inside the entry."""
+    fv = {"phone_country_code": "IN", "phoneNumbers": [{"phone": "7888108842", "phone_country_code": "IN"}]}
+    payload = _normalize_field_values(fv)
+    assert payload["phoneNumbers"] == [
+        {"type": "MOBILE", "code": "IN", "value": "7888108842", "primary": True}]
+
+
+def test_normalize_field_values_phone_entry_without_a_number_says_what_to_send():
+    fv = {"phone_country_code": "IN", "phoneNumbers": [{"code": "IN", "type": "MOBILE"}]}
+    with pytest.raises(ValueError, match="phoneNumbers.*value"):
+        _normalize_field_values(fv)
+
+
+TASK_FIELDS = [
+    {"name": "status", "type": "PICK_LIST", "standard": True,
+     "picklist": {"values": [{"id": 38256, "name": "OPEN", "displayName": "Open"},
+                             {"id": 38257, "name": "COMPLETED", "displayName": "Completed"}]}},
+    {"name": "type", "type": "PICK_LIST", "standard": True,
+     "picklist": {"values": [{"id": 38253, "name": "FOLLOW_UP", "displayName": "Follow up"}]}},
+    {"name": "cfStage", "type": "MULTI_PICKLIST", "standard": False,
+     "picklist": {"values": [{"id": 7, "name": "HOT", "displayName": "Hot"}]}},
+]
+
+
+def test_picklists_are_sent_as_option_ids_whatever_the_caller_sent():
+    from app.helpers import resolve_picklist_values
+    payload = {"name": "Call", "status": "OPEN", "type": "Follow Up",
+               "customFieldValues": {"cfStage": ["hot"], "cfNote": "x"}}
+    assert resolve_picklist_values(payload, TASK_FIELDS) == {
+        "name": "Call", "status": 38256, "type": 38253,
+        "customFieldValues": {"cfStage": [7], "cfNote": "x"}}
+    assert resolve_picklist_values({"status": "38257"}, TASK_FIELDS) == {"status": 38257}
+
+
+def test_an_unknown_picklist_value_lists_the_options():
+    from app.helpers import resolve_picklist_values
+    with pytest.raises(ValueError, match="Open=38256, Completed=38257"):
+        resolve_picklist_values({"status": "Done"}, TASK_FIELDS)
 
 
 def test_normalize_field_values_custom_fields():
@@ -375,10 +431,10 @@ async def test_get_lead_field_instructions_success():
         result = await get_lead_field_instructions_logic()
 
         assert "KYLAS CRM - LEAD FIELDS CHEAT SHEET" in result
-        assert "[STANDARD] 'First Name' (API Name: 'firstName')" in result
-        assert "[CUSTOM] 'Company Size' (Field ID: '57300'" in result
-        assert "Website (internal name: ''),(ID: 1001)" in result
-        assert "Small (internal name: ''),(ID: 12345)" in result
+        assert "[STANDARD] firstName 'First Name'" in result
+        assert "[CUSTOM] companySize (customFieldValues; field id 57300) 'Company Size'" in result
+        assert "Website=1001" in result
+        assert "Small=12345" in result
 
 
 @pytest.mark.asyncio
@@ -418,8 +474,8 @@ async def test_get_lead_field_instructions_omits_large_picklist():
         assert 'build_payload(id, fields=["timezone"])' in result
         assert "Asia/Calcutta" not in result
         # Non-large picklists are unaffected.
-        assert "Website (internal name: ''),(ID: 1001)" in result
-        assert "Small (internal name: ''),(ID: 12345)" in result
+        assert "Website=1001" in result
+        assert "Small=12345" in result
 
 
 @pytest.mark.asyncio
@@ -1850,11 +1906,11 @@ async def test_get_quotation_field_instructions_success():
         assert "KYLAS CRM - QUOTATION FIELDS CHEAT SHEET" in result
         assert "[STANDARD]" in result
         assert "'Summary'" in result
-        assert "'quotationNumber'" in result
-        assert "Draft (internal name: ''),(ID: 9001)" in result
+        assert "quotationNumber" in result
+        assert "Draft=9001" in result
         assert "## CUSTOM FIELDS" in result
         assert "'Region'" in result
-        assert "North (internal name: ''),(ID: 50001)" in result
+        assert "North=50001" in result
 
 
 def test_format_quotation_for_display_full():
@@ -2156,19 +2212,16 @@ async def test_build_payload_note_and_meeting_actions():
     # note.create
     note_payload = json.loads(await build_payload("note.create"))
     assert note_payload["id"] == "note.create"
-    assert note_payload["method"] == "POST"
     assert note_payload["schema"]["required"] == ["entity_type", "entity_id", "note_text"]
 
     # meeting.cancel
     cancel_payload = json.loads(await build_payload("meeting.cancel"))
     assert cancel_payload["id"] == "meeting.cancel"
-    assert cancel_payload["method"] == "POST"
     assert cancel_payload["schema"]["required"] == ["meeting_id"]
 
     # meeting.delete
     delete_payload = json.loads(await build_payload("meeting.delete"))
     assert delete_payload["id"] == "meeting.delete"
-    assert delete_payload["method"] == "DELETE"
     assert delete_payload["schema"]["required"] == ["meeting_id"]
 
 

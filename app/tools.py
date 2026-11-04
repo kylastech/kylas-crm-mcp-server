@@ -9,7 +9,7 @@ import yaml
 from app.config import logger
 from app.server import mcp
 from app.client import KylasAPIError, _reset_api_call_count
-from app.helpers import OPERATOR_MAPPING, _build_search_json_rule
+from app.helpers import OPERATOR_MAPPING, _build_search_json_rule, compact_text
 from app.reports import REPORT_PREVIEW_SCHEMA, create_report_logic, preview_report_logic
 from app.entities import (
     _build_call_log_search_json_rule,
@@ -308,6 +308,11 @@ async def search_entity_logic(
     try:
         result = await search_fn(filters, page=api_page, size=size, sort=sort)
         return result
+    except KylasAPIError as e:
+        # Kylas's own reason (e.g. which sort or filter it refused), not just
+        # "<operation> failed: 422".
+        detail = f"\n  Details: {e.response_body}" if e.response_body else ""
+        return f"Error searching {entity_type}: {e.message}{detail}"
     except Exception as e:
         return f"Error searching {entity_type}: {str(e)}"
 
@@ -747,58 +752,22 @@ def _load_registry(registry_dir: Path = _REGISTRY_DIR) -> Tuple[Dict[str, Any], 
 _REGISTRY_INDEX, _REGISTRY = _load_registry()
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
 def list_tool(
     bucket: Optional[str] = None,
     intent: Optional[str] = None,
 ) -> str:
     """
-    Step 1 of 3 in the generic CRM tool flow (list_tool -> build_payload ->
-    execute_request): find which endpoint id you need, before knowing anything
-    about its shape.
+    Step 1 of 3 (list_tool -> build_payload -> execute_request): find the
+    endpoint id you need. Returns only {"results": [{id, bucket, intent,
+    description}]} — never a schema (that is build_payload's job).
 
-    Returns ONLY a short summary row per match:
-      {"results": [{"id": "...", "bucket": "...", "intent": "...", "description": "..."}]}
-    Never method, path, a parameter schema, or an example — no matter how specific
-    bucket/intent are. That level of detail is build_payload(id)'s job alone.
-    This tool exists purely to narrow the full registry down to the one id you
-    actually need, without paying the cost of every endpoint's full schema.
-
-    It is always safe and cheap to call this with NO arguments to see everything
-    currently registered — do that first if you're not sure what's available, then
-    narrow with bucket/intent once you have a sense of what you're looking for.
-
-    Registry contents right now (this will grow — always confirm here rather than
-    assuming an id exists, since not every bucket has every intent):
-      buckets: lead, contact, deal, task, company, meeting, call_log, quotation, report, note, _meta
-      intents: get, search, search_by_term, search_idle, create, update, lookup, preview, cancel, delete
-      (lead/deal/company have all of get/search/search_by_term/search_idle/
-      create/update; contact has the same 5 minus search_idle; meeting has
-      the same 5 plus cancel, delete, and lookup (meeting.lookup_related);
-      task has get/search/search_by_term/create/update plus lookup
-      (task.lookup_entity, task.search_any_relation), no search_idle;
-      call_log has only search/create/update plus lookup (call_log.by_entity)
-      — no get, no search_by_term, no search_idle; note has create (note.create);
-      quotation is READ-ONLY — get/search/search_by_term/search_idle only, no create/update;
-      report has create and preview (report.create — creates and SAVES a real Kylas
-      report / chart; report.preview — runs the same report and returns its
-      numbers WITHOUT saving; both need entity="<entity>" in build_payload); _meta
-      is bucket-less and has lookup entries only (user.lookup,
-      product.lookup, pipeline.lookup, pipeline.details,
-      datetime.parse_to_utc, team.lookup, campaign.lookup,
-      campaign.activities, goal.lookup, goal.details). Call list_tool(bucket=...) to see exactly
-      which intents a given bucket actually has — don't assume parity
-      across buckets.)
-
-    bucket: restrict to one bucket (e.g. "lead", "contact", "deal", "task",
-      "company", "meeting", "call_log", "quotation", "report", "_meta"). Omit to search
-      every bucket.
-    intent: restrict to one intent — "get", "search", "search_by_term",
-      "search_idle", "create", "update", "lookup" or "preview". Omit to match any.
-
-    Example: list_tool(bucket="lead") returns all lead.* rows (get/search/
-    search_by_term/search_idle/create/update), each with its own id and
-    one-line description — nothing more.
+    bucket: lead, contact, deal, task, company, meeting, call_log, quotation,
+      report, note or _meta. Omit for every bucket.
+    intent: get, search, search_by_term, search_idle, create, update, lookup,
+      preview, cancel or delete. Omit for any.
+    Not every bucket has every intent — call with bucket=... rather than
+    assume an id exists.
     """
     results = []
     for entry in _REGISTRY.values():
@@ -883,12 +852,28 @@ def _lean_filter_field(f: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _filterable_fields_table(fields: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The filterable fields as build_payload sends them: each type's operators
+    once, then one "<filter field> | <label> | <type>" line per field. The
+    per-field form (_lean_filter_field) repeated the same operator list on all
+    ~70 fields of a search — most of a lead.search response."""
+    operators: Dict[str, List[str]] = {}
+    lines: List[str] = []
+    for f in fields:
+        lean = _lean_filter_field(f)
+        kind = f.get("type") or "TEXT_FIELD"
+        operators.setdefault(kind, lean["allowed_operators"])
+        lines.append(f"{lean['filter_field_path']} | {lean['displayName']} | {kind}")
+    return {"operators": operators, "fields": lines}
+
+
 async def _fold_field_metadata_into_schema(
     base_schema: Dict[str, Any],
     fetch_fields_fn: Any,
     for_search: bool,
     requested_picklists: Optional[List[str]] = None,
     bucket: Optional[str] = None,
+    for_update: bool = False,
 ) -> Dict[str, Any]:
     """
     Fetch this tenant's real field metadata for one bucket (via whichever
@@ -926,9 +911,9 @@ async def _fold_field_metadata_into_schema(
     picklist's options for filtering, exactly as it already did for
     create/update.
 
-    for_search additionally adds "tenant_filterable_fields": a lean
-    name/displayName/filter_field_path/allowed_operators table (via
-    _lean_filter_field) for filterable fields only — the one piece of
+    for_search additionally adds "tenant_filterable_fields": a compact
+    operators-per-type plus one-line-per-field table (via
+    _filterable_fields_table) for filterable fields only — the one piece of
     machine-readable structure the cheat-sheet prose doesn't carry, and which
     execute_request's filter-building depends on.
 
@@ -955,9 +940,8 @@ async def _fold_field_metadata_into_schema(
         )
 
     if for_search:
-        schema["tenant_filterable_fields"] = [
-            _lean_filter_field(f) for f in fields_meta if f.get("filterable", False)
-        ]
+        schema["tenant_filterable_fields"] = _filterable_fields_table(
+            [f for f in fields_meta if f.get("filterable", False)])
         return schema
 
     # Override the static YAML's "required" guess with the REAL required-field
@@ -967,6 +951,11 @@ async def _fold_field_metadata_into_schema(
     # registry originally hardcoded lead.create's required as
     # [firstName, lastName, email], but Kylas actually accepted a real create
     # with no email at all. Live data is the only real source of truth here.
+    # An update merges into the stored record (GET + merge + PUT), so it needs
+    # only the record's id — sending create's required fields again would
+    # overwrite values that changed meanwhile.
+    if for_update:
+        return schema
     live_required = [f.get("name") for f in fields_meta if f.get("standard", False) and f.get("required", False)]
     if live_required:
         schema["required"] = live_required
@@ -974,157 +963,38 @@ async def _fold_field_metadata_into_schema(
     return schema
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
 async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Optional[str] = None) -> str:
     """
-    Step 2 of 3 in the generic CRM tool flow: get everything about the ONE
-    endpoint you already picked via list_tool. Takes that id, plus an optional
-    "fields" hint (described at the bottom) that only controls how much
-    picklist detail comes back — never the values you're about to send. This
-    tool still never sees or checks those values; that only happens (if at
-    all) in execute_request, described there.
+    Step 2 of 3: everything about ONE endpoint id from list_tool — id,
+    read_only, usage_notes (the endpoint's real field rules; read them),
+    schema, example, fetched_live. It never validates your payload;
+    execute_request does.
 
-    REPORT ids (bucket "report": report.create, report.preview) ALSO REQUIRE the
-    "entity" argument — the CRM entity the report is about:
-      build_payload("report.create", entity="lead")
-    Valid entities: lead, deal, contact, company, task, meeting, call, email,
-    quotation (the STANDARD type). Calling a report id without entity returns
-    an error — just call again with entity set.
+    For tenant-specific endpoints (fetched_live true) it adds:
+      tenant_fields_reference - this tenant's real fields: *REQUIRED* /
+        [FILTERABLE] markers and picklist option id/name/label. Use these
+        option ids; never guess one.
+      tenant_filterable_fields - search ids only: {"operators": {type: [...]},
+        "fields": ["<filter field> | <label> | <type>", ...]}. Put the filter
+        field verbatim in a filter's "field" (custom fields are
+        "customFieldValues.<name>"), and take its operator ONLY from
+        operators[<its type>] — anything else is rejected.
+      live_fetch_error - the live fetch failed; the static parts are still right.
+    A "resolve_via": "<other id>" on a schema field: get that value through
+    <other id> first; never invent it.
 
-    Returns a JSON object with these fields:
-      id             - the id you asked for, echoed back.
-      method, path   - the real Kylas HTTP method and path for this endpoint,
-                       path params written as "{name}" (e.g. "/leads/{lead_id}").
-      usage_notes    - the ACTUAL rules for this one endpoint only: shorthand
-                       field formats, which picklist fields use a name instead
-                       of an Option ID, which fields must be resolved through
-                       another endpoint first, and any other constraint specific
-                       to it. Read this before building anything — it is not
-                       decorative, it is the real, load-bearing documentation
-                       for this endpoint (the same rules that used to live in
-                       this server's old global instructions, now scoped to
-                       exactly the one endpoint they apply to).
-      schema         - required/properties for the payload you need to build.
-                       If a field's own entry contains "resolve_via": "<other
-                       id>", do NOT invent a value for it — go run the full
-                       list_tool/build_payload/execute_request cycle on
-                       <other id> first, then use the real value it returns.
-      example        - one concrete, valid example payload for this endpoint.
-      dynamic_fields - true if this endpoint's real shape depends on THIS
-                       tenant's own custom fields/picklist options, which can
-                       only be known by asking Kylas directly (never static).
-      fetched_live   - true only if that tenant-specific data was actually
-                       fetched successfully on this call.
-      tenant_fields_reference - present only when dynamic_fields and
-                       fetched_live are both true: this tenant's REAL fields as
-                       a readable cheat sheet — the EXACT same text
-                       get_<bucket>_field_instructions returns (standard/custom
-                       fields, "*REQUIRED*"/"[FILTERABLE]" markers, real
-                       picklist option id/name/label per field), one shared
-                       formatter for both surfaces. Never placeholder data.
-                       A few oversized picklists (see "fields" below) get a
-                       one-line omission stub instead of their full option
-                       list — that is a deliberate size saving, not a fetch
-                       failure, and the stub tells you exactly how to get the
-                       real options when you need them (re-call build_payload
-                       naming that field in "fields").
-      tenant_filterable_fields - search ids only, present under the same
-                       condition as tenant_fields_reference: a lean
-                       name/displayName/filter_field_path/allowed_operators
-                       table for filterable fields — the two things the
-                       cheat-sheet text above doesn't carry, so filter-building
-                       stays machine-checkable:
-                         filter_field_path - the exact string to put in a
-                           filter's "field" key. Copy it verbatim; custom
-                           fields use a dotted "customFieldValues.<name>" path
-                           here.
-                         allowed_operators - the ONLY operators valid for that
-                           field's type (e.g. a DATE field cannot take
-                           "contains", and a CHECKBOX takes only
-                           equal/not_equal). Build every filter's "operator"
-                           from the list on THAT field — never guessed, and
-                           never copied from a field of a different type.
-                           Anything else is rejected before the request is
-                           sent. Symbols (">", ">=", "!=", "==") are accepted
-                           as shorthand and normalized, but the names in this
-                           list always work.
-                       For picklist option values (id/name/label) and whether
-                       a filterable picklist uses an internal name or a
-                       numeric id, read tenant_fields_reference instead — this
-                       table stays lean on purpose.
-      live_fetch_error - present only when dynamic_fields is true and the live
-                       fetch failed (e.g. no credentials configured yet). When
-                       this is present, everything else above — method, path,
-                       usage_notes, example — is still the real, correct static
-                       shape; only the tenant-specific enrichment is missing.
-                       Don't treat this field's presence as the whole call
-                       having failed.
-
-    This tool never validates the payload you build from this. Call
-    execute_request(id, payload) next to actually send it — a malformed payload
-    is caught there (or by Kylas itself), never here.
-
-    id: an endpoint id from list_tool (e.g. "lead.create", "contact.search").
-
-    fields: OPTIONAL. The names of the LARGE picklist fields you need the full
-      option list for — nothing else. This is not "the fields I intend to
-      set": every field of every type still comes back in full, with its name,
-      displayName and type, whether or not you pass this. Works the same on
-      create/update ids and search ids — on a search id it inlines the options
-      you need to build a filter on that picklist.
-
-      A handful of picklists on this tenant are enormous (timezone alone is
-      435 options / ~37 KB, which is 39% of a lead.create response). Their
-      option lists are OMITTED by default from "tenant_fields_reference" and
-      replaced with a one-line "N options omitted..." stub naming the exact
-      re-call that recovers them. Every other picklist — source, salutation,
-      campaign, companyEmployees, all custom picklists, and so on — is 9
-      options or fewer and is ALWAYS inlined in full. So the only reason to
-      pass this parameter is when the user has actually mentioned one of the
-      big ones.
-
-      The large picklists, with both spellings each concept goes by (entities
-      disagree on the name — a lead has "companyIndustry", a company has
-      "industry" — so pass whichever name you see in tenant_fields_reference):
-
-        timezone              - the user's/record's time zone (~435 options)
-        country               / companyCountry        (~247 options)
-        companyIndustry       / industry              (~147 options)
-        requirementCurrency                           (~165 options)
-        companyBusinessType   / businessType          (small, listed for
-                                                       consistency with the
-                                                       fields above)
-
-      Which of these exist depends on the entity: lead/contact have all of
-      them, company has the company-prefixed set plus timezone, meeting has
-      only timezone, and deal/task/call_log have none at all (their picklists
-      are small, so this parameter does nothing for those buckets).
-
-      Pass the names as a list, e.g. build_payload("lead.create",
-      fields=["country"]) when the user said "country India", or
-      build_payload("lead.search", fields=["country"]) when they asked for
-      leads in India, or fields=["country", "timezone"] for both. Matching is
-      case-insensitive. Names that aren't a large picklist on this bucket are
-      simply ignored — a wrong guess is never an error and never hides
-      anything, because everything else is returned in full regardless.
-
-      Omit it whenever the user's request doesn't touch one of the fields
-      above — that's the normal case and it is the cheap one.
-
-      You are never stuck: if tenant_fields_reference shows an "options
-      omitted" stub for a field you turn out to need, just call build_payload
-      again naming that field. Re-calling is idempotent. NEVER guess a
-      picklist option id or internal name to avoid the second call.
-
-    entity: REQUIRED for report ids (bucket "report"), ignored for every other
-      id. One of lead, deal, contact, company, task, meeting, call, email,
-      quotation — the STANDARD type (call get_entity_labels() if the user used
-      a renamed entity). The report reference (dimensions, metrics, date
-      fields, filters and their options) is fetched live for that entity, so a
-      report on a different entity needs a new build_payload call. "fields"
-      works here too: large picklist filters (country, timezone, ...) are
-      omitted unless named, e.g. build_payload("report.create", entity="lead",
-      fields=["country"]).
+    id: an endpoint id, e.g. "lead.create", "contact.search".
+    fields: OPTIONAL — only the LARGE picklists whose options you need, which
+      are otherwise omitted with a one-line stub: timezone, country /
+      companyCountry, companyIndustry / industry, requirementCurrency,
+      companyBusinessType / businessType. E.g. fields=["country"] when the user
+      says "country India" (create, update or search). Every other field is
+      always returned in full. Unknown names are ignored. deal, task and
+      call_log have no large picklists.
+    entity: REQUIRED for report ids (report.create, report.preview), ignored
+      otherwise — the standard type: lead, deal, contact, company, task,
+      meeting, call, email or quotation. "fields" works for report filters too.
     """
     entry = _REGISTRY.get(id)
     if not entry:
@@ -1207,6 +1077,7 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
                         for_search=(entry["intent"] == "search"),
                         requested_picklists=fields,
                         bucket=entry["bucket"],
+                        for_update=(entry["intent"] == "update"),
                     )
                     fetched_live = True
                 except KylasAPIError as e:
@@ -1215,14 +1086,27 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
                     # their own; only the live tenant field/picklist enrichment is missing.
                     live_fetch_error = e.message
 
+    usage_notes = entry.get("usage_notes", "")
+    create_entry = _REGISTRY.get(f"{entry['bucket']}.create") if entry["intent"] == "update" else None
+    if create_entry and create_entry.get("usage_notes"):
+        # Update notes say "the same rules as <bucket>.create apply"; a caller on
+        # the update step never fetches those, so they are given here in full.
+        usage_notes = (f"{usage_notes}\n\nRules from {create_entry['id']} for the fields you change "
+                       f"here (its required fields and what to ask before creating are for a new record, "
+                       f"not for this update):\n{create_entry['usage_notes']}")
+    # method/path/dynamic_fields are not sent: execute_request knows how to
+    # call the endpoint, and "fetched_live" already says whether live fields came.
+    for key in ("tenant_fields_reference",):
+        if isinstance(schema, dict) and isinstance(schema.get(key), str):
+            schema[key] = compact_text(schema[key])
     result = {
         "id": entry["id"],
-        "method": entry["method"],
-        "path": entry["path"],
-        "usage_notes": entry.get("usage_notes", ""),
+        # Whether execute_request on this id only reads (search, get, lookup,
+        # preview) or changes the CRM (create, update, cancel, delete).
+        "read_only": entry["intent"] in _READ_ONLY_INTENTS,
+        "usage_notes": usage_notes,
         "schema": schema,
         "example": entry.get("example"),
-        "dynamic_fields": bool(entry.get("dynamic_fields")),
         "fetched_live": fetched_live,
     }
     if live_fetch_error:
@@ -1231,7 +1115,7 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
             f"{live_fetch_error}. The schema/usage_notes/example above are still the "
             f"real static shape — only the live tenant-specific enrichment is missing."
         )
-    return json.dumps(result, indent=2)
+    return json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1258,56 +1142,29 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
 # Not fixed here; flagging it exactly where it now lives.
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+_SEARCH_INTENTS = ("search", "search_by_term", "search_idle")
+# How the search routers' failure texts start (a result never does).
+_SEARCH_ERROR_PREFIXES = ("Error", "✗", "Unexpected error", "Invalid filters",
+                          "Unknown entity_type", "Entity type '")
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True})
 async def execute_request(id: str, payload: Dict[str, Any]) -> str:
     """
-    Step 3 of 3 in the generic CRM tool flow: actually perform the call for the
-    payload you built via build_payload, using the SAME id you called it with.
-    Runs this repo's existing, already-tested implementation for that specific
-    endpoint — e.g. "lead.create" runs the exact same create_lead_logic() the
-    original create_lead tool already used — never a newly written or
-    reimplemented HTTP call.
+    Step 3 of 3: perform the call for the payload built from build_payload,
+    with the SAME id. Returns {"ok": true, "status": 200, "data": ...} or
+    {"ok": false, "error": {"code", "message", "details"?, "hint"?}}.
+    On failure read error.details FIRST — it is Kylas's own reason (duplicate
+    value, required field, business rule); message is often only a status.
+    error.code: UNKNOWN_ID (call list_tool), NOT_WIRED, BAD_PAYLOAD (missing or
+    wrong-typed field), SEARCH_FAILED, else Kylas's HTTP status or KYLAS_ERROR.
+    "data" differs per id: a record dict for get/create/update, a readable
+    text for searches.
 
-    build_payload does not validate anything about your payload, so this is
-    where a malformed one is caught first (or, if it's shaped correctly but
-    semantically wrong, by Kylas's own API). Always returns a normalized JSON
-    envelope, never a raw exception and never an unhandled crash:
-      success: {"ok": true, "status": 200, "data": <result>}
-      failure: {"ok": false, "error": {"code": "<CODE>", "message": "<why>",
-                "details": <Kylas's own real error body, when Kylas rejected
-                the request>}}
-
-    ALWAYS read "error.details" when present, before concluding anything
-    about why a request failed — "error.message" alone is often just
-    "<Operation> failed: <status code>" with no real information, while
-    "details" carries Kylas's own specific reason (e.g. a duplicate-value
-    rejection, a required-field validation message, a business-rule lock).
-    Treating a bare message + status code as the full picture is how a
-    genuine data collision (e.g. "phone number already exists") gets
-    misdiagnosed as a payload-building bug — check details FIRST.
-
-    "data" on success is whatever that endpoint's real underlying logic already
-    returns — do not assume it is always the same shape across ids. For *.get
-    and *.create ids today, that's a structured dict (the real record). For
-    *.search ids today, that's a pre-formatted, human-readable string (e.g.
-    "Found 3 lead(s)..."), because that is genuinely what the reused search
-    logic already returns — reused exactly as-is, not restructured.
-
-    error.code values you may see:
-      "UNKNOWN_ID"  - this id isn't in the registry at all — call
-                      list_tool to find a real one.
-      "NOT_WIRED"   - the id exists but has no execute_request handler yet.
-      "BAD_PAYLOAD" - the payload was missing a required field or had the
-                      wrong type for it — since build_payload never validates,
-                      this is often the FIRST place that surfaces.
-      anything else - Kylas's own HTTP status code, or "KYLAS_ERROR" for a
-                      connection/auth failure reaching Kylas at all.
-
-    id: an endpoint id from list_tool/build_payload (e.g. "lead.create").
-    payload: the request body/args you built by hand from that SAME id's
-        build_payload schema. Never send a payload built for one id against
-        a different id — the two are not interchangeable even if they look
-        similar (e.g. lead.create vs contact.create).
+    id: an endpoint id, e.g. "lead.create".
+    payload: built from THAT id's build_payload result, which must be visible
+      to you (call build_payload first if it is not) — never one built for or
+      copied from another id (lead.search and deal.search are not interchangeable).
     """
     entry = _REGISTRY.get(id)
     if not entry:
@@ -1327,7 +1184,12 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
             # already uses for this bucket's schema, not a second hardcoded map.
             original_get_tool = _REGISTRY_BUCKET_TO_GET_TOOL.get(bucket)
             id_field = (_ORIGINAL_TOOL_PARAMETERS.get(original_get_tool, {}).get("required") or ["entity_id"])[0]
-            result = await get_entity_logic(bucket, payload[id_field])
+            # Either name is accepted: "<bucket>_id" (this id's schema) or the
+            # "entity_id" every update takes.
+            record_id = payload.get(id_field, payload.get("entity_id"))
+            if record_id is None:
+                raise KeyError(f"{id_field} (or entity_id)")
+            result = await get_entity_logic(bucket, record_id)
         elif intent == "search":
             result = await search_entity_logic(
                 entity_type=bucket,
@@ -1357,7 +1219,11 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
             result = await create_entity_logic(bucket, payload)
         elif intent == "update":
             update_payload = dict(payload)
-            entity_id = update_payload.pop("entity_id")
+            entity_id = update_payload.pop("entity_id", None)
+            bucket_id = update_payload.pop(f"{bucket}_id", None)
+            entity_id = entity_id if entity_id is not None else bucket_id
+            if entity_id is None:
+                raise KeyError(f"entity_id (or {bucket}_id)")
             result = await update_entity_logic(bucket, entity_id, update_payload)
         elif intent == "preview" and bucket == "report":
             result = await preview_report_logic(payload)
@@ -1374,7 +1240,12 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
                 "ok": False,
                 "error": {"code": "NOT_WIRED", "message": f"intent '{intent}' has no execute_request router yet."},
             }, indent=2)
-        return json.dumps({"ok": True, "status": 200, "data": result}, default=str, indent=2)
+        if intent in _SEARCH_INTENTS and isinstance(result, str) and result.startswith(_SEARCH_ERROR_PREFIXES):
+            # The search routers report a failure as text instead of raising;
+            # an "ok": true around it would read as a successful, empty search.
+            return json.dumps({"ok": False, "error": {"code": "SEARCH_FAILED", "message": result}})
+        result = compact_text(result) if isinstance(result, str) else result
+        return json.dumps({"ok": True, "status": 200, "data": result}, default=str)
     except KylasAPIError as e:
         error_obj = {"code": str(e.status_code or "KYLAS_ERROR"), "message": e.message}
         # e.response_body is Kylas's own raw error body (set by handle_api_response) —
@@ -1389,6 +1260,15 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
                 error_obj["details"] = json.loads(e.response_body)
             except (json.JSONDecodeError, TypeError):
                 error_obj["details"] = e.response_body
+        details = error_obj.get("details")
+        if isinstance(details, dict) and str(details.get("code")) == _KYLAS_INVALID_JSON:
+            # Kylas says only "Invalid JSON", never which field: almost always a
+            # value of the wrong type — a picklist sent as a name, not its option id.
+            error_obj["hint"] = (
+                "Kylas could not read a field's value. Most often a picklist field was sent as "
+                f"a name instead of its option id, or a date is not ISO-8601 UTC. Call "
+                f"build_payload(\"{id}\") and send the option ids it lists; do not resend the "
+                "same payload.")
         return json.dumps({"ok": False, "error": error_obj}, indent=2)
     except (KeyError, ValueError, TypeError) as e:
         # Missing/malformed payload field (e.g. lead.get called without "lead_id") —
@@ -1459,6 +1339,12 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
 # these is actually dispatched — the underlying Python function for every
 # one of them still exists in this file unchanged, just no longer
 # separately advertised.
+# Kylas's error code for a body it could not deserialize ("Invalid JSON").
+_KYLAS_INVALID_JSON = "000004"
+
+# Registry intents whose execute_request only reads.
+_READ_ONLY_INTENTS = {"get", "search", "search_by_term", "search_idle", "lookup", "preview"}
+
 _REGISTRY_ONLY_TOOL_NAMES = {
     "list_tool", "build_payload", "execute_request",
     "get_current_user", "get_entity_labels",

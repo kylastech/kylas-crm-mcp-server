@@ -265,12 +265,6 @@
 
     Fields are merged over the existing record — other fields are left
     unchanged, this is not a full replace.
-
-    All the same rules as task.create apply to any field being changed here
-    (relation/association resolution, customFieldValues internal-name rule,
-    date/datetime UTC conversion, never guessing assignedTo) — see
-    task.create's usage_notes for the full rules; not repeated verbatim
-    here to avoid duplicating the same text twice.
   example: {entity_id: 12345, status: "COMPLETED"}
 
 - id: task.lookup_entity
