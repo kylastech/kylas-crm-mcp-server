@@ -178,7 +178,7 @@
     "timezone": {"id": <tz_picklist_id>, "name": "Asia/Calcutta"},
     "participants": [{"id": <user_id>, "entity": "user|lead|contact|external"}],
     "relatedTo": [{"id": <entity_id>, "entity": "lead|contact|deal|company"}],
-    "location": "Office", "description": "..."}
+    "medium": "OFFLINE", "location": "Office", "description": "..."}
 
     Resolving entity IDs — never guess: Meeting owner/conductor (CRM
     users/sales reps) — always resolve user.lookup (list_tool ->
@@ -249,14 +249,6 @@
     "customFieldValues" is merged key-by-key. Example: {"entity_id": 111,
     "participants": [{"id": <user_id>, "entity": "user"}]} adds a
     participant without dropping existing ones.
-
-    Same invitee rules as meeting.create apply to any participants being
-    added here: only leads/contacts with a valid email may be invitees,
-    deals can never be invitees. Same picklist Option ID / customFieldValues
-    internal-name / date-UTC-conversion / never-guess-ownerId rules as
-    meeting.create apply to any other field being changed — see
-    meeting.create's usage_notes for the full rules; not repeated verbatim
-    here to avoid duplicating the same text twice.
   example: {entity_id: 111, participants: [{id: 7236, entity: "user"}]}
 
 - id: meeting.lookup_related

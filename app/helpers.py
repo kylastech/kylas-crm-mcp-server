@@ -1,6 +1,7 @@
 """Shared helpers: dates/timezones, entity labels, field formatting, search rule building, payload normalization."""
 
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -288,31 +289,37 @@ def _format_field(
     is_required = field.get("required", False)
     filterable = field.get("filterable", False)
     prefix = "[STANDARD]" if is_standard else "[CUSTOM]"
+    # One line per field, one line for its options: the same facts as before
+    # (name, label, type, markers, a custom field's id, each option's id and
+    # internal name) in about half the characters — this text rides along on
+    # every model call that follows a build_payload.
     if is_standard:
-        identifier = f"API Name: '{name}'"
+        identifier = name
     else:
-        identifier = f"Field ID: '{field_id}', Internal Name for customFieldValues: '{name}'"
+        identifier = f"{name} (customFieldValues; field id {field_id})"
     required_marker = " *REQUIRED*" if is_required else ""
     filterable_marker = " [FILTERABLE]" if (include_filterable and filterable) else ""
-    lines.append(f"{prefix} '{label}' ({identifier}) - Type: {field_type}{required_marker}{filterable_marker}")
+    lines.append(f"{prefix} {identifier} '{label}' {field_type}{required_marker}{filterable_marker}")
     if field_type in ["PICK_LIST", "MULTI_PICKLIST"]:
         picklist = field.get("picklist") or {}
         # Deals use "picklistValues", Leads use "values"
         values = picklist.get("values") or picklist.get("picklistValues", [])
         if values:
             if name.strip().lower() in (large_fields or set()) and name.strip().lower() not in (requested_picklists or set()):
-                lines.append(f"  └─ {len(values)} options omitted to keep this reference compact.")
-                lines.append(f"     Call build_payload(id, fields=[\"{name}\"]) to get them. Do NOT guess an option id or name.")
+                lines.append(f"  {len(values)} options omitted to keep this reference compact. "
+                             f"Call build_payload(id, fields=[\"{name}\"]) to get them. Do NOT guess an option id or name.")
             else:
                 use_name = name in (internal_name_fields or set())
-                lines.append("  └─ Options (use internal name in search)" if use_name else "  └─ Options (use ID in search):")
+                options = []
                 for val in values:
                     if not isinstance(val, dict):
                         continue
                     val_label = val.get("displayName") or val.get("label") or val.get("name") or "Unknown"
-                    val_id = val.get("id", "")
                     val_name = val.get("name", "")
-                    lines.append(f"     • {val_label} (internal name: '{val_name}'),(ID: {val_id})")
+                    options.append(f"{val_label}{f' [{val_name}]' if val_name and val_name != val_label else ''}"
+                                   f"={val.get('id', '')}")
+                lines.append(("  Options label [internal name]=ID (use internal name in search): " if use_name
+                              else "  Options label [internal name]=ID (use ID in search): ") + "; ".join(options))
     return lines
 
 
@@ -542,6 +549,194 @@ def _is_stage_lock_error(error: KylasAPIError) -> bool:
         return False
 
 
+# Accepted phoneNumbers entry shape, shown in every phone error so a caller
+# can fix the payload in one retry instead of guessing.
+PHONE_SHAPES = (
+    'send "phone_country_code": "IN" (the country the user gave) with phoneNumbers: '
+    '[{"value": "7888108842", "code": "IN", "type": "MOBILE", "primary": true}] '
+    '(code may be "IN" or "+91"), or the shorthand phone + phone_country_code + phone_type'
+)
+
+# Keys a phoneNumbers entry may use for its number and its country.
+_PHONE_VALUE_KEYS = ("value", "phone", "number", "phoneNumber", "phone_number")
+_PHONE_COUNTRY_KEYS = ("code", "phone_country_code", "countryCode", "country_code", "dialCode", "dial_code")
+
+
+def _country_in_number(value: str) -> str:
+    """The ISO region of an international number ("+91 98232 89810" or
+    "0091…" -> "IN"), or "" when the number carries no country. Kylas reads
+    the same thing from a "+" number, so it is not something to ask about."""
+    raw = str(value).strip()
+    if raw.startswith("00"):
+        raw = "+" + raw[2:]
+    if not raw.startswith("+"):
+        return ""
+    try:
+        region = phonenumbers.region_code_for_number(phonenumbers.parse(raw, None))
+    except phonenumbers.NumberParseException:
+        return ""
+    return region if region and region != "ZZ" else ""
+
+
+def _normalize_phone_item(item: Any, default_country: str = "") -> Dict[str, Any]:
+    """One phoneNumbers entry in Kylas's shape {value, code, type, primary}.
+
+    Takes the number from value/phone/number/phoneNumber and the country from
+    code/phone_country_code/countryCode/dialCode ("IN" or "+91"), else from
+    the number itself when it is international ("+91…"), else the top-level
+    phone_country_code. Raises ValueError naming the accepted shapes when the
+    number is missing."""
+    if not isinstance(item, dict):
+        raise ValueError(f"Each phoneNumbers entry must be an object: {PHONE_SHAPES}.")
+    entry = dict(item)
+    value = next((entry.pop(k) for k in _PHONE_VALUE_KEYS if entry.get(k)), None)
+    for k in _PHONE_VALUE_KEYS:
+        entry.pop(k, None)
+    if not value or not str(value).strip():
+        raise ValueError(f"A phoneNumbers entry has no number: {PHONE_SHAPES}.")
+    country_raw = next((entry.pop(k) for k in _PHONE_COUNTRY_KEYS if entry.get(k)), None)
+    for k in _PHONE_COUNTRY_KEYS:
+        entry.pop(k, None)
+    country = _normalize_country_code(country_raw) if country_raw else ""
+    if country_raw and not country:
+        raise ValueError(f"Unknown phone country '{country_raw}': use a 2-letter code like IN "
+                         f"or a dial code like +91. {PHONE_SHAPES}.")
+    entry["value"] = str(value).strip()
+    country = country or _country_in_number(entry["value"])
+    if country or default_country:
+        entry["code"] = country or default_country
+    if entry.get("type"):
+        phone_type = str(entry["type"]).strip().upper()
+        if phone_type not in PHONE_TYPES:
+            raise ValueError(f"Invalid phone type '{entry['type']}'. Must be one of: "
+                             f"{', '.join(PHONE_TYPES)}.")
+        entry["type"] = phone_type
+    return entry
+
+
+def resolve_picklist_values(
+    payload: Dict[str, Any],
+    fields: List[Dict[str, Any]],
+    wrap: bool = False,
+    name_fields: Optional[set] = None,
+    wrap_name: bool = False,
+) -> Dict[str, Any]:
+    """Send picklist fields as Kylas wants them on create/update.
+
+    A value may be the option id (38256 or "38256"), its internal name
+    ("OPEN") or its label ("Open"), any case, or an object holding one of
+    those — this server already has every option, so the caller need not
+    look the id up. Standard fields are read at the top level, custom ones in
+    customFieldValues. An unknown value raises ValueError listing the
+    options as "Label=id".
+
+    What is sent depends on the entity (see the core services):
+      wrap=False  the plain id (leads, contacts, tasks); multi -> [id, ...]
+      wrap=True   {"id": id} (companies, deals, meetings, call logs); multi -> [{"id": id}]
+                  plus "name" with wrap_name (meetings store it on the lookup)
+      An object that already holds an id is sent exactly as given (wrap=True).
+      name_fields / an `internal` custom field: the option's internal name
+                  (lead/contact companyIndustry, country, timezone, ...)
+    """
+    name_fields = name_fields or set()
+    picklists: Dict[str, List[Dict[str, Any]]] = {}
+    by_name: Dict[str, bool] = {}
+    for field in fields or []:
+        if field.get("type") not in ("PICK_LIST", "MULTI_PICKLIST") or not field.get("name"):
+            continue
+        picklist = field.get("picklist") or {}
+        options = picklist.get("values") or picklist.get("picklistValues") or []
+        options = [o for o in options if isinstance(o, dict) and o.get("id") is not None]
+        if not options:
+            continue                      # nothing to resolve against (e.g. deal units): left as sent
+        picklists[field["name"]] = options
+        by_name[field["name"]] = field["name"] in name_fields or bool(field.get("internal"))
+
+    def _key(text: Any) -> str:
+        return " ".join(str(text).replace("_", " ").split()).lower()
+
+    def _option(name: str, value: Any) -> Dict[str, Any]:
+        options = picklists[name]
+        if isinstance(value, dict):
+            value = next((value[k] for k in ("id", "name", "displayName", "label", "value")
+                          if value.get(k) not in (None, "")), None)
+        if isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit()):
+            # An id is passed through even if not listed here: Kylas checks it.
+            found = next((o for o in options if str(o["id"]) == str(value).strip()), None)
+            return found or {"id": int(value)}
+        else:
+            wanted = _key(value)
+
+            def _names(option: Dict[str, Any]) -> List[str]:
+                return [_key(n) for n in (option.get("name"), option.get("displayName"), option.get("label"))
+                        if n is not None]
+
+            for option in options:
+                if wanted in _names(option):
+                    return option
+            # Only an exact id, name or label is taken — never a guess. The options
+            # containing what was written ("Kolkata" -> "(GMT+05:30) Chennai,
+            # Kolkata, …"), or sharing a word with it, are listed first instead.
+            partial = [o for o in options if wanted and any(wanted in n for n in _names(o))]
+            words = {w for w in wanted.split() if len(w) > 2}
+            close = partial or [o for o in options if words & set(" ".join(_names(o)).split())]
+            options = close + [o for o in options if o not in close]
+        choices = ", ".join(
+            f"{o.get('displayName') or o.get('name')}={o['id']}" for o in options[:40])
+        raise ValueError(f"'{value}' is not an option of picklist field '{name}'. "
+                         f"Send the option id (or its exact name): {choices}.")
+
+    def _one(name: str, value: Any) -> Any:
+        if value is None or isinstance(value, bool):
+            return value
+        if (wrap and not by_name[name] and isinstance(value, dict)
+                and str(value.get("id", "")).strip().isdigit()):
+            return value                  # already Kylas's shape: sent as before, extra keys kept
+        option = _option(name, value)
+        if by_name[name]:
+            return option.get("name") if option.get("name") is not None else value
+        if not wrap:
+            return int(option["id"])
+        if wrap_name and option.get("name") is not None:
+            return {"id": int(option["id"]), "name": option["name"]}
+        return {"id": int(option["id"])}
+
+    def _resolve(name: str, value: Any) -> Any:
+        if isinstance(value, list):
+            return [_one(name, v) for v in value]
+        return _one(name, value)
+
+    resolved = dict(payload)
+    for name in picklists:
+        if name in resolved:
+            resolved[name] = _resolve(name, resolved[name])
+    custom = resolved.get("customFieldValues")
+    if isinstance(custom, dict):
+        resolved["customFieldValues"] = {
+            k: (_resolve(k, v) if k in picklists else v) for k, v in custom.items()}
+    return resolved
+
+
+_RULE_LINE = re.compile(r"^\s*[=\-─━]{10,}\s*$")
+_CHEAT_SHEET_BANNER = re.compile(r"^\s*(KYLAS CRM - .*CHEAT SHEET|END OF CHEAT SHEET)\s*$")
+
+
+def compact_text(text: str) -> str:
+    """A tool's text output without decoration: no "=====" / "-----" rule
+    lines or cheat-sheet banners, and at most one blank line in a row. Every
+    value and label stays; only characters that carry nothing are dropped."""
+    out: List[str] = []
+    for line in text.splitlines():
+        if _RULE_LINE.match(line) or _CHEAT_SHEET_BANNER.match(line):
+            continue
+        if not line.strip() and (not out or not out[-1].strip()):
+            continue
+        out.append(line.rstrip())
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out)
+
+
 def _normalize_field_values(
     field_values: Dict[str, Any],
     custom_field_id_to_name: Optional[Dict[str, str]] = None,
@@ -562,20 +757,32 @@ def _normalize_field_values(
 
     phone_country_raw = fv.pop("phone_country_code", None)
     phone_country = _normalize_country_code(phone_country_raw)
+    shorthand = fv.get("phone") or fv.get("phoneNumber")
+    if not phone_country and isinstance(shorthand, str):
+        phone_country = _country_in_number(shorthand)       # "+91…" says its own country
     phone_type_raw = fv.pop("phone_type", None)
     phone_type = phone_type_raw.strip().upper() if isinstance(phone_type_raw, str) else None
     if phone_type and phone_type not in PHONE_TYPES:
         raise ValueError(
             f"Invalid phone type '{phone_type}'. Must be one of: {', '.join(PHONE_TYPES)}."
         )
+    # A "code" the caller put on an entry may be a guess; only a number written
+    # in international form ("+91…") carries a country the user actually gave.
+    phones_have_country = (
+        isinstance(fv.get("phoneNumbers"), list) and len(fv["phoneNumbers"]) > 0
+        and all(isinstance(p, dict) and any(
+            isinstance(p.get(k), str) and _country_in_number(p[k]) for k in _PHONE_VALUE_KEYS)
+            for p in fv["phoneNumbers"])
+    )
+    if isinstance(fv.get("phoneNumbers"), list):
+        fv["phoneNumbers"] = [_normalize_phone_item(p, phone_country) for p in fv["phoneNumbers"]]
     has_phone_data = (
         fv.get("phone") or fv.get("phoneNumber")
         or (isinstance(fv.get("phoneNumbers"), list) and len(fv["phoneNumbers"]) > 0)
     )
-    # Require explicit phone_country_code whenever any phone number is present (do not assume India).
-    # This applies even if phoneNumbers array already has "code" on each entry—caller must pass
-    # phone_country_code at top level so we know the user was asked, not assumed.
-    if has_phone_data and not phone_country:
+    # Require an explicit country whenever any phone number is present (do not assume India):
+    # top-level phone_country_code, or every number written as "+<dial code>…".
+    if has_phone_data and not phone_country and not phones_have_country:
         raise ValueError(
             "Phone number(s) were provided but country/dial code was not. "
             "Ask the user which country and dial code to use (e.g. India: IN or +91, US: US or +1) and include 'phone_country_code' in field_values."
@@ -639,10 +846,8 @@ def _normalize_field_values(
                 if not isinstance(p, dict):
                     continue
                 entry = dict(p)
-                if "code" not in entry or not entry.get("code"):
+                if not entry.get("code"):
                     entry["code"] = phone_country
-                elif len(str(entry["code"])) > 2:
-                    entry["code"] = _normalize_country_code(entry["code"]) or entry["code"]
                 phones.append(entry)
             payload["phoneNumbers"] = _ensure_single_primary(phones, PHONE_TYPES, "MOBILE")
             continue
