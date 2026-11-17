@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 import httpx
 
 from app.config import API_KEY, BASE_URL, SERVER_VERSION, logger
+from app.oauth import kylas_user_token
 from app.server import mcp
 
 # ---------------------------------------------------------------------------
@@ -204,7 +205,6 @@ def _resolve_auth_headers() -> Dict[str, str]:
             return {"api-key": header_key}
         # 3. A user's own Kylas token. Never fall through to the env key below:
         #    that would run the request as a different user.
-        from app.oauth import kylas_user_token
         user_token = kylas_user_token(request.headers.get("x-kylas-token"))
         if user_token:
             logger.debug("Resolved x-kylas-token header authentication")

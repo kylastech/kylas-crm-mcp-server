@@ -45,7 +45,7 @@ DEFAULT_TIMEZONE = _get_default_timezone()
 
 
 if not API_KEY:
-    logger.info("KYLAS_API_KEY not set. Server will rely on per-request 'x-api-key' header.")
+    logger.info("KYLAS_API_KEY not set. Server will rely on per-request 'x-api-key' or 'x-kylas-token' header (or OAuth).")
 
 # ---------------------------------------------------------------------------
 # System Instructions: ALWAYS get fields first, then create from user context

@@ -32,8 +32,6 @@ from starlette.middleware.authentication import AuthenticationMiddleware
 logger = logging.getLogger("kylas-mcp.oauth")
 
 _API_KEY_HEADER = "x-api-key"
-# A signed-in user's own Kylas access token, sent by a service acting for that user
-# (e.g. sd-ai-agent). Its own header, so it is never confused with an OAuth token.
 _USER_TOKEN_HEADER = "x-kylas-token"
 
 _OAUTH_AUTHORIZE_PATH = "/oauth/authorize"
