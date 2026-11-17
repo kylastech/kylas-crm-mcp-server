@@ -180,7 +180,9 @@ def _resolve_auth_headers() -> Dict[str, str]:
     """Resolve authentication headers:
     1. FastMCP OAuth Bearer token (if user is authenticated via OAuth)
     2. Per-request x-api-key header (if passed in the HTTP request)
-    3. Environment variable fallback (KYLAS_API_KEY)
+    3. Per-request x-kylas-token header: a signed-in user's own Kylas token, sent by a
+       service acting for that user — forwarded to Kylas as their Bearer token
+    4. Environment variable fallback (KYLAS_API_KEY)
     """
     # 1. Try FastMCP OAuth access token
     try:
@@ -200,16 +202,24 @@ def _resolve_auth_headers() -> Dict[str, str]:
         if header_key:
             logger.debug("Resolved x-api-key header authentication")
             return {"api-key": header_key}
+        # 3. A user's own Kylas token. Never fall through to the env key below:
+        #    that would run the request as a different user.
+        from app.oauth import kylas_user_token
+        user_token = kylas_user_token(request.headers.get("x-kylas-token"))
+        if user_token:
+            logger.debug("Resolved x-kylas-token header authentication")
+            return {"Authorization": f"Bearer {user_token}"}
     except Exception:
         pass
 
-    # 3. Fall back to env var
+    # 4. Fall back to env var
     if API_KEY:
         logger.debug("Resolved environment KYLAS_API_KEY authentication")
         return {"api-key": API_KEY}
 
     raise KylasAPIError(
-        "No authentication provided. Pass x-api-key header, set KYLAS_API_KEY, or configure Kylas OAuth."
+        "No authentication provided. Pass an x-api-key or x-kylas-token header, set KYLAS_API_KEY, "
+        "or configure Kylas OAuth."
     )
 
 
