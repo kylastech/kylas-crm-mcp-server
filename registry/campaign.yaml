@@ -175,8 +175,9 @@
 
     Then: show a table, say why #1 leads, recommend one and let the user
     choose (a campaign, or up to 4 activities). To build the new one:
-    campaign.create, then campaign_activity.create per chosen activity with
-    audience.audience_filters as given — each with its own preview and Yes.
+    campaign.create (its own preview and Yes), then campaign_activity.create
+    per chosen activity with audience.audience_filters as given (one call
+    each, created straight away as a DRAFT — no Yes needed).
     Ask about every cannot_reuse condition and say the same audience reaches
     the same people again. Describe what worked; don't claim a condition
     causes engagement. Never start the new campaign unless the user asks.

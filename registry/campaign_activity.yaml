@@ -258,6 +258,21 @@
     which one.
   example: {whatsapp_account: "Kylas Devs", entity: LEAD, query: "Please Reply"}
 
+- id: campaign_activity.smart_lists
+  bucket: campaign_activity
+  intent: lookup
+  method: GET
+  path: /v1/search-lists/{entity}/lookup
+  dynamic_fields: false
+  description: "Saved smart lists of leads or of contacts."
+  usage_notes: >
+    entity: LEAD or CONTACT — lead and contact smart lists are separate,
+    and the same name can exist for both, so use the entity the user
+    means (ask if it's unclear). query: part of the smart list name
+    (case-insensitive); leave it out to list the first 50. Returns
+    {entity, smart_lists: [{id, name}]}.
+  example: {entity: CONTACT, query: "Marketing"}
+
 - id: campaign_activity.check_utm
   bucket: campaign_activity
   intent: lookup
@@ -278,23 +293,31 @@
   method: POST
   path: /v1/campaigns/{campaign_id}/activities
   dynamic_fields: false
-  description: "Add an EMAIL or WHATSAPP activity to a campaign (as DRAFT — nothing is sent). Two calls: preview, then confirm."
+  description: "Add an EMAIL or WHATSAPP activity to a campaign as a DRAFT (nothing is sent). One call — no preview or confirm."
   usage_notes: >
-    Step 1 — preview (no confirm): nothing is written. The result shows every
-    detail, the recipients that match the audience right now (and whether
-    that count lets the activity start: 1 to 10,000), and who it runs as.
-    Show all of it and ask a Yes / No question (clickable choices if your app
-    offers them). Step 2 — only if the user says Yes: the same call again with
-    exactly the same details plus confirm: true. No: stop, make no other call.
-    If they want changes, preview again. Never say it was created until a call
-    returns executed: true.
+    One call creates the activity as a DRAFT — there is no preview and no
+    Yes / No step (a DRAFT sends nothing). Every check runs first, so a bad
+    request creates nothing. If a campaign, template, account or smart list
+    name matches several, the result is a choice list and nothing is
+    created: ask the user, then call again with the chosen one. The result
+    (executed: true) has the created activity, audience (recipients_now and
+    whether that lets it start: 1 to 10,000; for a smart list also its name,
+    its conditions in words and smart_list_note) and runs_as. Tell the user
+    all of it, including any note that it can't start yet. Don't call it
+    again to "retry" after executed: true — it was created.
 
-    campaign_id or campaign_name (several name matches return a choice — ask
-    first). type: EMAIL or WHATSAPP (CALL isn't supported here). entity: LEAD
-    or CONTACT. name (required). audience_filters (required, at least one):
-    the same filter format as lead.search / contact.search on that entity —
-    call build_payload("campaign_activity.create", entity="lead" or "contact")
-    to get the filterable fields. budget (required) and actual_expense
+    campaign_id or campaign_name. type: EMAIL or WHATSAPP (CALL isn't
+    supported here). entity: LEAD or CONTACT — from what the user says; ask
+    if it's unclear. name (required). Who gets it (required, one of the two):
+    smart_list — a smart list of that entity, by name or id
+    (campaign_activity.smart_lists lists them); its conditions are copied
+    into the activity exactly as saved, so later changes to the smart list
+    don't change the activity (say so). A smart list without conditions
+    ("All leads", "All contacts") means everyone of that entity and is
+    allowed. Or audience_filters (at least one): the same filter format as
+    lead.search / contact.search on that entity — call
+    build_payload("campaign_activity.create", entity="lead" or "contact") to
+    get the filterable fields. Never both. budget (required) and actual_expense
     (default 0): numbers, always in the campaign's currency. start_date
     (required) / end_date: the user's LOCAL date (plain start = 00:00, plain
     end = 23:59:59) and both inside the campaign's dates. utm_campaign,
@@ -307,11 +330,12 @@
     entity), sent_to PRIMARY_PHONE_NUMBER (default) or ALL_PHONE_NUMBERS,
     retry_times 0 to 7 (optional).
 
-    Checked before the preview: at most 4 activities per campaign, the
-    campaign's activity budgets together not above its budget, dates inside
-    the campaign. Ask the user for anything required they didn't give —
-    don't invent UTM values or filters. Activities are created as DRAFT;
-    starting one sends real messages and is a separate step.
+    Checked before anything is created: at most 4 activities per campaign,
+    the campaign's activity budgets together not above its budget, dates
+    inside the campaign. Ask the user for anything required they didn't give
+    — don't invent UTM values, filters or a smart list. Activities are
+    created as DRAFT; starting one sends real messages and is a separate step
+    (campaign_activity.start, which asks the user first).
   example:
     campaign_name: "MCP Plan2 Test"
     type: EMAIL
@@ -347,8 +371,12 @@
 
     Changeable (DRAFT / FAILED): name, budget, actual_expense, start_date,
     end_date (empty clears it), utm_* (utm_campaign must stay unique),
-    entity (then audience_filters must be given too, on that entity's
-    fields), audience_filters, sent_to, email_template (EMAIL),
+    entity (then a new audience must be given too: audience_filters on that
+    entity's fields, or a smart_list of that entity), a new audience —
+    either audience_filters or smart_list (name or id; its conditions are
+    copied as saved, later smart list changes don't follow; a smart list
+    without conditions such as "All leads" means everyone), never both —
+    sent_to, email_template (EMAIL),
     whatsapp_account, whatsapp_template, retry_times (WHATSAPP) — with the
     same rules as campaign_activity.create. type: switch EMAIL <-> WHATSAPP
     (DRAFT / FAILED only, as in the web form) — then give the new type's
@@ -359,7 +387,10 @@
 
     Step 1 — preview (no confirm): nothing is written; shows each change as
     before -> after, the activity after the update, the recipient count if
-    the audience changed, and who it runs as. Ask Yes / No (clickable
+    the audience changed (for a smart list also its name, its conditions in
+    words and smart_list_note — say it), and who it runs as. A smart list
+    name matching several returns a choice: ask, then preview again with the
+    chosen one. Ask Yes / No (clickable
     choices if your app offers them). Step 2 — only on Yes: the same call
     with confirm: true. Never say it was updated until a call returns
     executed: true.

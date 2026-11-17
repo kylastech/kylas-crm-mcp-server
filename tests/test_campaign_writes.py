@@ -258,11 +258,13 @@ from app.campaigns import (  # noqa: E402
     _id_or_name,
     _resolve_currency,
     _resolve_email_template,
+    _resolve_smart_list,
     _resolve_whatsapp_account,
     _resolve_whatsapp_template,
     check_utm_logic,
     currencies_logic,
     email_templates_logic,
+    smart_lists_logic,
     whatsapp_templates_logic,
 )
 
@@ -437,6 +439,94 @@ async def test_whatsapp_templates_lookup_resolves_the_account_first():
 async def test_email_templates_lookup_needs_an_entity():
     with pytest.raises(ValueError, match="'entity' must be one of"):
         await email_templates_logic({"query": "lead"})
+
+
+# Smart lists — shapes as QA returned them on 2026-11-17.
+_SL_LEAD_LOOKUP = {"content": [{"id": 98342, "name": "All my leads"}, {"id": 146421, "name": "All leads-copy"},
+                               {"id": 146422, "name": "All leads-copy-copy"}, {"id": 98341, "name": "All leads"}]}
+_SL_RADIUS_RULE = {"id": "addressCoordinate", "field": "addressCoordinate", "type": "GpsCoordinates",
+                   "operator": "range_within", "group": False,
+                   "value": {"radius": 8, "unit": "KILOMETERS", "lat": 18.5291453, "lon": 73.8473186}}
+_SL_146421 = {"id": 146421, "name": "All leads-copy", "entityType": "LEAD",
+              "searchRequest": {"jsonRule": {"condition": "AND", "valid": True, "rules": [_SL_RADIUS_RULE]}}}
+_SL_98341 = {"id": 98341, "name": "All leads", "entityType": "LEAD", "searchRequest": {"jsonRule": None}}
+
+
+def _smart_list_missing(params):
+    # Kylas answers an unknown id (or another entity's id) with 400 + code 003005, not 404.
+    raise KylasAPIError("Fetch smart list failed: 400", status_code=400,
+                        response_body='{"code":"003005","message":"Search list does not exists","errorDetails":[]}')
+
+
+@pytest.mark.asyncio
+async def test_smart_list_by_name_prefers_exact_match_and_keeps_its_rules_unchanged():
+    fake = _FakeKylasGet({"/v1/search-lists/lead/lookup": _SL_LEAD_LOOKUP, "/v1/search-lists/lead/146421": _SL_146421})
+    with patch("app.campaigns._kylas_get", fake):
+        smart_list, choice = await _resolve_smart_list("all leads-copy", "LEAD")
+    assert choice is None
+    assert smart_list == {"id": 146421, "name": "All leads-copy", "rules": [_SL_RADIUS_RULE]}
+    assert fake.calls[0]["params"] == {"q": "all leads-copy", "size": 50}
+
+
+@pytest.mark.asyncio
+async def test_smart_list_without_conditions_has_empty_rules():
+    fake = _FakeKylasGet({"/v1/search-lists/lead/98341": _SL_98341})
+    with patch("app.campaigns._kylas_get", fake):
+        smart_list, _ = await _resolve_smart_list(98341, "LEAD")
+    assert smart_list == {"id": 98341, "name": "All leads", "rules": []}
+    assert [c["path"] for c in fake.calls] == ["/v1/search-lists/lead/98341"]  # an id skips the lookup
+
+
+@pytest.mark.asyncio
+async def test_smart_list_name_with_several_matches_returns_a_choice_and_fetches_nothing():
+    fake = _FakeKylasGet({"/v1/search-lists/lead/lookup": _SL_LEAD_LOOKUP})
+    with patch("app.campaigns._kylas_get", fake):
+        smart_list, choice = await _resolve_smart_list("leads-copy", "LEAD")
+    assert smart_list is None and len(choice["matches"]) == 4 and choice["note"].startswith("STOP")
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_smart_list_name_is_not_found():
+    with patch("app.campaigns._kylas_get", _FakeKylasGet({"/v1/search-lists/contact/lookup": {"content": []}})):
+        with pytest.raises(KylasAPIError, match="No contact smart list name contains 'Diwali'"):
+            await _resolve_smart_list("Diwali", "CONTACT")
+
+
+@pytest.mark.asyncio
+async def test_unknown_or_other_entity_smart_list_id_gives_a_clear_message():
+    with patch("app.campaigns._kylas_get", _FakeKylasGet({"/v1/search-lists/lead/98325": _smart_list_missing})):
+        with pytest.raises(KylasAPIError, match="No lead smart list with id 98325") as error:
+            await _resolve_smart_list("98325", "LEAD")
+    assert error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_other_smart_list_errors_are_passed_on():
+    def server_error(params):
+        raise KylasAPIError("Fetch smart list failed: 500", status_code=500, response_body="boom")
+    with patch("app.campaigns._kylas_get", _FakeKylasGet({"/v1/search-lists/lead/5": server_error})):
+        with pytest.raises(KylasAPIError, match="Fetch smart list failed: 500"):
+            await _resolve_smart_list(5, "LEAD")
+
+
+@pytest.mark.asyncio
+async def test_smart_list_of_another_entity_is_rejected():
+    contact_list = {**_SL_98341, "id": 98325, "name": "All contacts", "entityType": "CONTACT"}
+    with patch("app.campaigns._kylas_get", _FakeKylasGet({"/v1/search-lists/lead/98325": contact_list})):
+        with pytest.raises(ValueError, match="'All contacts' is for CONTACTs, not LEADs"):
+            await _resolve_smart_list(98325, "LEAD")
+
+
+@pytest.mark.asyncio
+async def test_smart_lists_lookup_asks_for_50_of_that_entity():
+    fake = _FakeKylasGet({"/v1/search-lists/contact/lookup": {"content": [{"id": 98327, "name": "Marketing contacts"}]}})
+    with patch("app.campaigns._kylas_get", fake):
+        result = await smart_lists_logic({"entity": "contact", "query": "Marketing"})
+    assert result == {"entity": "CONTACT", "smart_lists": [{"id": 98327, "name": "Marketing contacts"}]}
+    assert fake.calls == [{"path": "/v1/search-lists/contact/lookup", "params": {"q": "Marketing", "size": 50}}]
+    with pytest.raises(ValueError, match="'entity' must be one of"):
+        await smart_lists_logic({"query": "Marketing"})
 
 
 @pytest.mark.asyncio
@@ -725,18 +815,23 @@ def _kylas_lookups():
         "/v1/messages/connected-accounts/lookup": _account_lookup,
         "/v1/messages/whatsapp-templates/lookup": {"content": [{"id": 1040, "name": "Please Reply copy"}]},
         "/v1/messages/whatsapp-templates/1040": _WA_1040,
+        "/v1/search-lists/lead/lookup": lambda params: {"content": [r for r in _SL_LEAD_LOOKUP["content"]
+                                                                     if params["q"].lower() in r["name"].lower()]},
+        "/v1/search-lists/lead/146421": _SL_146421,
+        "/v1/search-lists/lead/98341": _SL_98341,
     })
 
 
 class _ActivityPatched(_Patched):
-    """C1's doubles plus template/account lookups, lead fields, the audience count and the final activity.get."""
+    """C1's doubles plus template/account/smart list lookups, lead fields, the audience count and activity.get."""
 
     def __init__(self, api, recipients=1, current=None):
         super().__init__(api)
-        self.count = AsyncMock(return_value=recipients)
+        self.count = AsyncMock(return_value=recipients) if isinstance(recipients, int) else AsyncMock(side_effect=recipients)
         self.patches += [
             patch("app.campaigns._kylas_get", _kylas_lookups()),
             patch("app.campaigns._fetch_lead_fields", AsyncMock(return_value=_LEAD_FIELDS)),
+            patch.dict("app.campaigns._AUDIENCE_FIELD_FETCHERS", {"LEAD": AsyncMock(return_value=_LEAD_FIELDS)}),
             patch("app.campaigns.count_audience", self.count),
             patch("app.campaigns.get_activity_logic", AsyncMock(side_effect=lambda p: {"id": p["activity_id"]})),
         ]
@@ -757,30 +852,24 @@ def _activity_api(campaign=_CAMPAIGN_449, duplicate=False):
 
 
 @pytest.mark.asyncio
-async def test_activity_create_preview_writes_nothing_and_shows_everything():
+async def test_activity_create_is_one_call_without_confirm_and_reports_the_audience():
     api = _activity_api()
-    with _ActivityPatched(api):
-        result = await create_activity_logic(dict(_EMAIL_CREATE))
-    assert api.writes() == [] and result["executed"] is False
-    preview = result["preview"]
-    assert preview["campaign"] == {"id": 449, "name": "MCP Plan2 Test", "status": "DRAFT"}
-    assert (preview["type"], preview["entity"], preview["sent_to"]) == ("EMAIL", "LEAD", "PRIMARY_EMAIL")
-    assert preview["email_template"] == "Lead creation"
-    assert preview["audience_filters"] == [{"field": "id", "operator": "equal", "value": 753407}]
-    assert preview["recipients_now"] == 1 and preview["recipients_note"].startswith("Can start")
-    # Same money shape as activity reads and campaign previews.
-    assert preview["budget"] == {"value": 500.0, "currency": "INR", "currency_id": 431}
-    assert preview["actual_expense"] == {"value": 0.0, "currency": "INR", "currency_id": 431}
-    assert preview["start_date"] == "05 Nov 2026, 12:00:00 AM (Asia/Calcutta)" and preview["end_date"] == "none"
-    assert preview["status"].startswith("DRAFT")
-    assert "NOTHING WAS WRITTEN" in result["note"]
+    patched = _ActivityPatched(api)
+    with patched:
+        result = await create_activity_logic(dict(_EMAIL_CREATE))  # no confirm
+    assert len(api.writes()) == 1 and result["executed"] is True and result["activity"] == {"id": 800}
+    assert result["audience"] == {"recipients_now": 1, "recipients_note": result["audience"]["recipients_note"]}
+    assert result["audience"]["recipients_note"].startswith("Can start")
+    assert result["runs_as"] == {"user": "Akash Nakhate", "user_id": 8112, "tenant_id": 3691}
+    assert result["status"].startswith("DRAFT") and "NOTHING WAS WRITTEN" not in json.dumps(result)
+    assert patched.count.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_activity_create_confirm_posts_the_web_form_body():
+async def test_activity_create_posts_the_web_form_body():
     api = _activity_api()
-    with _ActivityPatched(api) as _:
-        result = await create_activity_logic({**_EMAIL_CREATE, "confirm": True})
+    with _ActivityPatched(api):
+        result = await create_activity_logic({**_EMAIL_CREATE, "confirm": True})  # an old confirm is just ignored
     (post,) = api.writes()
     assert post["path"] == "/v1/campaigns/449/activities"
     body = post["body"]
@@ -792,7 +881,7 @@ async def test_activity_create_confirm_posts_the_web_form_body():
     assert body["payload"] == {"type": "EMAIL", "sentTo": "PRIMARY_EMAIL", "emailTemplate": {"id": 812, "name": "Lead creation"}}
     assert body["filters"]["jsonRule"]["condition"] == "AND"
     assert [(r["field"], r["value"]) for r in body["filters"]["jsonRule"]["rules"]] == [("id", 753407)]
-    assert result == {"executed": True, "activity": {"id": 800}}
+    assert result["executed"] is True and result["activity"] == {"id": 800} and "smart_list" not in result["audience"]
 
 
 @pytest.mark.asyncio
@@ -863,10 +952,86 @@ async def test_activity_create_with_an_ambiguous_template_asks_first():
 
 @pytest.mark.parametrize("recipients,note", [(0, "No leads/contacts match"), (10001, "More than 10,000 match")])
 @pytest.mark.asyncio
-async def test_activity_preview_warns_when_it_could_not_start(recipients, note):
-    with _ActivityPatched(_activity_api(), recipients=recipients):
+async def test_activity_create_still_creates_but_says_when_it_could_not_start(recipients, note):
+    api = _activity_api()
+    with _ActivityPatched(api, recipients=recipients):
         result = await create_activity_logic(dict(_EMAIL_CREATE))
-    assert result["preview"]["recipients_now"] == recipients and result["preview"]["recipients_note"].startswith(note)
+    assert len(api.writes()) == 1 and result["executed"] is True
+    assert result["audience"]["recipients_now"] == recipients and result["audience"]["recipients_note"].startswith(note)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_count_after_create_is_not_an_error():
+    api = _activity_api()
+    with _ActivityPatched(api, recipients=KylasAPIError("Count audience failed: 503", status_code=503)):
+        result = await create_activity_logic(dict(_EMAIL_CREATE))
+    assert result["executed"] is True and len(api.writes()) == 1
+    assert result["audience"]["recipients_now"] is None and "couldn't be read" in result["audience"]["recipients_note"]
+
+
+# --- campaign_activity.create with a smart list (Plan 3) ----------------------------
+
+_SMART_LIST_CREATE = {k: v for k, v in _EMAIL_CREATE.items() if k != "audience_filters"}
+
+
+@pytest.mark.asyncio
+async def test_smart_list_rules_are_copied_into_the_activity_unchanged():
+    api = _activity_api()
+    patched = _ActivityPatched(api, recipients=69)
+    with patched:
+        result = await create_activity_logic({**_SMART_LIST_CREATE, "smart_list": "All leads-copy"})
+    rule = {"condition": "AND", "valid": True, "rules": [_SL_RADIUS_RULE]}
+    assert api.writes()[0]["body"]["filters"] == {"jsonRule": rule}  # map radius kept as the web form keeps it
+    assert patched.count.await_args.args == ("LEAD", rule)
+    audience = result["audience"]
+    assert audience["smart_list"] == {"id": 146421, "name": "All leads-copy"}
+    assert audience["recipients_now"] == 69 and audience["smart_list_note"].startswith("The activity keeps its own copy")
+    assert len(audience["conditions"]) == 1 and "addressCoordinate" in audience["conditions"][0]
+
+
+@pytest.mark.asyncio
+async def test_smart_list_without_conditions_targets_everyone_as_null():
+    api = _activity_api()
+    patched = _ActivityPatched(api, recipients=9986)
+    with patched:
+        result = await create_activity_logic({**_SMART_LIST_CREATE, "smart_list": 98341})
+    # Kylas rejects an empty rules list but takes null, exactly what the web form saves for "All leads".
+    assert api.writes()[0]["body"]["filters"] == {"jsonRule": None}
+    assert patched.count.await_args.args == ("LEAD", None)
+    assert result["audience"]["smart_list"] == {"id": 98341, "name": "All leads"}
+    assert result["audience"]["conditions"] == ["everyone — every lead (the smart list has no conditions)"]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_smart_list_name_returns_a_choice_and_creates_nothing():
+    api = _activity_api()
+    with _ActivityPatched(api):
+        result = await create_activity_logic({**_SMART_LIST_CREATE, "smart_list": "leads-copy"})
+    assert result["note"].startswith("STOP") and [m["id"] for m in result["matches"]] == [146421, 146422]
+    assert api.writes() == []
+
+
+@pytest.mark.parametrize("payload,message", [
+    ({**_EMAIL_CREATE, "smart_list": "All leads"}, "either smart_list or audience_filters, not both"),
+    (_SMART_LIST_CREATE, "Give smart_list .* or audience_filters"),
+    ({**_SMART_LIST_CREATE, "smart_list": ""}, "Give smart_list .* or audience_filters"),
+])
+@pytest.mark.asyncio
+async def test_activity_create_needs_exactly_one_audience(payload, message):
+    api = _activity_api()
+    with _ActivityPatched(api):
+        with pytest.raises(ValueError, match=message):
+            await create_activity_logic(dict(payload))
+    assert api.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_smart_list_creates_nothing():
+    api = _activity_api()
+    with _ActivityPatched(api):
+        with pytest.raises(KylasAPIError, match="No lead smart list name contains 'Diwali'"):
+            await create_activity_logic({**_SMART_LIST_CREATE, "smart_list": "Diwali"})
+    assert api.writes() == []
 
 
 # --- campaign_activity.update -----------------------------------------------------
@@ -942,6 +1107,71 @@ async def test_activity_update_new_audience_is_counted_and_replaced():
     assert preview["preview"]["changes"]["audience_filters"]["after"] == [
         {"field": "firstName", "operator": "contains", "value": "Atharva"}]
     assert api.writes()[0]["body"]["filters"]["jsonRule"]["rules"][0]["field"] == "firstName"
+
+
+@pytest.mark.asyncio
+async def test_activity_update_with_a_smart_list_previews_then_copies_its_rules():
+    api, patched = _update(recipients=69)
+    with patched:
+        preview = await update_activity_logic({"activity_id": 800, "smart_list": "All leads-copy"})
+        assert api.writes() == []
+        result = await update_activity_logic({"activity_id": 800, "smart_list": "All leads-copy", "confirm": True})
+    shown = preview["preview"]
+    assert preview["executed"] is False and "NOTHING WAS WRITTEN" in preview["note"]  # update keeps its Yes / No
+    assert shown["smart_list"] == {"id": 146421, "name": "All leads-copy"}
+    assert shown["recipients_now"] == 69 and shown["smart_list_note"].startswith("The activity keeps its own copy")
+    assert "addressCoordinate" in shown["conditions"][0]
+    assert set(shown["changes"]) == {"audience_filters"}
+    (put,) = api.writes()
+    assert put["body"]["filters"] == {"jsonRule": {"condition": "AND", "valid": True, "rules": [_SL_RADIUS_RULE]}}
+    assert put["body"]["payload"] == _ACTIVITY_800["payload"] and put["body"]["name"] == "Welcome email"
+    assert result["executed"] is True and patched.count.await_count == 1  # counted on the preview only
+
+
+@pytest.mark.asyncio
+async def test_activity_update_to_a_smart_list_without_conditions_saves_null():
+    api, patched = _update(recipients=9986)
+    with patched:
+        preview = await update_activity_logic({"activity_id": 800, "smart_list": "All leads"})
+        await update_activity_logic({"activity_id": 800, "smart_list": "All leads", "confirm": True})
+    assert preview["preview"]["changes"]["audience_filters"]["after"] == []
+    assert preview["preview"]["conditions"] == ["everyone — every lead (the smart list has no conditions)"]
+    assert api.writes()[0]["body"]["filters"] == {"jsonRule": None}
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"smart_list": "All leads", "audience_filters": [{"field": "firstName", "operator": "contains", "value": "A"}]},
+     "either smart_list or audience_filters, not both"),
+    ({"smart_list": "Diwali"}, "No lead smart list name contains 'Diwali'"),
+    ({"entity": "CONTACT"}, "or a smart_list of contacts"),
+])
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.asyncio
+async def test_activity_update_smart_list_errors_write_nothing(change, message, confirm):
+    api, patched = _update()
+    with patched:
+        with pytest.raises((ValueError, KylasAPIError), match=message):
+            await update_activity_logic({"activity_id": 800, **change, "confirm": confirm})
+    assert api.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_activity_update_with_an_ambiguous_smart_list_asks_first():
+    api, patched = _update()
+    with patched:
+        result = await update_activity_logic({"activity_id": 800, "smart_list": "leads-copy", "confirm": True})
+    assert result["note"].startswith("STOP") and [m["id"] for m in result["matches"]] == [146421, 146422]
+    assert api.writes() == []
+
+
+@pytest.mark.asyncio
+async def test_started_activity_audience_cant_change_to_a_smart_list():
+    started = {**_ACTIVITY_800, "status": "IN_PROGRESS"}
+    api, patched = _update(started, {**_CAMPAIGN_449, "activities": [started]})
+    with patched:
+        with pytest.raises(ValueError, match=r"This activity is IN_PROGRESS: .*\['audience_filters'\]"):
+            await update_activity_logic({"activity_id": 800, "smart_list": "All leads-copy", "confirm": True})
+    assert api.writes() == []
 
 
 @pytest.mark.parametrize("status", ["IN_PROGRESS", "PAUSED", "COMPLETED", "QUEUED", "PROCESSED"])
