@@ -1011,13 +1011,41 @@ async def test_ambiguous_smart_list_name_returns_a_choice_and_creates_nothing():
     assert api.writes() == []
 
 
+@pytest.mark.asyncio
+async def test_smart_list_with_extra_filters_keeps_its_rules_and_adds_the_filters():
+    # Like the web form: pick a smart list, then add filters — all of them joined with AND.
+    api = _activity_api()
+    patched = _ActivityPatched(api, recipients=3)
+    with patched:
+        result = await create_activity_logic({**_EMAIL_CREATE, "smart_list": "All leads-copy"})
+    saved = api.writes()[0]["body"]["filters"]["jsonRule"]
+    assert saved["condition"] == "AND" and saved["valid"] is True
+    assert saved["rules"][0] == _SL_RADIUS_RULE  # the smart list's rule, unchanged and first
+    assert len(saved["rules"]) == 2 and saved["rules"][1]["field"] == "id" and saved["rules"][1]["value"] == 753407
+    assert patched.count.await_args.args == ("LEAD", saved)
+    audience = result["audience"]
+    assert audience["smart_list"] == {"id": 146421, "name": "All leads-copy"} and len(audience["conditions"]) == 2
+    assert audience["smart_list_note"].endswith("all must match.")
+
+
+@pytest.mark.asyncio
+async def test_smart_list_without_conditions_plus_filters_saves_only_the_filters():
+    api = _activity_api()
+    with _ActivityPatched(api, recipients=1):
+        result = await create_activity_logic({**_EMAIL_CREATE, "smart_list": "All leads"})
+    saved = api.writes()[0]["body"]["filters"]["jsonRule"]
+    assert [r["field"] for r in saved["rules"]] == ["id"]
+    assert "everyone" not in result["audience"]["conditions"][0]
+
+
 @pytest.mark.parametrize("payload,message", [
-    ({**_EMAIL_CREATE, "smart_list": "All leads"}, "either smart_list or audience_filters, not both"),
-    (_SMART_LIST_CREATE, "Give smart_list .* or audience_filters"),
-    ({**_SMART_LIST_CREATE, "smart_list": ""}, "Give smart_list .* or audience_filters"),
+    (_SMART_LIST_CREATE, "Give smart_list .*audience_filters"),
+    ({**_SMART_LIST_CREATE, "smart_list": ""}, "Give smart_list .*audience_filters"),
+    ({**_SMART_LIST_CREATE, "smart_list": "All leads-copy", "audience_filters": [{"field": "nope", "value": 1}]},
+     "Invalid audience filter"),
 ])
 @pytest.mark.asyncio
-async def test_activity_create_needs_exactly_one_audience(payload, message):
+async def test_activity_create_needs_a_valid_audience(payload, message):
     api = _activity_api()
     with _ActivityPatched(api):
         with pytest.raises(ValueError, match=message):
@@ -1139,9 +1167,21 @@ async def test_activity_update_to_a_smart_list_without_conditions_saves_null():
     assert api.writes()[0]["body"]["filters"] == {"jsonRule": None}
 
 
+@pytest.mark.asyncio
+async def test_activity_update_to_a_smart_list_with_extra_filters():
+    api, patched = _update(recipients=4)
+    change = {"activity_id": 800, "smart_list": "All leads-copy",
+              "audience_filters": [{"field": "firstName", "operator": "contains", "value": "A"}]}
+    with patched:
+        preview = await update_activity_logic(dict(change))
+        await update_activity_logic({**change, "confirm": True})
+    assert preview["executed"] is False and len(preview["preview"]["conditions"]) == 2
+    assert preview["preview"]["smart_list_note"].endswith("all must match.")
+    rules = api.writes()[0]["body"]["filters"]["jsonRule"]["rules"]
+    assert rules[0] == _SL_RADIUS_RULE and [r["field"] for r in rules[1:]] == ["firstName"]
+
+
 @pytest.mark.parametrize("change,message", [
-    ({"smart_list": "All leads", "audience_filters": [{"field": "firstName", "operator": "contains", "value": "A"}]},
-     "either smart_list or audience_filters, not both"),
     ({"smart_list": "Diwali"}, "No lead smart list name contains 'Diwali'"),
     ({"entity": "CONTACT"}, "or a smart_list of contacts"),
 ])

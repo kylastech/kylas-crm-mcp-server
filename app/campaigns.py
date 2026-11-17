@@ -1754,33 +1754,45 @@ def _audience_note(recipients: int) -> str:
 
 SMART_LIST_COPY_NOTE = ("The activity keeps its own copy of the smart list's conditions; later changes to the "
                         "smart list won't change this activity.")
+SMART_LIST_EXTRA_NOTE = " The extra audience_filters were added to the smart list's conditions — all must match."
 
 
 async def _activity_audience(
     entity: str, payload: Dict[str, Any], tz_name: str,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Who an activity reaches, as (jsonRule, smart_list, choice) — from audience_filters OR a smart list.
+    """Who an activity reaches, as (jsonRule, smart_list, choice) — from a smart list, audience_filters, or both.
 
-    A smart list's conditions are copied exactly as saved, like the web form
-    does, so conditions this server can't build itself (map radius) still
-    work. A smart list without conditions ("All leads") means everyone and is
-    saved as jsonRule null, as the web form saves it — Kylas rejects an empty
-    rules list but accepts null.
+    Works like the web form: picking a smart list copies its conditions
+    exactly as saved (so conditions this server can't build itself, like a
+    map radius, still work), and any extra filters are added after them,
+    all joined with AND. A smart list without conditions ("All leads") alone
+    means everyone and is saved as jsonRule null, as the web form saves it —
+    Kylas rejects an empty rules list but accepts null.
     """
     has_list = payload.get("smart_list") not in (None, "")
-    if has_list and payload.get("audience_filters"):
-        raise ValueError("Give either smart_list or audience_filters, not both.")
-    if not has_list:
-        if not payload.get("audience_filters"):
-            raise ValueError("Who gets it? Give smart_list (a lead / contact smart list's name or id) or "
-                             "audience_filters (needs at least one filter).")
-        return await build_audience_rule(entity, payload.get("audience_filters"), tz_name), None, None
-    smart_list, choice = await _resolve_smart_list(payload["smart_list"], entity)
-    if choice:
-        return None, None, choice
-    if not smart_list["rules"]:
+    has_filters = bool(payload.get("audience_filters"))
+    if not has_list and not has_filters:
+        raise ValueError("Who gets it? Give smart_list (a lead / contact smart list's name or id), "
+                         "audience_filters (needs at least one filter), or both (the filters narrow the smart list).")
+    smart_list = None
+    if has_list:
+        smart_list, choice = await _resolve_smart_list(payload["smart_list"], entity)
+        if choice:
+            return None, None, choice
+    extra = (await build_audience_rule(entity, payload["audience_filters"], tz_name))["rules"] if has_filters else []
+    rules = (smart_list["rules"] if smart_list else []) + extra
+    if not rules:
         return None, smart_list, None
-    return {"condition": "AND", "valid": True, "rules": smart_list["rules"]}, smart_list, None
+    return {"condition": "AND", "valid": True, "rules": rules}, smart_list, None
+
+
+async def _smart_list_details(entity: str, smart_list: Dict[str, Any], json_rule: Optional[Dict[str, Any]],
+                              tz_name: str) -> Dict[str, Any]:
+    """The smart list part of a create result / update preview: which list, every condition in words, the notes."""
+    extra = len((json_rule or {}).get("rules") or []) > len(smart_list["rules"])
+    return {"smart_list": {"id": smart_list["id"], "name": smart_list["name"]},
+            "conditions": await _smart_list_conditions(entity, (json_rule or {}).get("rules") or [], tz_name),
+            "smart_list_note": SMART_LIST_COPY_NOTE + (SMART_LIST_EXTRA_NOTE if extra else "")}
 
 
 async def _smart_list_conditions(entity: str, rules: List[Dict[str, Any]], tz_name: str) -> List[str]:
@@ -1852,9 +1864,7 @@ async def create_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
         audience = {"recipients_now": None,
                     "recipients_note": "Created, but the number of people it reaches couldn't be read right now."}
     if smart_list:
-        audience = {"smart_list": {"id": smart_list["id"], "name": smart_list["name"]},
-                    "conditions": await _smart_list_conditions(entity, smart_list["rules"], tz_name),
-                    **audience, "smart_list_note": SMART_LIST_COPY_NOTE}
+        audience = {**await _smart_list_details(entity, smart_list, json_rule, tz_name), **audience}
     return {
         **result,
         "audience": audience,
@@ -1866,7 +1876,7 @@ async def create_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
 async def update_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     """PUT /v1/campaigns/{cid}/activities/{aid} (read-merge-write) — preview, then confirm: true.
 
-    A new audience is audience_filters or a smart_list, with the same rules as create (_activity_audience).
+    A new audience is a smart_list, audience_filters or both, with the same rules as create (_activity_audience).
     """
     user = await _acting_user()
     tz_name = await _resolve_timezone(payload.get("timezone") or user["timezone"])
@@ -1901,7 +1911,7 @@ async def update_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     body["entity"] = entity
     recipients, smart_list = None, None
     if new_audience:
-        # Same rules as create: one of the two, a smart list copied as saved ("All leads" -> null).
+        # Same rules as create: a smart list copied as saved, plus any extra filters ("All leads" alone -> null).
         json_rule, smart_list, choice = await _activity_audience(entity, payload, tz_name)
         if choice:
             return choice
@@ -1945,9 +1955,7 @@ async def update_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     details = {"activity": _activity_ref(current), "changes": diff, "after_update": after}
     if smart_list:
-        details.update({"smart_list": {"id": smart_list["id"], "name": smart_list["name"]},
-                        "conditions": await _smart_list_conditions(entity, smart_list["rules"], tz_name),
-                        "smart_list_note": SMART_LIST_COPY_NOTE})
+        details.update(await _smart_list_details(entity, smart_list, body["filters"]["jsonRule"], tz_name))
     if recipients is not None:
         details.update({"recipients_now": recipients, "recipients_note": _audience_note(recipients)})
     return _preview_reply("campaign_activity.update", details, user,
@@ -2659,9 +2667,11 @@ _ACTIVITY_WRITE_PROPERTIES = {
 
 _SMART_LIST_PROPERTY = {
     "smart_list": {"type": ["string", "integer"],
-                   "description": "Who receives it, instead of audience_filters: a smart list of that entity, by name "
-                                  "or id (campaign_activity.smart_lists lists them). Its conditions are copied into "
-                                  "the activity; later changes to the smart list don't change it."},
+                   "description": "Who receives it: a smart list of that entity, by name or id "
+                                  "(campaign_activity.smart_lists lists them). Its conditions are copied into the "
+                                  "activity; later changes to the smart list don't change it. Can be given with "
+                                  "audience_filters: the filters are added to the smart list's conditions (all must "
+                                  "match), like adding filters after picking a smart list in the web form."},
 }
 
 _CONFIRM_PROPERTIES = {

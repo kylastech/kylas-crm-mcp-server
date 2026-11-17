@@ -308,16 +308,19 @@
 
     campaign_id or campaign_name. type: EMAIL or WHATSAPP (CALL isn't
     supported here). entity: LEAD or CONTACT — from what the user says; ask
-    if it's unclear. name (required). Who gets it (required, one of the two):
-    smart_list — a smart list of that entity, by name or id
-    (campaign_activity.smart_lists lists them); its conditions are copied
+    if it's unclear. name (required). Who gets it (required — a smart list,
+    filters, or both): smart_list — a smart list of that entity, by name or
+    id (campaign_activity.smart_lists lists them); its conditions are copied
     into the activity exactly as saved, so later changes to the smart list
     don't change the activity (say so). A smart list without conditions
     ("All leads", "All contacts") means everyone of that entity and is
-    allowed. Or audience_filters (at least one): the same filter format as
-    lead.search / contact.search on that entity — call
+    allowed. audience_filters (at least one if given): the same filter
+    format as lead.search / contact.search on that entity — call
     build_payload("campaign_activity.create", entity="lead" or "contact") to
-    get the filterable fields. Never both. budget (required) and actual_expense
+    get the filterable fields. Both together (like adding filters after
+    picking a smart list in the web form): the filters are added to the
+    smart list's conditions and every condition must match, e.g. smart list
+    "Mumbai leads" + source = Website. budget (required) and actual_expense
     (default 0): numbers, always in the campaign's currency. start_date
     (required) / end_date: the user's LOCAL date (plain start = 00:00, plain
     end = 23:59:59) and both inside the campaign's dates. utm_campaign,
@@ -373,9 +376,11 @@
     end_date (empty clears it), utm_* (utm_campaign must stay unique),
     entity (then a new audience must be given too: audience_filters on that
     entity's fields, or a smart_list of that entity), a new audience —
-    either audience_filters or smart_list (name or id; its conditions are
-    copied as saved, later smart list changes don't follow; a smart list
-    without conditions such as "All leads" means everyone), never both —
+    audience_filters, smart_list (name or id; its conditions are copied as
+    saved, later smart list changes don't follow; a smart list without
+    conditions such as "All leads" means everyone), or both (the filters are
+    added to the smart list's conditions, all must match); it replaces the
+    whole current audience —
     sent_to, email_template (EMAIL),
     whatsapp_account, whatsapp_template, retry_times (WHATSAPP) — with the
     same rules as campaign_activity.create. type: switch EMAIL <-> WHATSAPP
