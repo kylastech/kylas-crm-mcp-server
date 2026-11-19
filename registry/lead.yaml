@@ -98,7 +98,7 @@
     (str) — one of the allowed operators for that field type; value — type
     depends on field type; timeZone (str, optional) — for date/datetime
     filters; type (str, optional) — field type, inferred from schema if
-    omitted. Filters are REQUIRED (non-empty) for lead. page: 0-based
+    omitted. Filters are REQUIRED (non-empty) for lead unless smart_list is given. page: 0-based
     (default 0). size: page size, max 100 (default 20). sort: e.g.
     "createdAt,desc" (default).
 
@@ -133,6 +133,17 @@
     Idle / Stagnant Leads: use lead.search_idle(days) for "no activity for N
     days" queries. Fallback: lead.search with updatedAt ≤ threshold AND
     latestActivityCreatedAt ≤ threshold.
+
+    Smart list: when the user names a saved smart list ("leads from the
+    Holy West Team smart list"), pass smart_list — its name or id
+    (smart_list.lookup lists the lead smart lists) — instead of building
+    filters. The list's saved conditions are used exactly as saved. You can
+    still add filters ("... created this week"): they are added after the
+    list's conditions and all must match. Filters are then optional. A
+    smart list with no conditions ("All leads") means every lead. A name
+    matching several lists returns a choice: ask the user, then search
+    again with the chosen id. Smart lists are per entity, so a lead search
+    only sees lead smart lists.
   example:
     filters: [{field: "updatedAt", operator: "greater_or_equal", value: "2024-01-01T00:00:00.000Z"}]
 

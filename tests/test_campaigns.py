@@ -1145,7 +1145,7 @@ def test_campaign_activity_bucket_lists_its_ids():
                    "campaign_activity.create", "campaign_activity.email_templates",
                    "campaign_activity.generated_records", "campaign_activity.get", "campaign_activity.pause",
                    "campaign_activity.recipients", "campaign_activity.resume", "campaign_activity.search",
-                   "campaign_activity.smart_lists", "campaign_activity.start", "campaign_activity.update", "campaign_activity.whatsapp_accounts",
+                   "campaign_activity.start", "campaign_activity.update", "campaign_activity.whatsapp_accounts",
                    "campaign_activity.whatsapp_templates"]
 
 

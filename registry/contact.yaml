@@ -86,7 +86,7 @@
     that field type; value — type depends on field type; timeZone (str,
     optional) — for date/datetime filters; type (str, optional) — field
     type, inferred from schema if omitted. Filters are REQUIRED (non-empty)
-    for contact. page: 0-based (default 0). size: page size, max 100
+    for contact unless smart_list is given. page: 0-based (default 0). size: page size, max 100
     (default 20). sort: e.g. "createdAt,desc" (default).
 
     No pipeline or pipelineStage fields exist for contacts — don't filter by
@@ -117,6 +117,17 @@
     auto-fetch all pages sequentially — fetch page 1, show results, then ask
     if the user wants more. If you receive a 429 error: stop, wait at least
     5 seconds, then retry once.
+
+    Smart list: when the user names a saved smart list ("contacts from the
+    Marketing smart list"), pass smart_list — its name or id
+    (smart_list.lookup lists the contact smart lists) — instead of building
+    filters. The list's saved conditions are used exactly as saved. You can
+    still add filters ("... created this week"): they are added after the
+    list's conditions and all must match. Filters are then optional. A
+    smart list with no conditions ("All contacts") means every contact. A
+    name matching several lists returns a choice: ask the user, then search
+    again with the chosen id. Smart lists are per entity, so a contact
+    search only sees contact smart lists.
   example:
     filters: [{field: "createdAt", operator: "greater_or_equal", value: "2024-01-01T00:00:00.000Z"}]
 

@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import yaml
 
@@ -16,6 +16,8 @@ from app.campaigns import (
     CAMPAIGN_BUCKETS,
     CAMPAIGN_ROUTERS,
     CAMPAIGN_SCHEMAS,
+    _resolve_smart_list,
+    smart_lists_logic,
     unwired_campaign_ids,
 )
 from app.entities import (
@@ -283,14 +285,19 @@ async def get_entity_logic(entity_type: str, entity_id: int) -> Any:
 # Generic Search Tool
 # ---------------------------------------------------------------------------
 
+SMART_LIST_SEARCH_ENTITIES = ("lead", "contact")  # the entities whose smart lists we can search with
+SMART_LIST_LOOKUP_ID = "smart_list.lookup"  # the _meta helper that lists them
+
+
 async def search_entity_logic(
     entity_type: str,
     filters: List[Dict[str, Any]],
     page: int = 0,
     size: int = 20,
     sort: Optional[str] = "createdAt,desc",
+    smart_list: Optional[Union[str, int]] = None,
 ) -> str:
-    """Logic for generic entity search."""
+    """Logic for generic entity search. A lead / contact search can also take a smart list (name or id)."""
     # Validate entity_type
     cfg = _ENTITY_CONFIG.get(entity_type)
     if not cfg:
@@ -302,10 +309,15 @@ async def search_entity_logic(
     if not search_fn:
         return f"Entity type '{entity_type}' does not support search."
 
-    # Validate filters for entities that require them
-    if entity_type not in ("meeting", "call_log"):
+    has_smart_list = smart_list not in (None, "")
+    if has_smart_list and entity_type not in SMART_LIST_SEARCH_ENTITIES:
+        return (f"Error: smart_list works for lead and contact searches only, not {entity_type}. "
+                "Search with filters instead.")
+
+    # Validate filters for entities that require them (a smart list is enough on its own)
+    if entity_type not in ("meeting", "call_log") and not has_smart_list:
         if not filters:
-            return "Error: filters cannot be empty for this entity type. Provide at least one filter."
+            return "Error: filters cannot be empty for this entity type. Provide at least one filter, or a smart_list."
 
     # Handle pagination offset (meeting/call_log are 1-based)
     page_offset = cfg.get("search_page_offset", 0)
@@ -313,8 +325,20 @@ async def search_entity_logic(
 
     # Call the entity-specific search logic
     try:
-        result = await search_fn(filters, page=api_page, size=size, sort=sort)
-        return result
+        if not has_smart_list:
+            return await search_fn(filters, page=api_page, size=size, sort=sort)
+        # The smart list's saved conditions are sent exactly as saved (map radius etc. included);
+        # extra filters are added after them. "All leads" has no conditions, so it means everyone.
+        found, choice = await _resolve_smart_list(smart_list, entity_type.upper())
+        if choice:
+            names = "; ".join(f"{m.get('name')} (id {m.get('id')})" for m in choice["matches"])
+            return f"{choice['note']} Matches: {names}"
+        result = await search_fn(filters or [], page=api_page, size=size, sort=sort, base_rules=found["rules"])
+        extra = f" plus {len(filters)} extra filter(s)" if filters else ""
+        what = (f"its {len(found['rules'])} saved condition(s){extra}" if found["rules"]
+                else "no conditions (everyone)" + (f", so only your {len(filters)} filter(s)" if filters else ""))
+        return (f"Smart list \"{found['name']}\" (id {found['id']}) used with {what}, exactly as saved.\n"
+                f"{result}")
     except Exception as e:
         return f"Error searching {entity_type}: {str(e)}"
 
@@ -326,6 +350,7 @@ async def search_entity(
     page: int = 0,
     size: int = 20,
     sort: Optional[str] = "createdAt,desc",
+    smart_list: Optional[Union[str, int]] = None,
 ) -> str:
     """
     Search/filter any entity type (lead, contact, task, deal, company, meeting, call_log).
@@ -340,8 +365,12 @@ async def search_entity(
       - timeZone (str, optional): For date/datetime filters.
       - type (str, optional): Field type. If omitted, inferred from schema.
 
-    For lead/contact/task/deal/company: Filters are REQUIRED (non-empty).
+    For lead/contact/task/deal/company: Filters are REQUIRED (non-empty), unless smart_list is given.
     For meeting/call_log: Filters are OPTIONAL (empty = all records).
+
+    smart_list (lead and contact only): the name or id of a saved smart list of that entity
+    (smart_list.lookup finds them). Its saved conditions are used exactly as saved; any filters are
+    added after them and all must match. A smart list with no conditions ("All leads") means everyone.
 
     page: 0-based page for lead/contact/task/deal/company; 1-based for meeting/call_log (default 0).
     size: Page size, max 100 (max 500 for meeting/call_log) (default 20).
@@ -357,7 +386,7 @@ async def search_entity(
       - search_entity("meeting", [{"field": "owner", "operator": "equal", "value": user_id}])
       - search_entity("meeting", [{"field": "organizer", "operator": "equal", "value": user_id}])
     """
-    return await search_entity_logic(entity_type, filters, page, size, sort)
+    return await search_entity_logic(entity_type, filters, page, size, sort, smart_list)
 
 
 async def search_entity_by_term_logic(
@@ -789,7 +818,8 @@ def list_tool(
       campaign_activity, _meta
       intents: get, search, search_by_term, search_idle, create, update, lookup, preview, cancel, delete, analytics,
       start, pause, resume, complete
-      (lead/deal/company have all of get/search/search_by_term/search_idle/
+      (lead.search / contact.search also take smart_list, a smart list's name or id;
+      lead/deal/company have all of get/search/search_by_term/search_idle/
       create/update; contact has the same 5 minus search_idle; meeting has
       the same 5 plus cancel, delete, and lookup (meeting.lookup_related);
       task has get/search/search_by_term/create/update plus lookup
@@ -807,14 +837,14 @@ def list_tool(
       calls: preview, then confirm; pause/resume/complete run at once;
       start/resume send real messages); campaign_activity has
       search, get, analytics (funnel / call outcomes), lookups for
-      templates/accounts/smart lists/UTM, create, update, start, pause, resume and
+      templates/accounts/UTM, create, update, start, pause, resume and
       complete (EMAIL / WHATSAPP; create is ONE call that makes a DRAFT, no
       confirm; update/start are preview then confirm, like campaign),
       plus recipients and generated_records (search intent); _meta
       is bucket-less and has lookup entries only (user.lookup,
       product.lookup, pipeline.lookup, pipeline.details,
       datetime.parse_to_utc, team.lookup, campaign.lookup,
-      campaign.activities, goal.lookup, goal.details). Call list_tool(bucket=...) to see exactly
+      campaign.activities, goal.lookup, goal.details, smart_list.lookup). Call list_tool(bucket=...) to see exactly
       which intents a given bucket actually has — don't assume parity
       across buckets.)
 
@@ -1176,7 +1206,7 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
         original_get_tool = _REGISTRY_BUCKET_TO_GET_TOOL.get(entry["bucket"])
         schema = _real_get_schema(original_get_tool) if original_get_tool else (entry.get("schema") or {})
     elif entry["intent"] == "search":
-        schema = _real_search_schema()
+        schema = _real_search_schema(entry["bucket"])
     elif entry["intent"] == "search_by_term":
         schema = _real_search_by_term_schema()
     elif entry["intent"] == "search_idle":
@@ -1188,6 +1218,8 @@ async def build_payload(id: str, fields: Optional[List[str]] = None, entity: Opt
             schema = _real_create_schema()
     elif entry["intent"] == "update":
         schema = _real_update_schema()
+    elif id == SMART_LIST_LOOKUP_ID:
+        schema = _smart_list_lookup_schema()
     elif entry["intent"] == "lookup":
         schema = _real_get_schema(_REGISTRY_ID_TO_META_TOOL.get(id, ""))
     elif entry["intent"] in ("cancel", "delete"):
@@ -1396,6 +1428,7 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
                 page=payload.get("page", 0),
                 size=payload.get("size", 20),
                 sort=payload.get("sort", "createdAt,desc"),
+                smart_list=payload.get("smart_list"),
             )
         elif intent == "search_by_term":
             result = await search_entity_by_term_logic(
@@ -1761,6 +1794,7 @@ _META_LOOKUP_ROUTERS: Dict[str, Any] = {
     "goal.details": _goal_details_router,
     "meeting.cancel": _cancel_meeting_router,
     "meeting.delete": _delete_meeting_router,
+    SMART_LIST_LOOKUP_ID: smart_lists_logic,
 }
 
 
@@ -1777,14 +1811,29 @@ def _real_get_schema(tool_name: str) -> Dict[str, Any]:
     return json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get(tool_name, {})))
 
 
-def _real_search_schema() -> Dict[str, Any]:
+def _real_search_schema(bucket: Optional[str] = None) -> Dict[str, Any]:
     """
     search_entity's real inputSchema, with "entity_type" removed (redundant —
     the registry id already fixes it) and "page"/"size"/"sort" kept exactly
     as search_entity actually declares them, defaults included.
+    "smart_list" stays only for the buckets that can use one (lead, contact).
     """
     schema = json.loads(json.dumps(_ORIGINAL_TOOL_PARAMETERS.get("search_entity", {})))
+    if bucket not in SMART_LIST_SEARCH_ENTITIES:
+        schema.get("properties", {}).pop("smart_list", None)
     return _without_entity_type(schema)
+
+
+def _smart_list_lookup_schema() -> Dict[str, Any]:
+    """smart_list.lookup's input: whose smart lists (LEAD or CONTACT) and an optional part of the name."""
+    return {
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string", "enum": ["LEAD", "CONTACT"], "description": "Whose smart lists to list: LEAD or CONTACT."},
+            "query": {"type": "string", "description": "Part of the smart list name; leave out to list the first 50."},
+        },
+        "required": ["entity"],
+    }
 
 
 def _real_search_by_term_schema() -> Dict[str, Any]:
