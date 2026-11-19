@@ -807,8 +807,9 @@ def list_tool(
       calls: preview, then confirm; pause/resume/complete run at once;
       start/resume send real messages); campaign_activity has
       search, get, analytics (funnel / call outcomes), lookups for
-      templates/accounts/UTM, create, update, start, pause, resume and
-      complete (EMAIL / WHATSAPP, same call rules as campaign),
+      templates/accounts/smart lists/UTM, create, update, start, pause, resume and
+      complete (EMAIL / WHATSAPP; create is ONE call that makes a DRAFT, no
+      confirm; update/start are preview then confirm, like campaign),
       plus recipients and generated_records (search intent); _meta
       is bucket-less and has lookup entries only (user.lookup,
       product.lookup, pipeline.lookup, pipeline.details,

@@ -1240,6 +1240,41 @@ async def _resolve_whatsapp_template(
     return {"id": t["id"], "name": t.get("name")}, None
 
 
+SMART_LIST_LOOKUP_SIZE = 50  # the lookup returns only 10 by default; a tenant can have many more
+_SMART_LIST_MISSING = "003005"  # Kylas answers an unknown (or other entity's) id with 400 + this code, not 404
+
+
+async def _resolve_smart_list(value: Any, entity: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """A lead / contact smart list by id or name, as ({id, name, rules}, None) — or (None, choice).
+
+    Smart lists are separate per entity, so only that entity's lists are
+    searched. `rules` are the smart list's saved conditions, exactly as
+    stored; they are empty for an "everyone" list such as "All leads".
+    """
+    path = entity.lower()
+    list_id, name = _id_or_name(value)
+    if not list_id:
+        data = await _kylas_get(f"/v1/search-lists/{path}/lookup", "Look up smart lists",
+                                params={"q": name, "size": SMART_LIST_LOOKUP_SIZE})
+        row, choice = _choose_by_name(_lookup_rows(data), name, f"{path} smart list")
+        if choice:
+            return None, choice
+        list_id = row["id"]
+    missing = (f"No {path} smart list with id {list_id}. Smart lists belong to one entity — "
+               f"campaign_activity.smart_lists lists the {path} ones.")
+    try:
+        sl = await _kylas_get(f"/v1/search-lists/{path}/{list_id}", "Fetch smart list", not_found=missing)
+    except KylasAPIError as e:
+        if e.status_code == 400 and _SMART_LIST_MISSING in (e.response_body or ""):
+            raise KylasAPIError(missing, status_code=404)
+        raise
+    if str(sl.get("entityType") or entity).upper() != entity:
+        raise ValueError(f"Smart list '{sl.get('name')}' is for {str(sl.get('entityType')).upper()}s, "
+                         f"not {entity}s.")
+    rules = ((sl.get("searchRequest") or {}).get("jsonRule") or {}).get("rules") or []
+    return {"id": sl.get("id"), "name": sl.get("name"), "rules": rules}, None
+
+
 def _check_whatsapp_template(t: Dict[str, Any], account_id: int, entity: str) -> None:
     """A template is usable only from its own account, for its own entity, once WhatsApp approved it."""
     if (t.get("connectedAccount") or {}).get("id") != account_id:
@@ -1303,6 +1338,14 @@ async def whatsapp_templates_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
                             params={"connectedAccountId": account["id"], "entityType": entity.lower(),
                                     "q": str(payload.get("query") or "")})
     return {"account": account, "templates": [{"id": r.get("id"), "name": r.get("name")} for r in _lookup_rows(data)]}
+
+
+async def smart_lists_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Smart lists of leads or of contacts, optionally narrowed by name (at most 50 rows)."""
+    entity = _entity_arg(payload)
+    data = await _kylas_get(f"/v1/search-lists/{entity.lower()}/lookup", "Look up smart lists",
+                            params={"q": str(payload.get("query") or ""), "size": SMART_LIST_LOOKUP_SIZE})
+    return {"entity": entity, "smart_lists": [{"id": r.get("id"), "name": r.get("name")} for r in _lookup_rows(data)]}
 
 
 async def check_utm_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1554,7 +1597,7 @@ _ACTIVITY_TEXT_FIELDS = ("name", "utm_campaign", "utm_source", "utm_medium", "ut
 _ACTIVITY_REQUIRED_TEXT = ("name", "utm_campaign", "utm_source", "utm_medium")
 _ACTIVITY_PAYLOAD_FIELDS = ("sent_to", "email_template", "whatsapp_account", "whatsapp_template", "retry_times")
 _ACTIVITY_CHANGEABLE = ("type",) + _ACTIVITY_TEXT_FIELDS + ("budget", "actual_expense", "start_date", "end_date",
-                                                           "entity", "audience_filters") + _ACTIVITY_PAYLOAD_FIELDS
+                                                           "entity", "audience_filters", "smart_list") + _ACTIVITY_PAYLOAD_FIELDS
 # The readable fields that come from an activity's payload; all of them change with its type.
 _PAYLOAD_VIEW_FIELDS = ("type", "sent_to", "email_template", "whatsapp_account", "whatsapp_template", "retry_times")
 CAMPAIGN_AUDIENCE_IDS = frozenset({"campaign_activity.create", "campaign_activity.update"})
@@ -1709,8 +1752,63 @@ def _audience_note(recipients: int) -> str:
     return "Can start: within the 1 to 10,000 recipients an activity needs."
 
 
+SMART_LIST_COPY_NOTE = ("The activity keeps its own copy of the smart list's conditions; later changes to the "
+                        "smart list won't change this activity.")
+SMART_LIST_EXTRA_NOTE = " The extra audience_filters were added to the smart list's conditions — all must match."
+
+
+async def _activity_audience(
+    entity: str, payload: Dict[str, Any], tz_name: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Who an activity reaches, as (jsonRule, smart_list, choice) — from a smart list, audience_filters, or both.
+
+    Works like the web form: picking a smart list copies its conditions
+    exactly as saved (so conditions this server can't build itself, like a
+    map radius, still work), and any extra filters are added after them,
+    all joined with AND. A smart list without conditions ("All leads") alone
+    means everyone and is saved as jsonRule null, as the web form saves it —
+    Kylas rejects an empty rules list but accepts null.
+    """
+    has_list = payload.get("smart_list") not in (None, "")
+    has_filters = bool(payload.get("audience_filters"))
+    if not has_list and not has_filters:
+        raise ValueError("Who gets it? Give smart_list (a lead / contact smart list's name or id), "
+                         "audience_filters (needs at least one filter), or both (the filters narrow the smart list).")
+    smart_list = None
+    if has_list:
+        smart_list, choice = await _resolve_smart_list(payload["smart_list"], entity)
+        if choice:
+            return None, None, choice
+    extra = (await build_audience_rule(entity, payload["audience_filters"], tz_name))["rules"] if has_filters else []
+    rules = (smart_list["rules"] if smart_list else []) + extra
+    if not rules:
+        return None, smart_list, None
+    return {"condition": "AND", "valid": True, "rules": rules}, smart_list, None
+
+
+async def _smart_list_details(entity: str, smart_list: Dict[str, Any], json_rule: Optional[Dict[str, Any]],
+                              tz_name: str) -> Dict[str, Any]:
+    """The smart list part of a create result / update preview: which list, every condition in words, the notes."""
+    extra = len((json_rule or {}).get("rules") or []) > len(smart_list["rules"])
+    return {"smart_list": {"id": smart_list["id"], "name": smart_list["name"]},
+            "conditions": await _smart_list_conditions(entity, (json_rule or {}).get("rules") or [], tz_name),
+            "smart_list_note": SMART_LIST_COPY_NOTE + (SMART_LIST_EXTRA_NOTE if extra else "")}
+
+
+async def _smart_list_conditions(entity: str, rules: List[Dict[str, Any]], tz_name: str) -> List[str]:
+    """A smart list's conditions in words, to show the user. Display only — the saved rules stay as they are."""
+    if not rules:
+        return [f"everyone — every {entity.lower()} (the smart list has no conditions)"]
+    try:
+        rebuilt = rebuild_audience(entity, rules, await _AUDIENCE_FIELD_FETCHERS[entity](), tz_name)
+        return rebuilt["readable"] + [c["condition"] for c in rebuilt["cannot_reuse"]]
+    except Exception as e:  # words are only a help; never fail a done create over them
+        logger.warning("Could not describe smart list rules in words: %r", e)
+        return [f"{r.get('field')} {str(r.get('operator') or '').replace('_', ' ')} {r.get('value')}" for r in rules]
+
+
 async def create_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """POST /v1/campaigns/{cid}/activities — in two calls: preview (nothing written), then confirm: true."""
+    """POST /v1/campaigns/{cid}/activities """
     activity_type = _activity_type_arg(payload.get("type"))
     _check_type_fields(payload, activity_type)
     entity = _entity_arg(payload)
@@ -1741,7 +1839,9 @@ async def create_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
     activity_payload, choice = await _activity_payload(activity_type, entity, payload)
     if choice:
         return choice
-    json_rule = await build_audience_rule(entity, payload.get("audience_filters"), tz_name)
+    json_rule, smart_list, choice = await _activity_audience(entity, payload, tz_name)
+    if choice:
+        return choice
 
     body = {
         "name": texts["name"], "status": "DRAFT", "entity": entity,
@@ -1749,27 +1849,35 @@ async def create_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
         **{_ACTIVITY_FIELD_MAP[k]: v for k, v in texts.items() if k != "name"},
         "filters": {"jsonRule": json_rule}, "payload": activity_payload,
     }
-    if payload.get("confirm") is True:
-        created = await _campaign_call("POST", f"/v1/campaigns/{campaign_id}/activities", "Create campaign activity",
-                                       body=body)
-        return await _confirmed(
-            "activity", lambda: get_activity_logic({"activity_id": created["id"], "campaign_id": campaign_id}),
-            created["id"])
+    created = await _campaign_call("POST", f"/v1/campaigns/{campaign_id}/activities", "Create campaign activity",
+                                   body=body)
+    result = await _confirmed(
+        "activity", lambda: get_activity_logic({"activity_id": created["id"], "campaign_id": campaign_id}),
+        created["id"])
 
-    recipients = await count_audience(entity, json_rule)
-    details = {
-        "campaign": {"id": campaign_id, "name": campaign.get("name"), "status": campaign.get("status")},
-        **_activity_view(body, await _currency_names(), tz_name),
-        "recipients_now": recipients,
-        "recipients_note": _audience_note(recipients),
-        "status": "DRAFT (nothing is sent until it is started)",
+    # Created — from here on nothing may turn this into an error (a retry would fail on its utm_campaign).
+    try:
+        recipients = await count_audience(entity, json_rule)
+        audience: Dict[str, Any] = {"recipients_now": recipients, "recipients_note": _audience_note(recipients)}
+    except Exception as e:
+        logger.warning("Activity %s was created but counting its audience failed: %r", created["id"], e)
+        audience = {"recipients_now": None,
+                    "recipients_note": "Created, but the number of people it reaches couldn't be read right now."}
+    if smart_list:
+        audience = {**await _smart_list_details(entity, smart_list, json_rule, tz_name), **audience}
+    return {
+        **result,
+        "audience": audience,
+        "runs_as": {"user": user["name"], "user_id": user["id"], "tenant_id": user["tenant_id"]},
+        "status": "DRAFT — nothing is sent until it is started (campaign_activity.start asks the user first).",
     }
-    return _preview_reply("campaign_activity.create", details, user,
-                          f"create this {activity_type} activity in campaign '{campaign.get('name')}'")
 
 
 async def update_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """PUT /v1/campaigns/{cid}/activities/{aid} (read-merge-write) — preview, then confirm: true."""
+    """PUT /v1/campaigns/{cid}/activities/{aid} (read-merge-write) — preview, then confirm: true.
+
+    A new audience is a smart_list, audience_filters or both, with the same rules as create (_activity_audience).
+    """
     user = await _acting_user()
     tz_name = await _resolve_timezone(payload.get("timezone") or user["timezone"])
     current, choice = await _resolve_activity(payload)
@@ -1796,12 +1904,17 @@ async def update_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
         if key in asked:
             body[api_field] = await _activity_money(payload[key], currency_id, key)
     entity = _entity_arg(payload) if "entity" in asked else current.get("entity")
-    if entity != current.get("entity") and "audience_filters" not in asked:
-        raise ValueError(f"Changing the entity to {entity} needs new audience_filters on {entity.lower()} fields.")
+    new_audience = "audience_filters" in asked or "smart_list" in asked
+    if entity != current.get("entity") and not new_audience:
+        raise ValueError(f"Changing the entity to {entity} needs new audience_filters on {entity.lower()} fields, "
+                         f"or a smart_list of {entity.lower()}s.")
     body["entity"] = entity
-    recipients = None
-    if "audience_filters" in asked:
-        json_rule = await build_audience_rule(entity, payload.get("audience_filters"), tz_name)
+    recipients, smart_list = None, None
+    if new_audience:
+        # Same rules as create: a smart list copied as saved, plus any extra filters ("All leads" alone -> null).
+        json_rule, smart_list, choice = await _activity_audience(entity, payload, tz_name)
+        if choice:
+            return choice
         body["filters"] = {"jsonRule": json_rule}
         if payload.get("confirm") is not True:  # only the preview shows it; a failed count mustn't block the write
             recipients = await count_audience(entity, json_rule)
@@ -1820,7 +1933,8 @@ async def update_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     currencies = await _currency_names()
     before, after = _activity_view(current, currencies, tz_name), _activity_view(body, currencies, tz_name)
-    shown = set(asked) | {"entity"} | (set(_PAYLOAD_VIEW_FIELDS) if type_changed else set())
+    shown = (set(asked) | {"entity"} | (set(_PAYLOAD_VIEW_FIELDS) if type_changed else set())
+             | ({"audience_filters"} if new_audience else set()))
     diff = {k: {"before": before.get(k), "after": after.get(k)} for k in (*after, *before)
             if k in shown and before.get(k) != after.get(k)}
     if not diff:
@@ -1840,6 +1954,8 @@ async def update_activity_logic(payload: Dict[str, Any]) -> Dict[str, Any]:
             current["id"])
 
     details = {"activity": _activity_ref(current), "changes": diff, "after_update": after}
+    if smart_list:
+        details.update(await _smart_list_details(entity, smart_list, body["filters"]["jsonRule"], tz_name))
     if recipients is not None:
         details.update({"recipients_now": recipients, "recipients_note": _audience_note(recipients)})
     return _preview_reply("campaign_activity.update", details, user,
@@ -2549,6 +2665,15 @@ _ACTIVITY_WRITE_PROPERTIES = {
     "retry_times": {"type": "integer", "minimum": 0, "maximum": 7, "description": "WHATSAPP: retries, 0 to 7."},
 }
 
+_SMART_LIST_PROPERTY = {
+    "smart_list": {"type": ["string", "integer"],
+                   "description": "Who receives it: a smart list of that entity, by name or id "
+                                  "(campaign_activity.smart_lists lists them). Its conditions are copied into the "
+                                  "activity; later changes to the smart list don't change it. Can be given with "
+                                  "audience_filters: the filters are added to the smart list's conditions (all must "
+                                  "match), like adding filters after picking a smart list in the web form."},
+}
+
 _CONFIRM_PROPERTIES = {
     "confirm": {"type": "boolean",
                 "description": "Leave out for the preview. true only after the user said Yes to it, with the same details."},
@@ -2659,7 +2784,7 @@ CAMPAIGN_SCHEMAS: Dict[str, Dict[str, Any]] = {
             "campaign_name": {"type": "string", "description": "The campaign's name; several matches return a choice."},
             "type": {"type": "string", "enum": list(_ACTIVITY_WRITE_TYPES)},
             **_ACTIVITY_WRITE_PROPERTIES,
-            **_CONFIRM_PROPERTIES,
+            **_SMART_LIST_PROPERTY,
         },
     },
     "campaign_activity.update": {
@@ -2670,6 +2795,7 @@ CAMPAIGN_SCHEMAS: Dict[str, Dict[str, Any]] = {
                      "description": "Only to switch EMAIL <-> WHATSAPP (DRAFT / FAILED); give the new type's "
                                     "template (and WhatsApp account) too."},
             **_ACTIVITY_WRITE_PROPERTIES,
+            **_SMART_LIST_PROPERTY,
             **_CONFIRM_PROPERTIES,
         },
     },
@@ -2708,6 +2834,14 @@ CAMPAIGN_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
         "required": ["whatsapp_account", "entity"],
     },
+    "campaign_activity.smart_lists": {
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string", "enum": ACTIVITY_ENTITIES, "description": "Who the activity targets."},
+            "query": {"type": "string", "description": "Part of the smart list name; leave out to list the first 50."},
+        },
+        "required": ["entity"],
+    },
     "campaign_activity.check_utm": {
         "type": "object",
         "properties": {
@@ -2739,6 +2873,7 @@ CAMPAIGN_ROUTERS: Dict[str, CampaignRouter] = {
     "campaign_activity.email_templates": email_templates_logic,
     "campaign_activity.whatsapp_accounts": whatsapp_accounts_logic,
     "campaign_activity.whatsapp_templates": whatsapp_templates_logic,
+    "campaign_activity.smart_lists": smart_lists_logic,
     "campaign_activity.check_utm": check_utm_logic,
 }
 

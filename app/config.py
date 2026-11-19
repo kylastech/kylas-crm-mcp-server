@@ -216,9 +216,12 @@ Not every bucket has every intent:
     the user clearly asks for that action on that campaign / activity. campaign.lookup /
     campaign.activities in _meta are only report-filter helpers — use the campaign bucket to answer campaign questions.
   - campaign_activity: search, get, analytics, lookups (email_templates, whatsapp_accounts, whatsapp_templates,
-    check_utm), create, update, start, pause, resume, complete (EMAIL / WHATSAPP; create/update/start are two
-    calls like campaign writes, pause/resume/complete run at once; start/resume send real messages), plus search-intent
-    recipients and generated_records
+    check_utm, smart_lists), create, update, start, pause, resume, complete (EMAIL / WHATSAPP; create is ONE call
+    that saves the activity straight away as a DRAFT.
+    its audience is a smart_list (lead / contact smart list name or id), audience_filters, or both — then the
+    filters are added to the smart list's conditions and all must match, as in the web form.
+    update/start are two calls like campaign writes, pause/resume/complete run at once; start/resume send real
+    messages), plus search-intent recipients and generated_records
     (the email/WhatsApp/call activities inside campaigns: campaign_activity.analytics gives the sent/delivered/read
     funnel or call outcomes, campaign_activity.recipients who received it and what each did). Every id but search
     takes activity_name, so the user never needs an id.
