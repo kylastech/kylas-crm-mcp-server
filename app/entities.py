@@ -1011,13 +1011,26 @@ def _extract_primary_phone(phones: Any) -> str:
     return "-"
 
 
+def _with_base_rules(json_rule: Optional[Dict[str, Any]], base_rules: Optional[List[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    """A search jsonRule that also keeps a smart list's saved conditions, exactly as saved, in front.
+
+    Kylas accepts jsonRule null ("everyone") but not an empty rules list, so no rules at all gives None.
+    """
+    rules = list(base_rules or []) + list((json_rule or {}).get("rules") or [])
+    return {"condition": "AND", "valid": True, "rules": rules} if rules else None
+
+
 async def search_leads_logic(
     filters: List[Dict[str, Any]],
     page: int = 0,
     size: int = 20,
     sort: Optional[str] = "createdAt,desc",
+    base_rules: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """Search leads with jsonRule; only filterable fields allowed. Uses current user timezone for date/datetime filters when timeZone is not provided."""
+    """Search leads with jsonRule; only filterable fields allowed. Uses current user timezone for date/datetime filters when timeZone is not provided.
+
+    base_rules: a smart list's saved conditions, sent as they are; filters (if any) are added after them with AND.
+    """
     fields_list = await _fetch_lead_fields()
     filterable_map = _get_filterable_fields_map(fields_list)
     if not filterable_map:
@@ -1033,15 +1046,17 @@ async def search_leads_logic(
             except Exception:
                 default_tz = DEFAULT_TIMEZONE
             break
-    json_rule, err = _build_search_json_rule(
-        filters, filterable_map, default_timezone=default_tz,
-        internal_name_fields=_BUCKET_PICKLIST_RULES.get("lead", {}).get("internal_name", set()),
-    )
+    json_rule, err = None, None
+    if filters:
+        json_rule, err = _build_search_json_rule(
+            filters, filterable_map, default_timezone=default_tz,
+            internal_name_fields=_BUCKET_PICKLIST_RULES.get("lead", {}).get("internal_name", set()),
+        )
     if err:
         return f"Invalid filters: {err}"
     payload = {
         "fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "companyName", "createdAt"],
-        "jsonRule": json_rule,
+        "jsonRule": _with_base_rules(json_rule, base_rules) if base_rules is not None else json_rule,
     }
     params = {"page": page, "size": min(size, 100)}
     if sort:
@@ -1342,8 +1357,12 @@ async def search_contacts_logic(
     page: int = 0,
     size: int = 20,
     sort: Optional[str] = "createdAt,desc",
+    base_rules: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """Search contacts with jsonRule; only filterable fields allowed."""
+    """Search contacts with jsonRule; only filterable fields allowed.
+
+    base_rules: a smart list's saved conditions, sent as they are; filters (if any) are added after them with AND.
+    """
     fields_list = await _fetch_contact_fields()
     filterable_map = _get_filterable_fields_map(fields_list)
     # Add associated entity fields which are filterable but may not be marked as such in schema
@@ -1363,15 +1382,17 @@ async def search_contacts_logic(
             except Exception:
                 default_tz = DEFAULT_TIMEZONE
             break
-    json_rule, err = _build_search_json_rule(
-        filters, filterable_map, default_timezone=default_tz,
-        internal_name_fields=_BUCKET_PICKLIST_RULES.get("contact", {}).get("internal_name", set()),
-    )
+    json_rule, err = None, None
+    if filters:
+        json_rule, err = _build_search_json_rule(
+            filters, filterable_map, default_timezone=default_tz,
+            internal_name_fields=_BUCKET_PICKLIST_RULES.get("contact", {}).get("internal_name", set()),
+        )
     if err:
         return f"Invalid filters: {err}"
     payload = {
         "fields": ["id", "firstName", "lastName", "emails", "phoneNumbers", "ownerId", "department", "designation", "createdAt"],
-        "jsonRule": json_rule,
+        "jsonRule": _with_base_rules(json_rule, base_rules) if base_rules is not None else json_rule,
     }
     params = {"page": page, "size": min(size, 100)}
     if sort:

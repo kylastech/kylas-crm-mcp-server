@@ -194,10 +194,13 @@ campaign_activity,
 plus a bucket-less "_meta" group for shared lookups (user.lookup,
 product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
 team.lookup, campaign.lookup, campaign.activities,
-    goal.lookup, goal.details).
+    goal.lookup, goal.details, smart_list.lookup).
 Not every bucket has every intent:
   - lead, deal, company: get, search, search_by_term, search_idle, create, update (all 6)
   - contact: get, search, search_by_term, create, update (no search_idle)
+  - lead.search / contact.search also take smart_list (a saved smart list's name or id): the list's saved
+    conditions are used as they are, filters are optional then and any you add must match too
+    (smart_list.lookup lists the smart lists of LEAD or CONTACT)
   - meeting: get, search, search_by_term, create, update, cancel, delete, plus lookup (meeting.lookup_related)
   - task: get, search, search_by_term, create, update, lookup (task.lookup_entity, task.search_any_relation — no search_idle)
   - call_log: search, create, update, lookup (call_log.by_entity — no get, no search_by_term, no search_idle)
@@ -216,9 +219,9 @@ Not every bucket has every intent:
     the user clearly asks for that action on that campaign / activity. campaign.lookup /
     campaign.activities in _meta are only report-filter helpers — use the campaign bucket to answer campaign questions.
   - campaign_activity: search, get, analytics, lookups (email_templates, whatsapp_accounts, whatsapp_templates,
-    check_utm, smart_lists), create, update, start, pause, resume, complete (EMAIL / WHATSAPP; create is ONE call
+    check_utm), create, update, start, pause, resume, complete (EMAIL / WHATSAPP; create is ONE call
     that saves the activity straight away as a DRAFT.
-    its audience is a smart_list (lead / contact smart list name or id), audience_filters, or both — then the
+    its audience is a smart_list (lead / contact smart list name or id; smart_list.lookup lists them), audience_filters, or both — then the
     filters are added to the smart list's conditions and all must match, as in the web form.
     update/start are two calls like campaign writes, pause/resume/complete run at once; start/resume send real
     messages), plus search-intent recipients and generated_records
@@ -227,7 +230,7 @@ Not every bucket has every intent:
     takes activity_name, so the user never needs an id.
   - _meta: lookup only (user.lookup, product.lookup, pipeline.lookup, pipeline.details, datetime.parse_to_utc,
     team.lookup, campaign.lookup, campaign.activities,
-    goal.lookup, goal.details)
+    goal.lookup, goal.details, smart_list.lookup)
 Always call list_tool(bucket=...) to see exactly which ids exist for a
 bucket before assuming one does.
 

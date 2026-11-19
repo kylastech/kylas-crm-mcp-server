@@ -258,21 +258,6 @@
     which one.
   example: {whatsapp_account: "Kylas Devs", entity: LEAD, query: "Please Reply"}
 
-- id: campaign_activity.smart_lists
-  bucket: campaign_activity
-  intent: lookup
-  method: GET
-  path: /v1/search-lists/{entity}/lookup
-  dynamic_fields: false
-  description: "Saved smart lists of leads or of contacts."
-  usage_notes: >
-    entity: LEAD or CONTACT — lead and contact smart lists are separate,
-    and the same name can exist for both, so use the entity the user
-    means (ask if it's unclear). query: part of the smart list name
-    (case-insensitive); leave it out to list the first 50. Returns
-    {entity, smart_lists: [{id, name}]}.
-  example: {entity: CONTACT, query: "Marketing"}
-
 - id: campaign_activity.check_utm
   bucket: campaign_activity
   intent: lookup
@@ -310,7 +295,7 @@
     supported here). entity: LEAD or CONTACT — from what the user says; ask
     if it's unclear. name (required). Who gets it (required — a smart list,
     filters, or both): smart_list — a smart list of that entity, by name or
-    id (campaign_activity.smart_lists lists them); its conditions are copied
+    id (smart_list.lookup lists them); its conditions are copied
     into the activity exactly as saved, so later changes to the smart list
     don't change the activity (say so). A smart list without conditions
     ("All leads", "All contacts") means everyone of that entity and is

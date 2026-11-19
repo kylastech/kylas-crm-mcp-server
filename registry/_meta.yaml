@@ -276,3 +276,24 @@
     reported on), its frequency (the report's default date range) and the
     per-person targets.
   example: {goal_id: 548}
+
+- id: smart_list.lookup
+  bucket: _meta
+  intent: lookup
+  method: GET
+  path: /v1/search-lists/{entity}/lookup
+  dynamic_fields: false
+  description: "Find saved smart lists of leads or of contacts by name — to search them, or to use one as a campaign activity's audience."
+  usage_notes: >
+    entity: LEAD or CONTACT — lead and contact smart lists are separate and
+    the same name can exist for both, so use the entity the user means
+    ("leads from the X smart list" -> LEAD; ask if it's unclear). query:
+    part of the smart list name (case-insensitive); leave it out to list
+    the first 50. Returns {entity, smart_lists: [{id, name}]}.
+
+    You usually don't need this to search: lead.search / contact.search
+    take smart_list (a name or an id) directly and resolve it themselves.
+    Use this lookup when the user asks which smart lists exist, or to show
+    the choices when a name is unclear. To create a campaign activity for a
+    smart list use campaign_activity.create (smart_list).
+  example: {entity: LEAD, query: "Holy West"}

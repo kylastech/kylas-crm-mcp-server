@@ -1261,7 +1261,7 @@ async def _resolve_smart_list(value: Any, entity: str) -> Tuple[Optional[Dict[st
             return None, choice
         list_id = row["id"]
     missing = (f"No {path} smart list with id {list_id}. Smart lists belong to one entity — "
-               f"campaign_activity.smart_lists lists the {path} ones.")
+               f"smart_list.lookup lists the {path} ones.")
     try:
         sl = await _kylas_get(f"/v1/search-lists/{path}/{list_id}", "Fetch smart list", not_found=missing)
     except KylasAPIError as e:
@@ -2668,7 +2668,7 @@ _ACTIVITY_WRITE_PROPERTIES = {
 _SMART_LIST_PROPERTY = {
     "smart_list": {"type": ["string", "integer"],
                    "description": "Who receives it: a smart list of that entity, by name or id "
-                                  "(campaign_activity.smart_lists lists them). Its conditions are copied into the "
+                                  "(smart_list.lookup lists them). Its conditions are copied into the "
                                   "activity; later changes to the smart list don't change it. Can be given with "
                                   "audience_filters: the filters are added to the smart list's conditions (all must "
                                   "match), like adding filters after picking a smart list in the web form."},
@@ -2834,14 +2834,6 @@ CAMPAIGN_SCHEMAS: Dict[str, Dict[str, Any]] = {
         },
         "required": ["whatsapp_account", "entity"],
     },
-    "campaign_activity.smart_lists": {
-        "type": "object",
-        "properties": {
-            "entity": {"type": "string", "enum": ACTIVITY_ENTITIES, "description": "Who the activity targets."},
-            "query": {"type": "string", "description": "Part of the smart list name; leave out to list the first 50."},
-        },
-        "required": ["entity"],
-    },
     "campaign_activity.check_utm": {
         "type": "object",
         "properties": {
@@ -2873,7 +2865,6 @@ CAMPAIGN_ROUTERS: Dict[str, CampaignRouter] = {
     "campaign_activity.email_templates": email_templates_logic,
     "campaign_activity.whatsapp_accounts": whatsapp_accounts_logic,
     "campaign_activity.whatsapp_templates": whatsapp_templates_logic,
-    "campaign_activity.smart_lists": smart_lists_logic,
     "campaign_activity.check_utm": check_utm_logic,
 }
 
