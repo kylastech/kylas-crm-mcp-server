@@ -32,12 +32,22 @@ from starlette.middleware.authentication import AuthenticationMiddleware
 logger = logging.getLogger("kylas-mcp.oauth")
 
 _API_KEY_HEADER = "x-api-key"
+_USER_TOKEN_HEADER = "x-kylas-token"
 
 _OAUTH_AUTHORIZE_PATH = "/oauth/authorize"
 _OAUTH_TOKEN_PATH = "/oauth/token"
 _USERS_ME_PATH = "/v1/users/me"
 
 _KYLAS_OIDC_SCOPES = ["openid", "profile", "email", "offline_access"]
+
+
+def kylas_user_token(value: Optional[str]) -> Optional[str]:
+    """The token in an ``x-kylas-token`` header value, or None when it holds none.
+    A ``Bearer `` prefix is tolerated, so a caller pasting a whole header still works."""
+    parts = (value or "").split(None, 1)
+    if parts and parts[0].lower() == "bearer":
+        parts = parts[1:]
+    return parts[0].strip() if parts and parts[0].strip() else None
 
 
 def _origin(url: str) -> str:
@@ -155,15 +165,18 @@ class KylasTokenVerifier(TokenVerifier):
 
 
 class _ApiKeyAwareBearerBackend(BearerAuthBackend):
-    """Bearer-token auth, plus a legacy escape hatch for the ``x-api-key`` flow.
+    """Bearer-token auth, plus escape hatches for the ``x-api-key`` and
+    ``x-kylas-token`` flows.
 
     OAuth clients still authenticate exactly as before (Bearer token → verifier).
-    Additionally, a request carrying a non-empty ``x-api-key`` header is allowed
-    through the auth gate WITHOUT OAuth: it gets a synthetic authenticated user whose
-    access token is empty, so ``main._resolve_auth_headers`` skips the OAuth branch and
-    falls through to the ``x-api-key`` header (which Kylas validates on the real API
-    call). This keeps pre-OAuth API-key clients working while OAuth is enabled — clients
-    that send neither a Bearer token nor an api-key still get 401 and must log in.
+    Additionally, a request carrying a non-empty ``x-api-key`` or ``x-kylas-token``
+    header (a signed-in user's own Kylas token) is allowed through the auth gate
+    WITHOUT OAuth: it gets a synthetic authenticated user whose access token is empty,
+    so ``_resolve_auth_headers`` skips the OAuth branch and falls through to that header
+    (which Kylas validates on the real API call). This keeps pre-OAuth API-key clients
+    working while OAuth is enabled — clients that send neither a Bearer token nor one
+    of these headers still get 401 and must log in. ``Authorization`` keeps its OAuth
+    meaning only: it is never taken for a Kylas token.
     """
 
     def __init__(self, provider: "KylasOAuthProxy") -> None:
@@ -178,12 +191,16 @@ class _ApiKeyAwareBearerBackend(BearerAuthBackend):
         api_key = next(
             (conn.headers.get(k) for k in conn.headers if k.lower() == _API_KEY_HEADER), None
         )
-        if not api_key:
+        if api_key:
+            client_id = "kylas-x-api-key"
+        elif kylas_user_token(conn.headers.get(_USER_TOKEN_HEADER)):
+            client_id = "kylas-user-token"
+        else:
             return None
         scopes = list(getattr(self._provider, "required_scopes", None) or [])
-        # token="" so the tool layer uses the x-api-key path, not a Bearer header.
-        synthetic = AccessToken(token="", client_id="kylas-x-api-key", scopes=scopes)
-        logger.debug("Request authenticated via x-api-key header (OAuth gate bypassed)")
+        # token="" so the tool layer uses the header path, not the OAuth Bearer branch.
+        synthetic = AccessToken(token="", client_id=client_id, scopes=scopes)
+        logger.debug("Request authenticated via %s (OAuth gate bypassed)", client_id)
         return AuthCredentials(scopes), AuthenticatedUser(synthetic)
 
 
@@ -196,7 +213,7 @@ class KylasOAuthProxy(OAuthProxy):
         scopes upstream (authorize / token / refresh); with no scope sent, Kylas grants
         the app's own registered scopes.
       * ``get_middleware`` swaps in :class:`_ApiKeyAwareBearerBackend` so existing
-        ``x-api-key`` clients keep working with OAuth enabled.
+        ``x-api-key`` clients, and ``x-kylas-token`` callers, work with OAuth enabled.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:

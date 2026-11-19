@@ -57,6 +57,22 @@ Set environment variables (or use a `.env` file):
 | `KYLAS_CLIENT_SECRET` | No             | Kylas Marketplace App Client Secret (required for OAuth) |
 | `MCP_SERVER_BASE_URL` | No             | Public URL of this MCP server (required for OAuth redirects) |
 
+## Authentication
+
+Each request is authenticated with the first of these it carries:
+
+| How | Header | Runs in Kylas as |
+|-----|--------|------------------|
+| OAuth login (e.g. Claude's native connector) | `Authorization: Bearer <token this server issued>` | the user who logged in |
+| API key | `x-api-key: <Kylas API key>` | the key's user |
+| A signed-in user's own Kylas token, sent by a service acting for that user| `x-kylas-token: <user's Kylas access token>` | that user |
+| Neither (OAuth off only) | — | the `KYLAS_API_KEY` user |
+
+- `x-api-key` wins when both it and `x-kylas-token` are sent.
+- `x-kylas-token` is forwarded to Kylas as `Authorization: Bearer <token>`; like an API key, Kylas validates it on every call. It is never replaced by `KYLAS_API_KEY`.
+- `Authorization` is used for OAuth only: a Kylas token sent there is not accepted.
+- `KYLAS_BASE_URL` must point at the environment that issued the tokens (a QA token works only against the QA API).
+
 ## OAuth 2.1 Authentication
 
 The server supports standard OAuth 2.1 authorization code flow with PKCE via FastMCP's `OAuthProxy`. This allows multiple users to connect securely, and Kylas will restrict API calls to their own user permissions.
