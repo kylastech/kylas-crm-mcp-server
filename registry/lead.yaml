@@ -256,10 +256,4 @@
     Phone updates: always include phone_country_code (e.g. "IN", "+91",
     "US") whenever phone or phoneNumbers is in the payload. Never assume a
     default country.
-
-    All the same rules as lead.create apply to any field being changed here
-    (email/phone shorthand, picklist Option ID exceptions, customFieldValues
-    internal-name rule, date/datetime UTC conversion, never guessing
-    ownerId) — see lead.create's usage_notes for the full rules; not
-    repeated verbatim here to avoid duplicating the same text twice.
   example: {entity_id: 12345, firstName: "Jane", lastName: "Doe"}

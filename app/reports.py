@@ -587,16 +587,27 @@ def get_report_config_instructions_logic(
                      "the same limit applies to 'between' on date filters.")
     lines.append("  The date-range field can NOT also be used in filters.")
 
-    lines.extend(["", "FILTERS (filters[] = {field, operator, value}) — optional, each field at most once:"])
+    # Most filters share one of a few operator lists: each list is written once
+    # as a named set, and a filter names its set — exact, at a fraction of the
+    # size of the list on every filter.
+    op_sets: Dict[str, str] = {}
+    filter_lines: List[str] = []
     for f in filters:
-        lines.extend(_format_report_filter(entity, f, requested, tenant_currency))
+        filter_lines.extend(_format_report_filter(entity, f, requested, tenant_currency, op_sets))
+    lines.extend(["", "FILTER OPERATOR SETS (a filter's operator must come from the set it names):"])
+    lines.extend(f"  {name}: {ops}" for ops, name in op_sets.items())
+    lines.extend(["", "FILTERS (filters[] = {field, operator, value}) — optional, each field at most once:"])
+    lines.extend(filter_lines)
     lines.append("")
     lines.append("Operators is_null/is_not_null/is_empty/is_not_empty take no value. "
                  "in/not_in take a list. between/not_between (numbers) take [from, to].")
     return "\n".join(lines)
 
 
-def _format_report_filter(entity: str, f: Dict[str, Any], requested: set, tenant_currency: Optional[str]) -> List[str]:
+def _format_report_filter(entity: str, f: Dict[str, Any], requested: set, tenant_currency: Optional[str],
+                          op_sets: Optional[Dict[str, str]] = None) -> List[str]:
+    """One filter's lines. With `op_sets` (operator list -> set name, filled in
+    as new lists appear) the filter names its operator set instead of listing it."""
     fid = f.get("id") or ""
     field_type = f.get("fieldType") or ""
     supported, resolver = filter_support(f, entity)
@@ -604,7 +615,10 @@ def _format_report_filter(entity: str, f: Dict[str, Any], requested: set, tenant
     if not supported:
         return [f"{head} — NOT SUPPORTED (can't be used in reports created here)"]
     ops = ", ".join(filter_operators_for(entity, f, tenant_currency))
-    lines = [f"{head} — operators: {ops}"]
+    if op_sets is None:
+        lines = [f"{head} — operators: {ops}"]
+    else:
+        lines = [f"{head} — operators: {op_sets.setdefault(ops, f'OPS{len(op_sets) + 1}')}"]
     parent = _RELATED_FIELD_PARENT.get(fid)
     required = list(f.get("requiredFilters") or []) + ([parent] if parent and parent not in (f.get("requiredFilters") or []) else [])
     if required:
@@ -631,9 +645,8 @@ def _format_report_filter(entity: str, f: Dict[str, Any], requested: set, tenant
             lines.append(f'     Call build_payload("report.create", entity="{entity}", fields=["{fid}"]) to get them. '
                          "Do NOT guess an option id or name.")
         elif field_type not in ("TOGGLE", "CHECKBOX"):
-            lines.append(f"     value: {send}. Options:")
-            for v in values:
-                lines.append(f"       - {v.get('displayName')} (id: {v.get('id')}, name: '{v.get('name')}')")
+            lines.append(f"     value: {send}. Options label (id, 'name'): " + "; ".join(
+                f"{v.get('displayName')} ({v.get('id')}, '{v.get('name')}')" for v in values))
         else:
             lines.append(f"     value: {send}")
     elif field_type in ("NUMBER", "MONEY", "AUTO_INCREMENT"):
