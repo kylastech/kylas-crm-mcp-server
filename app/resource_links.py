@@ -169,7 +169,8 @@ def executed_query(rule: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(r, dict) or not (r.get("id") or r.get("field")) or "rules" in r:
             return None
         item = {"field": r.get("id") or r.get("field"), "operator": r.get("operator")}
-        for key in ("type", "value"):
+        # timeZone: the day a date rule (and "today", "current_month"...) means.
+        for key in ("type", "value", "timeZone"):
             if key in r:
                 item[key] = r[key]
         rules.append(item)

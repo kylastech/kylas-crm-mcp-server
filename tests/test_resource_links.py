@@ -146,7 +146,8 @@ async def test_the_search_rules_sent_inside_the_block_are_recorded():
 
 def test_the_executed_rule_becomes_the_links_query():
     assert rl.executed_query(EXECUTED) == {"condition": "AND", "rules": [
-        {"field": "createdAt", "operator": "greater", "type": "date", "value": "2026-10-31T18:30:00.000Z"},
+        {"field": "createdAt", "operator": "greater", "type": "date", "value": "2026-10-31T18:30:00.000Z",
+         "timeZone": "Asia/Calcutta"},
         {"field": "cfRegion", "operator": "equal", "type": "long", "value": 41}]}
     assert rl.executed_query({"rules": [{"condition": "OR", "rules": []}]}) is None
     assert rl.executed_query("nope") is None
@@ -165,7 +166,8 @@ async def test_a_search_over_mcp_links_with_the_rule_kylas_ran_not_the_filters_a
 
     link = result.content[1]
     assert link.meta["com.kylas/query"]["rules"][0] == {
-        "field": "createdAt", "operator": "greater", "type": "date", "value": "2026-10-31T18:30:00.000Z"}
+        "field": "createdAt", "operator": "greater", "type": "date", "value": "2026-10-31T18:30:00.000Z",
+        "timeZone": "Asia/Calcutta"}
     assert link.meta["com.kylas/count"] == 4
 
 
