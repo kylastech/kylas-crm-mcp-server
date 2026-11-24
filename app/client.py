@@ -25,6 +25,31 @@ def _mask_api_key(api_key: Optional[str]) -> str:
     return "*" * (len(api_key) - 12) + api_key[-12:]
 
 
+# The search rules sent to Kylas while one execute_request runs, when its
+# caller asked for them (app/resource_links.py records_searches): the rule a
+# search link carries is the one Kylas ran — dates in UTC, custom fields and
+# picklists resolved — never the caller's own filters.
+_SEARCHES_SENT: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
+    "kylas_searches_sent", default=None)
+
+
+async def _record_search(request: httpx.Request) -> None:
+    """Request hook: record a search's jsonRule while execute_request runs.
+
+    Read-only and never raises, so it cannot affect any Kylas request.
+    """
+    try:
+        sent = _SEARCHES_SENT.get()
+        if sent is None or request.method != "POST" or "search" not in request.url.path:
+            return
+        body = json.loads(request.content or b"null")
+        rule = body.get("jsonRule") if isinstance(body, dict) else None
+        if isinstance(rule, dict):
+            sent.append((request.url.path, rule))
+    except Exception:  # noqa: BLE001 — never the request's problem
+        logger.debug("A search rule could not be recorded", exc_info=True)
+
+
 async def _log_request(request: httpx.Request) -> None:
     """Log request details in a readable format."""
     api_key = request.headers.get("api-key")
@@ -241,7 +266,7 @@ class _ThrottledClientContext:
             headers=headers,
             timeout=30.0,
             event_hooks={
-                "request": [_log_request],
+                "request": [_log_request, _record_search],
                 "response": [_log_response],
             },
         )

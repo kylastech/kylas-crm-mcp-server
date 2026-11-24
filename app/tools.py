@@ -1,11 +1,15 @@
 """Generic entity tools, the YAML registry tools (list_tool/build_payload/execute_request) and tool-surface finalization."""
 
+import inspect
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
+from fastmcp.tools.tool import ToolResult
+from mcp.types import TextContent
 
+from app import resource_links
 from app.config import logger
 from app.server import mcp
 from app.client import KylasAPIError, _reset_api_call_count
@@ -1148,7 +1152,6 @@ _SEARCH_ERROR_PREFIXES = ("Error", "✗", "Unexpected error", "Invalid filters",
                           "Unknown entity_type", "Entity type '")
 
 
-@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True})
 async def execute_request(id: str, payload: Dict[str, Any]) -> str:
     """
     Step 3 of 3: perform the call for the payload built from build_payload,
@@ -1283,6 +1286,39 @@ async def execute_request(id: str, payload: Dict[str, Any]) -> str:
             "ok": False,
             "error": {"code": "INTERNAL_ERROR", "message": str(e)},
         }, indent=2)
+
+
+# The MCP tool behind execute_request. The function above stays the plain
+# JSON-string call every in-process caller and test uses; the tool answers
+# with that same text (and the same {"result": text} structured content) and,
+# after it, one resource_link per record the call created, changed or
+# deleted, or per search it ran — MCP's own way for a tool to point at what
+# it touched. A client that ignores links reads exactly what it did before.
+_STRING_RESULT_SCHEMA = {"type": "object", "properties": {"result": {"type": "string"}},
+                         "required": ["result"], "x-fastmcp-wrap-result": True}
+
+
+@mcp.tool(name="execute_request", description=inspect.getdoc(execute_request),
+          annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
+          output_schema=_STRING_RESULT_SCHEMA)
+async def execute_request_tool(id: str, payload: Dict[str, Any]) -> ToolResult:
+    """The `execute_request` MCP tool: its usual text, then its resource links.
+
+    The text block comes first and is unchanged. Building links never fails
+    the call, so a successful write is never reported as an error.
+    """
+    with resource_links.records_searches() as searches:
+        text = await execute_request(id, payload)
+    # The call has happened (a lead created): reading its links must never
+    # turn that into a failed call a model would retry, creating it twice.
+    links: List[Any] = []
+    try:
+        if resource_links.client_accepts_links():
+            links = resource_links.links_for(id, _REGISTRY.get(id), payload, text, searches)
+    except Exception:  # noqa: BLE001
+        logger.warning("execute_request(%s): resource links could not be built", id, exc_info=True)
+    return ToolResult(content=[TextContent(type="text", text=text), *links],
+                      structured_content={"result": text})
 
 
 # ---------------------------------------------------------------------------

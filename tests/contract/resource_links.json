@@ -1,0 +1,710 @@
+{
+  "version": 1,
+  "about": "The resource link contract, one case per entity and action. Source of truth: sd-ai-agent tests/contract/resource_links.json; copied verbatim to sd-ui (src/components/shared/AIFeatures/AIAgents/ResourceLinks/resource_links.contract.json) and kylas-crm-mcp-server (tests/contract/resource_links.json). Each repo checks its side: producers make `link` from `native`/`mcp`; sd-ui shows `link` as `ui`. An `mcp` case's `executedRule` is the jsonRule Kylas ran for it: the MCP server's search link carries it; sd-ai-agent's stopgap cannot see it, so its link is the same without `com.kylas/query`.",
+  "cases": [
+    {
+      "name": "lead created (native)",
+      "native": {
+        "node": "kylas_create_entity",
+        "arguments": {
+          "entity_type": "lead"
+        },
+        "config": {},
+        "output": {
+          "status_code": 201,
+          "data": {
+            "id": 9,
+            "firstName": "Asha",
+            "lastName": "Rao"
+          },
+          "entity_id": 9
+        }
+      },
+      "ui": {
+        "label": "Created lead · Asha Rao",
+        "url": "/sales/leads/details/9"
+      },
+      "link": {
+        "type": "resource_link",
+        "uri": "kylas://lead/9",
+        "name": "Asha Rao",
+        "_meta": {
+          "com.kylas/action": "CreateAction",
+          "com.kylas/entity": "lead",
+          "com.kylas/id": 9
+        }
+      }
+    },
+    {
+      "name": "deal created (MCP)",
+      "mcp": {
+        "arguments": {
+          "id": "deal.create",
+          "payload": {
+            "name": "Big"
+          }
+        },
+        "answer": {
+          "ok": true,
+          "status": 200,
+          "data": {
+            "id": 2,
+            "name": "Big"
+          }
+        }
+      },
+      "ui": {
+        "label": "Created deal · Big",
+        "url": "/sales/deals/details/2"
+      },
+      "link": {
+        "name": "Big",
+        "uri": "kylas://deal/2",
+        "_meta": {
+          "com.kylas/action": "CreateAction",
+          "com.kylas/entity": "deal",
+          "com.kylas/id": 2
+        },
+        "type": "resource_link"
+      }
+    },
+    {
+      "name": "contact updated (native)",
+      "native": {
+        "node": "kylas_update_entity",
+        "arguments": {
+          "entity_type": "contact",
+          "entity_id": 4
+        },
+        "config": {},
+        "output": {
+          "status_code": 200,
+          "data": {
+            "id": 4,
+            "firstName": "Ravi"
+          },
+          "updated": true,
+          "skipped": false
+        }
+      },
+      "ui": {
+        "label": "Updated contact · Ravi",
+        "url": "/sales/contacts/details/4"
+      },
+      "link": {
+        "type": "resource_link",
+        "uri": "kylas://contact/4",
+        "name": "Ravi",
+        "_meta": {
+          "com.kylas/action": "UpdateAction",
+          "com.kylas/entity": "contact",
+          "com.kylas/id": 4
+        }
+      }
+    },
+    {
+      "name": "company updated (MCP)",
+      "mcp": {
+        "arguments": {
+          "id": "company.update",
+          "payload": {
+            "entity_id": 3,
+            "name": "Acme"
+          }
+        },
+        "answer": {
+          "ok": true,
+          "status": 200,
+          "data": {
+            "id": 3,
+            "name": "Acme"
+          }
+        }
+      },
+      "ui": {
+        "label": "Updated company · Acme",
+        "url": "/sales/companies/details/3"
+      },
+      "link": {
+        "name": "Acme",
+        "uri": "kylas://company/3",
+        "_meta": {
+          "com.kylas/action": "UpdateAction",
+          "com.kylas/entity": "company",
+          "com.kylas/id": 3
+        },
+        "type": "resource_link"
+      }
+    },
+    {
+      "name": "task created (MCP)",
+      "mcp": {
+        "arguments": {
+          "id": "task.create",
+          "payload": {
+            "name": "Call back"
+          }
+        },
+        "answer": {
+          "ok": true,
+          "status": 200,
+          "data": {
+            "id": 5,
+            "name": "Call back"
+          }
+        }
+      },
+      "ui": {
+        "label": "Created task · Call back",
+        "url": "/sales/tasks/list?id=equal&id=5"
+      },
+      "link": {
+        "name": "Call back",
+        "uri": "kylas://task/5",
+        "_meta": {
+          "com.kylas/action": "CreateAction",
+          "com.kylas/entity": "task",
+          "com.kylas/id": 5
+        },
+        "type": "resource_link"
+      }
+    },
+    {
+      "name": "meeting cancelled (MCP)",
+      "mcp": {
+        "arguments": {
+          "id": "meeting.cancel",
+          "payload": {
+            "meeting_id": 6
+          }
+        },
+        "answer": {
+          "ok": true,
+          "status": 200,
+          "data": "✓ Meeting 6 cancelled successfully."
+        }
+      },
+      "ui": {
+        "label": "Updated meeting · meeting 6",
+        "url": "/sales/meetings/list?id=equal&id=6"
+      },
+      "link": {
+        "name": "meeting 6",
+        "uri": "kylas://meeting/6",
+        "_meta": {
+          "com.kylas/action": "UpdateAction",
+          "com.kylas/entity": "meeting",
+          "com.kylas/id": 6
+        },
+        "type": "resource_link"
+      }
+    },
+    {
+      "name": "meeting deleted (native)",
+      "native": {
+        "node": "kylas_delete_entity",
+        "arguments": {
+          "entity_type": "meeting",
+          "entity_id": 6
+        },
+        "config": {},
+        "output": {
+          "status_code": 200,
+          "data": null,
+          "deleted": true,
+          "skipped": false
+        }
+      },
+      "ui": {
+        "label": "Deleted meeting · meeting 6",
+        "url": null
+      },
+      "link": {
+        "type": "resource_link",
+        "uri": "kylas://meeting/6",
+        "name": "meeting 6",
+        "_meta": {
+          "com.kylas/action": "DeleteAction",
+          "com.kylas/entity": "meeting",
+          "com.kylas/id": 6
+        }
+      }
+    },
+    {
+      "name": "call log created (MCP)",
+      "mcp": {
+        "arguments": {
+          "id": "call_log.create",
+          "payload": {
+            "outcome": "connected"
+          }
+        },
+        "answer": {
+          "ok": true,
+          "status": 200,
+          "data": {
+            "id": 7,
+            "outcome": "connected"
+          }
+        }
+      },
+      "ui": {
+        "label": "Created call log · call log 7",
+        "url": "/sales/calls/list?id=7"
+      },
+      "link": {
+        "name": "call log 7",
+        "uri": "kylas://call_log/7",
+        "_meta": {
+          "com.kylas/action": "CreateAction",
+          "com.kylas/entity": "call_log",
+          "com.kylas/id": 7
+        },
+        "type": "resource_link"
+      }
+    },
+    {
+      "name": "note on a lead (native)",
+      "native": {
+        "node": "kylas_add_note",
+        "arguments": {
+          "entity_id": 77
+        },
+        "config": {
+          "entity_type": "lead"
+        },
+        "output": {
+          "status_code": 201,
+          "data": {
+            "id": 12
+          },
+          "skipped": false
+        }
+      },
+      "ui": {
+        "label": "Created note on lead",
+        "url": "/sales/leads/details/77"
+      },
+      "link": {
+        "type": "resource_link",
+        "uri": "kylas://note/12",
+        "name": "Note on lead 77",
+        "_meta": {
+          "com.kylas/action": "CreateAction",
+          "com.kylas/entity": "note",
+          "com.kylas/id": 12,
+          "com.kylas/about": "kylas://lead/77"
+        }
+      }
+    },
+    {
+      "name": "report created (MCP)",
+      "mcp": {
+        "arguments": {
+          "id": "report.create",
+          "payload": {
+            "entity": "lead"
+          }
+        },
+        "answer": {
+          "ok": true,
+          "status": 200,
+          "data": {
+            "id": 6,
+            "name": "Leads by Source (Made by MCP)"
+          }
+        }
+      },
+      "ui": {
+        "label": "Created report · Leads by Source (Made by MCP)",
+        "url": "/sales/reports/details/6"
+      },
+      "link": {
+        "name": "Leads by Source (Made by MCP)",
+        "uri": "kylas://report/6",
+        "_meta": {
+          "com.kylas/action": "CreateAction",
+          "com.kylas/entity": "report",
+          "com.kylas/id": 6
+        },
+        "type": "resource_link"
+      }
+    },
+    {
+      "name": "quotations searched by a rule (native)",
+      "native": {
+        "node": "kylas_search_entity",
+        "arguments": {
+          "entity_type": "quotation",
+          "filter": {
+            "condition": "AND",
+            "rules": [
+              {
+                "id": "status",
+                "field": "status",
+                "operator": "equal",
+                "type": "string",
+                "value": "DRAFT"
+              }
+            ]
+          }
+        },
+        "config": {},
+        "output": {
+          "status_code": 200,
+          "results": [],
+          "total": 3,
+          "skipped": false
+        }
+      },
+      "ui": {
+        "label": "Open 3 quotations in list",
+        "url": "/sales/quotations/list?status=equal&status=DRAFT&smartlist=Sherpa+search&sortByField=updatedAt&sortOrder=desc"
+      },
+      "link": {
+        "type": "resource_link",
+        "uri": "kylas://quotation",
+        "name": "3 quotation result(s)",
+        "_meta": {
+          "com.kylas/action": "SearchAction",
+          "com.kylas/entity": "quotation",
+          "com.kylas/query": {
+            "condition": "AND",
+            "rules": [
+              {
+                "id": "status",
+                "field": "status",
+                "operator": "equal",
+                "type": "string",
+                "value": "DRAFT"
+              }
+            ],
+            "valid": true
+          },
+          "com.kylas/count": 3
+        }
+      }
+    },
+    {
+      "name": "leads searched by a filter (MCP)",
+      "mcp": {
+        "arguments": {
+          "id": "lead.search",
+          "payload": {
+            "filters": [
+              {
+                "field": "city",
+                "operator": "contains",
+                "value": "Pune"
+              }
+            ]
+          }
+        },
+        "answer": {
+          "ok": true,
+          "status": 200,
+          "data": "Found 100 lead(s) (page 1 of 21, total 2012)\n• ID: 1"
+        },
+        "executedRule": {
+          "condition": "AND",
+          "valid": true,
+          "rules": [
+            {
+              "operator": "contains",
+              "id": "city",
+              "field": "city",
+              "type": "string",
+              "value": "Pune",
+              "relatedFieldIds": null
+            }
+          ]
+        }
+      },
+      "ui": {
+        "label": "Open 2012 leads in list",
+        "url": "/sales/leads/list?city=contains&city=Pune&smartlist=Sherpa+search&sortByField=updatedAt&sortOrder=desc"
+      },
+      "link": {
+        "name": "2012 lead result(s)",
+        "uri": "kylas://lead",
+        "_meta": {
+          "com.kylas/action": "SearchAction",
+          "com.kylas/entity": "lead",
+          "com.kylas/query": {
+            "condition": "AND",
+            "rules": [
+              {
+                "field": "city",
+                "operator": "contains",
+                "type": "string",
+                "value": "Pune"
+              }
+            ]
+          },
+          "com.kylas/count": 2012
+        },
+        "type": "resource_link"
+      }
+    },
+    {
+      "name": "leads searched by a date, as Kylas ran it in UTC (MCP)",
+      "mcp": {
+        "arguments": {
+          "id": "lead.search",
+          "payload": {
+            "filters": [
+              {
+                "field": "createdAt",
+                "operator": "greater",
+                "value": "2026-11-01"
+              }
+            ]
+          }
+        },
+        "answer": {
+          "ok": true,
+          "status": 200,
+          "data": "Found 4 lead(s) (page 1 of 1, total 4)"
+        },
+        "executedRule": {
+          "condition": "AND",
+          "valid": true,
+          "rules": [
+            {
+              "operator": "greater",
+              "id": "createdAt",
+              "field": "createdAt",
+              "type": "date",
+              "value": "2026-10-31T18:30:00.000Z",
+              "timeZone": "Asia/Calcutta",
+              "relatedFieldIds": null
+            }
+          ]
+        }
+      },
+      "ui": {
+        "label": "Open 4 leads in list",
+        "url": "/sales/leads/list?createdAt=greater&createdAt=2026-10-31T18%3A30%3A00.000Z&smartlist=Sherpa+search&sortByField=updatedAt&sortOrder=desc"
+      },
+      "link": {
+        "name": "4 lead result(s)",
+        "uri": "kylas://lead",
+        "_meta": {
+          "com.kylas/action": "SearchAction",
+          "com.kylas/entity": "lead",
+          "com.kylas/query": {
+            "condition": "AND",
+            "rules": [
+              {
+                "field": "createdAt",
+                "operator": "greater",
+                "type": "date",
+                "value": "2026-10-31T18:30:00.000Z"
+              }
+            ]
+          },
+          "com.kylas/count": 4
+        },
+        "type": "resource_link"
+      }
+    },
+    {
+      "name": "leads searched by a term (MCP)",
+      "mcp": {
+        "arguments": {
+          "id": "lead.search_by_term",
+          "payload": {
+            "search_term": "pune"
+          }
+        },
+        "answer": {
+          "ok": true,
+          "status": 200,
+          "data": "Found 3 lead(s) matching 'pune':"
+        }
+      },
+      "ui": {
+        "label": "3 leads found",
+        "url": null
+      },
+      "link": {
+        "name": "3 lead result(s)",
+        "uri": "kylas://lead",
+        "_meta": {
+          "com.kylas/action": "SearchAction",
+          "com.kylas/entity": "lead",
+          "com.kylas/query": {
+            "term": "pune"
+          },
+          "com.kylas/count": 3
+        },
+        "type": "resource_link"
+      }
+    },
+    {
+      "name": "email sent to a lead (native)",
+      "native": {
+        "node": "kylas_send_email",
+        "arguments": {
+          "to": [
+            {
+              "entity": "LEAD",
+              "id": 9,
+              "name": "Asha Rao"
+            },
+            {
+              "entity": "custom-email",
+              "email": "a@example.com"
+            }
+          ],
+          "subject": "Hi",
+          "body": "Hello"
+        },
+        "config": {},
+        "output": {
+          "status_code": 202,
+          "sent": true,
+          "data": {},
+          "skipped": false
+        }
+      },
+      "ui": {
+        "label": "Sent to lead · Asha Rao",
+        "url": "/sales/leads/details/9"
+      },
+      "link": {
+        "type": "resource_link",
+        "uri": "kylas://lead/9",
+        "name": "Asha Rao",
+        "_meta": {
+          "com.kylas/action": "SendAction",
+          "com.kylas/entity": "lead",
+          "com.kylas/id": 9
+        }
+      }
+    },
+    {
+      "name": "whatsapp sent to a contact (native)",
+      "native": {
+        "node": "kylas_send_whatsapp",
+        "arguments": {
+          "entity_type": "contact",
+          "entity_id": 4
+        },
+        "config": {},
+        "output": {
+          "status_code": 200,
+          "sent": true,
+          "data": {},
+          "skipped": false,
+          "skip_reason": null
+        }
+      },
+      "ui": {
+        "label": "Sent to contact · contact 4",
+        "url": "/sales/contacts/details/4"
+      },
+      "link": {
+        "type": "resource_link",
+        "uri": "kylas://contact/4",
+        "name": "contact 4",
+        "_meta": {
+          "com.kylas/action": "SendAction",
+          "com.kylas/entity": "contact",
+          "com.kylas/id": 4
+        }
+      }
+    },
+    {
+      "name": "deal shared (native)",
+      "native": {
+        "node": "kylas_share_record",
+        "arguments": {
+          "entity_type": "deal",
+          "entity_id": 2
+        },
+        "config": {},
+        "output": {
+          "status_code": 201,
+          "data": {
+            "id": 31
+          },
+          "skipped": false
+        }
+      },
+      "ui": {
+        "label": "Shared deal · deal 2",
+        "url": "/sales/deals/details/2"
+      },
+      "link": {
+        "type": "resource_link",
+        "uri": "kylas://deal/2",
+        "name": "deal 2",
+        "_meta": {
+          "com.kylas/action": "ShareAction",
+          "com.kylas/entity": "deal",
+          "com.kylas/id": 2
+        }
+      }
+    },
+    {
+      "name": "leads searched by a custom field (native)",
+      "native": {
+        "node": "kylas_search_entity",
+        "arguments": {
+          "entity_type": "lead",
+          "filter": {
+            "condition": "AND",
+            "rules": [
+              {
+                "field": "customFieldValues.cfRegion",
+                "operator": "equal",
+                "type": "long",
+                "value": 41
+              }
+            ]
+          }
+        },
+        "config": {},
+        "output": {
+          "status_code": 200,
+          "results": [],
+          "total": 5,
+          "skipped": false
+        }
+      },
+      "ui": {
+        "label": "Open 5 leads in list",
+        "url": "/sales/leads/list?cfRegion=equal&cfRegion=41&smartlist=Sherpa+search&sortByField=updatedAt&sortOrder=desc"
+      },
+      "link": {
+        "type": "resource_link",
+        "uri": "kylas://lead",
+        "name": "5 lead result(s)",
+        "_meta": {
+          "com.kylas/action": "SearchAction",
+          "com.kylas/entity": "lead",
+          "com.kylas/query": {
+            "condition": "AND",
+            "rules": [
+              {
+                "field": "customFieldValues.cfRegion",
+                "operator": "equal",
+                "type": "long",
+                "value": 41,
+                "id": "cfRegion"
+              }
+            ],
+            "valid": true
+          },
+          "com.kylas/count": 5
+        }
+      }
+    }
+  ],
+  "noLink": [
+    "Reads (get, activity, notes, fields, picklists, connected email) change nothing.",
+    "kylas_import: an import job has no page of its own in sd-ui (only the generic data-management screens), so it gets no link; its status is in the run's output.",
+    "A failed, skipped or no-op call (an update that changed nothing, a send that did not go out) gets no link."
+  ]
+}
